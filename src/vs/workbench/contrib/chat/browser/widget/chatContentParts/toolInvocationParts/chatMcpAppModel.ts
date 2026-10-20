@@ -29,7 +29,7 @@ import { IStorageService } from '../../../../../../../platform/storage/common/st
 
 import { IMcpAppResourceContent, McpToolCallUI } from '../../../../../mcp/browser/mcpToolCallUI.js';
 import { McpResourceURI } from '../../../../../mcp/common/mcpTypes.js';
-import { MCP } from '../../../../../mcp/common/modelContextProtocol.js';
+import { MCPLegacy } from '../../../../../mcp/common/modelContextProtocolLegacy.js';
 import { McpApps } from '../../../../../mcp/common/modelContextProtocolApps.js';
 import { IWebviewElement, IWebviewService, WebviewContentPurpose, WebviewOriginStore } from '../../../../../webview/browser/webview.js';
 import { IChatRequestVariableEntry } from '../../../../common/attachments/chatVariableEntries.js';
@@ -500,7 +500,7 @@ export class ChatMcpAppModel extends Disposable {
 
 				default: {
 					softAssertNever(request);
-					const cast = request as MCP.JSONRPCRequest;
+					const cast = request as MCPLegacy.JSONRPCRequest;
 					if (cast.id !== undefined) {
 						await this._sendError(cast.id, -32601, `Method not found: ${cast.method}`);
 					}
@@ -641,7 +641,7 @@ export class ChatMcpAppModel extends Disposable {
 		if (isToolResultInputOutputDetails(resultDetails) && resultDetails.mcpOutput) {
 			this._sendNotification({
 				method: 'ui/notifications/tool-result',
-				params: resultDetails.mcpOutput as MCP.CallToolResult,
+				params: resultDetails.mcpOutput as MCPLegacy.CallToolResult,
 			});
 		}
 	}
@@ -673,7 +673,7 @@ export class ChatMcpAppModel extends Disposable {
 		return { isError: false };
 	}
 
-	private async _handleUpdateModelContext(params: McpApps.McpUiUpdateModelContextRequest['params']): Promise<MCP.EmptyResult> {
+	private async _handleUpdateModelContext(params: McpApps.McpUiUpdateModelContextRequest['params']): Promise<MCPLegacy.EmptyResult> {
 		const widget = this._chatWidgetService.getWidgetBySessionResource(this.renderData.sessionResource);
 		if (!widget) {
 			return {};
@@ -826,7 +826,7 @@ export class ChatMcpAppModel extends Disposable {
 	/**
 	 * Handles tools/call requests from the MCP App.
 	 */
-	private async _handleToolsCall(params: MCP.CallToolRequestParams, token: CancellationToken): Promise<MCP.CallToolResult> {
+	private async _handleToolsCall(params: MCPLegacy.CallToolRequestParams, token: CancellationToken): Promise<MCPLegacy.CallToolResult> {
 		if (!params?.name) {
 			throw new Error('Missing tool name in tools/call request');
 		}
@@ -837,7 +837,7 @@ export class ChatMcpAppModel extends Disposable {
 	/**
 	 * Handles resources/read requests from the MCP App.
 	 */
-	private async _handleResourcesRead(params: MCP.ReadResourceRequestParams, token: CancellationToken): Promise<MCP.ReadResourceResult> {
+	private async _handleResourcesRead(params: MCPLegacy.ReadResourceRequestParams, token: CancellationToken): Promise<MCPLegacy.ReadResourceResult> {
 		if (!params?.uri) {
 			throw new Error('Missing uri in resources/read request');
 		}
@@ -850,7 +850,7 @@ export class ChatMcpAppModel extends Disposable {
 	 * to the host-side sampling implementation through the underlying
 	 * transport (typically an agent host that owns the MCP server).
 	 */
-	private async _handleSamplingCreateMessage(params: MCP.CreateMessageRequestParams, token: CancellationToken): Promise<MCP.CreateMessageResult> {
+	private async _handleSamplingCreateMessage(params: MCPLegacy.CreateMessageRequestParams, token: CancellationToken): Promise<MCPLegacy.CreateMessageResult> {
 		if (!params) {
 			throw new Error('Missing params in sampling/createMessage request');
 		}
@@ -863,7 +863,7 @@ export class ChatMcpAppModel extends Disposable {
 			jsonrpc: '2.0',
 			id,
 			result,
-		} satisfies MCP.JSONRPCResponse);
+		} satisfies MCPLegacy.JSONRPCResponse);
 	}
 
 	private async _sendError(id: number | string, code: number, message: string): Promise<void> {
@@ -871,7 +871,7 @@ export class ChatMcpAppModel extends Disposable {
 			jsonrpc: '2.0',
 			id,
 			error: { code, message },
-		} satisfies MCP.JSONRPCErrorResponse);
+		} satisfies MCPLegacy.JSONRPCErrorResponse);
 	}
 
 	private async _sendNotification(message: McpApps.HostNotification): Promise<void> {

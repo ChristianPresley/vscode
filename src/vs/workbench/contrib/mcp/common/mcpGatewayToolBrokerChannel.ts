@@ -10,7 +10,7 @@ import { autorun } from '../../../../base/common/observable.js';
 import { IServerChannel } from '../../../../base/parts/ipc/common/ipc.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IMcpGatewayServerDescriptor } from '../../../../platform/mcp/common/mcpGateway.js';
-import { MCP } from '../../../../platform/mcp/common/modelContextProtocol.js';
+import { MCPLegacy } from '../../../../platform/mcp/common/modelContextProtocolLegacy.js';
 import { URI } from '../../../../base/common/uri.js';
 import { McpServer } from './mcpServer.js';
 import { IMcpServer, IMcpService, McpCapability, McpServerCacheState, McpToolVisibility } from './mcpTypes.js';
@@ -208,7 +208,7 @@ export class McpGatewayToolBrokerChannel extends Disposable implements IServerCh
 		return result;
 	}
 
-	private async _listToolsForServer(serverId: string): Promise<readonly MCP.Tool[]> {
+	private async _listToolsForServer(serverId: string): Promise<readonly MCPLegacy.Tool[]> {
 		const server = this._getServerById(serverId);
 		if (!server) {
 			this._logService.warn(`[McpGateway][ToolBroker] listToolsForServer: unknown server '${serverId}'`);
@@ -225,7 +225,7 @@ export class McpGatewayToolBrokerChannel extends Disposable implements IServerCh
 		return tools;
 	}
 
-	private async _callToolForServer(serverId: string, name: string, args: Record<string, unknown>, chatSessionResource?: string, token: CancellationToken = CancellationToken.None): Promise<MCP.CallToolResult> {
+	private async _callToolForServer(serverId: string, name: string, args: Record<string, unknown>, chatSessionResource?: string, token: CancellationToken = CancellationToken.None): Promise<MCPLegacy.CallToolResult> {
 		this._logService.debug(`[McpGateway][ToolBroker] callToolForServer '${serverId}' tool '${name}' with args: ${JSON.stringify(args)}`);
 
 		const server = this._getServerById(serverId);
@@ -246,7 +246,7 @@ export class McpGatewayToolBrokerChannel extends Disposable implements IServerCh
 		return result;
 	}
 
-	private async _listResourcesForServer(serverId: string): Promise<readonly MCP.Resource[]> {
+	private async _listResourcesForServer(serverId: string): Promise<readonly MCPLegacy.Resource[]> {
 		const server = this._getServerById(serverId);
 		if (!server) {
 			this._logService.warn(`[McpGateway][ToolBroker] listResourcesForServer: unknown server '${serverId}'`);
@@ -272,7 +272,7 @@ export class McpGatewayToolBrokerChannel extends Disposable implements IServerCh
 		}
 	}
 
-	private async _readResourceForServer(serverId: string, uri: string, token: CancellationToken = CancellationToken.None): Promise<MCP.ReadResourceResult> {
+	private async _readResourceForServer(serverId: string, uri: string, token: CancellationToken = CancellationToken.None): Promise<MCPLegacy.ReadResourceResult> {
 		const server = this._getServerById(serverId);
 		if (!server) {
 			throw new Error(`Unknown server: ${serverId}`);
@@ -284,7 +284,7 @@ export class McpGatewayToolBrokerChannel extends Disposable implements IServerCh
 		return result;
 	}
 
-	private async _listResourceTemplatesForServer(serverId: string): Promise<readonly MCP.ResourceTemplate[]> {
+	private async _listResourceTemplatesForServer(serverId: string): Promise<readonly MCPLegacy.ResourceTemplate[]> {
 		const server = this._getServerById(serverId);
 		if (!server) {
 			this._logService.warn(`[McpGateway][ToolBroker] listResourceTemplatesForServer: unknown server '${serverId}'`);

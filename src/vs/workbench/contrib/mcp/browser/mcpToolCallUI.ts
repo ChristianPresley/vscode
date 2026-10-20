@@ -20,7 +20,7 @@ import { IThemeService } from '../../../../platform/theme/common/themeService.js
 import { McpServer } from '../common/mcpServer.js';
 import { IMcpServer, IMcpService, IMcpSamplingService, IMcpToolCallUIData, McpToolVisibility } from '../common/mcpTypes.js';
 import { findMcpServer, startServerAndWaitForLiveTools, translateMcpLogMessage } from '../common/mcpTypesUtils.js';
-import { MCP } from '../common/modelContextProtocol.js';
+import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
 import { McpApps } from '../common/modelContextProtocolApps.js';
 
 /**
@@ -45,13 +45,13 @@ export interface IMcpAppCallTransport extends IDisposable {
 	readonly onNotification: Event<{ readonly method: string; readonly params?: unknown }>;
 
 	loadResource(token: CancellationToken): Promise<IMcpAppResourceContent>;
-	callTool(name: string, params: Record<string, unknown>, token: CancellationToken): Promise<MCP.CallToolResult>;
-	readResource(uri: string, token: CancellationToken): Promise<MCP.ReadResourceResult>;
-	sampling(params: MCP.CreateMessageRequest['params'], token: CancellationToken): Promise<MCP.CreateMessageResult>;
-	log(params: MCP.LoggingMessageNotificationParams): Promise<void>;
+	callTool(name: string, params: Record<string, unknown>, token: CancellationToken): Promise<MCPLegacy.CallToolResult>;
+	readResource(uri: string, token: CancellationToken): Promise<MCPLegacy.ReadResourceResult>;
+	sampling(params: MCPLegacy.CreateMessageRequest['params'], token: CancellationToken): Promise<MCPLegacy.CreateMessageResult>;
+	log(params: MCPLegacy.LoggingMessageNotificationParams): Promise<void>;
 }
 
-function readResourceContentToHtml(contents: readonly (MCP.TextResourceContents | MCP.BlobResourceContents)[]): IMcpAppResourceContent {
+function readResourceContentToHtml(contents: readonly (MCPLegacy.TextResourceContents | MCPLegacy.BlobResourceContents)[]): IMcpAppResourceContent {
 	if (!contents || contents.length === 0) {
 		throw new Error('UI resource not found on server');
 	}
@@ -101,7 +101,7 @@ class LocalMcpAppCallTransport extends Disposable implements IMcpAppCallTranspor
 		);
 	}
 
-	async log(params: MCP.LoggingMessageNotificationParams): Promise<void> {
+	async log(params: MCPLegacy.LoggingMessageNotificationParams): Promise<void> {
 		const server = await this._getServer(CancellationToken.None);
 		if (server) {
 			translateMcpLogMessage((server as McpServer).logger, params, `[App UI]`);
@@ -118,7 +118,7 @@ class LocalMcpAppCallTransport extends Disposable implements IMcpAppCallTranspor
 		return readResourceContentToHtml(resourceResult.contents);
 	}
 
-	async callTool(name: string, params: Record<string, unknown>, token: CancellationToken): Promise<MCP.CallToolResult> {
+	async callTool(name: string, params: Record<string, unknown>, token: CancellationToken): Promise<MCPLegacy.CallToolResult> {
 		const server = await this._getServer(token);
 		if (!server) {
 			throw new Error('MCP server not found for tool call');
@@ -140,7 +140,7 @@ class LocalMcpAppCallTransport extends Disposable implements IMcpAppCallTranspor
 		};
 	}
 
-	async readResource(uri: string, token: CancellationToken): Promise<MCP.ReadResourceResult> {
+	async readResource(uri: string, token: CancellationToken): Promise<MCPLegacy.ReadResourceResult> {
 		const server = await this._getServer(token);
 		if (!server) {
 			throw new Error('MCP server not found');
@@ -149,7 +149,7 @@ class LocalMcpAppCallTransport extends Disposable implements IMcpAppCallTranspor
 		return await McpServer.callOn(server, h => h.readResource({ uri }, token), token);
 	}
 
-	async sampling(params: MCP.CreateMessageRequest['params'], token: CancellationToken): Promise<MCP.CreateMessageResult> {
+	async sampling(params: MCPLegacy.CreateMessageRequest['params'], token: CancellationToken): Promise<MCPLegacy.CreateMessageResult> {
 		const server = await this._getServer(token);
 		if (!server) {
 			throw new Error('MCP server not found for sampling');
@@ -207,7 +207,7 @@ class AhpMcpAppCallTransport extends Disposable implements IMcpAppCallTransport 
 		return this._connection;
 	}
 
-	async log(params: MCP.LoggingMessageNotificationParams): Promise<void> {
+	async log(params: MCPLegacy.LoggingMessageNotificationParams): Promise<void> {
 		// Notifications are one-way; the AHP `mcp://` channel accepts
 		// `notifications/message` from the client. We use the request
 		// path here for symmetry (the host treats `notifications/message`
@@ -221,22 +221,22 @@ class AhpMcpAppCallTransport extends Disposable implements IMcpAppCallTransport 
 	}
 
 	async loadResource(_token: CancellationToken): Promise<IMcpAppResourceContent> {
-		const result = await this._getConnection().handleMcpRequest(this._channel, 'resources/read', { uri: this._uiData.resourceUri }) as MCP.ReadResourceResult;
+		const result = await this._getConnection().handleMcpRequest(this._channel, 'resources/read', { uri: this._uiData.resourceUri }) as MCPLegacy.ReadResourceResult;
 		return readResourceContentToHtml(result.contents);
 	}
 
-	async callTool(name: string, params: Record<string, unknown>, _token: CancellationToken): Promise<MCP.CallToolResult> {
-		const result = await this._getConnection().handleMcpRequest(this._channel, 'tools/call', { name, arguments: params }) as MCP.CallToolResult;
+	async callTool(name: string, params: Record<string, unknown>, _token: CancellationToken): Promise<MCPLegacy.CallToolResult> {
+		const result = await this._getConnection().handleMcpRequest(this._channel, 'tools/call', { name, arguments: params }) as MCPLegacy.CallToolResult;
 		return result;
 	}
 
-	async readResource(uri: string, _token: CancellationToken): Promise<MCP.ReadResourceResult> {
-		const result = await this._getConnection().handleMcpRequest(this._channel, 'resources/read', { uri }) as MCP.ReadResourceResult;
+	async readResource(uri: string, _token: CancellationToken): Promise<MCPLegacy.ReadResourceResult> {
+		const result = await this._getConnection().handleMcpRequest(this._channel, 'resources/read', { uri }) as MCPLegacy.ReadResourceResult;
 		return result;
 	}
 
-	async sampling(params: MCP.CreateMessageRequest['params'], _token: CancellationToken): Promise<MCP.CreateMessageResult> {
-		const result = await this._getConnection().handleMcpRequest(this._channel, 'sampling/createMessage', params as unknown as Record<string, unknown>) as MCP.CreateMessageResult;
+	async sampling(params: MCPLegacy.CreateMessageRequest['params'], _token: CancellationToken): Promise<MCPLegacy.CreateMessageResult> {
+		const result = await this._getConnection().handleMcpRequest(this._channel, 'sampling/createMessage', params as unknown as Record<string, unknown>) as MCPLegacy.CreateMessageResult;
 		return result;
 	}
 }
@@ -401,7 +401,7 @@ export class McpToolCallUI extends Disposable {
 	/**
 	 * Logs a message to the MCP server's logger.
 	 */
-	public log(log: MCP.LoggingMessageNotificationParams): Promise<void> {
+	public log(log: MCPLegacy.LoggingMessageNotificationParams): Promise<void> {
 		return this._transport.log(log);
 	}
 
@@ -421,7 +421,7 @@ export class McpToolCallUI extends Disposable {
 	 * @param token Cancellation token
 	 * @returns The tool call result
 	 */
-	public callTool(name: string, params: Record<string, unknown>, token: CancellationToken): Promise<MCP.CallToolResult> {
+	public callTool(name: string, params: Record<string, unknown>, token: CancellationToken): Promise<MCPLegacy.CallToolResult> {
 		return this._transport.callTool(name, params, token);
 	}
 
@@ -431,7 +431,7 @@ export class McpToolCallUI extends Disposable {
 	 * @param token Cancellation token
 	 * @returns The resource content
 	 */
-	public readResource(uri: string, token: CancellationToken): Promise<MCP.ReadResourceResult> {
+	public readResource(uri: string, token: CancellationToken): Promise<MCPLegacy.ReadResourceResult> {
 		return this._transport.readResource(uri, token);
 	}
 
@@ -440,7 +440,7 @@ export class McpToolCallUI extends Disposable {
 	 * host-side sampling implementation. Only supported when the App
 	 * server runs inside an agent host that has opted into sampling.
 	 */
-	public sampling(params: MCP.CreateMessageRequest['params'], token: CancellationToken): Promise<MCP.CreateMessageResult> {
+	public sampling(params: MCPLegacy.CreateMessageRequest['params'], token: CancellationToken): Promise<MCPLegacy.CreateMessageResult> {
 		return this._transport.sampling(params, token);
 	}
 }

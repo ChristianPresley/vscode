@@ -11,7 +11,7 @@ import { autorun, autorunSelfDisposable, IReader } from '../../../../base/common
 import { ILogger } from '../../../../platform/log/common/log.js';
 import { ToolDataSource } from '../../chat/common/tools/languageModelToolsService.js';
 import { IMcpServer, IMcpServerStartOpts, IMcpService, McpConnectionState, McpServerCacheState, McpServerTransportType } from './mcpTypes.js';
-import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
 
 /**
@@ -120,8 +120,8 @@ export function canLoadMcpNetworkResourceDirectly(resource: URL, server: IMcpSer
 	return isResourceRequestValid;
 }
 
-export function isTaskResult(obj: MCP.Result | MCP.CreateTaskResult): obj is MCP.CreateTaskResult {
-	return (obj as MCP.CreateTaskResult).task !== undefined;
+export function isTaskResult(obj: MCPLegacy.Result | MCPLegacy.CreateTaskResult): obj is MCPLegacy.CreateTaskResult {
+	return (obj as MCPLegacy.CreateTaskResult).task !== undefined;
 }
 
 export function findMcpServer(mcpService: IMcpService, filter: (s: IMcpServer) => boolean, token?: CancellationToken) {
@@ -150,7 +150,7 @@ export function findMcpServer(mcpService: IMcpService, filter: (s: IMcpServer) =
 	});
 }
 
-export function translateMcpLogMessage(logger: ILogger, params: MCP.LoggingMessageNotificationParams, prefix = '') {
+export function translateMcpLogMessage(logger: ILogger, params: MCPLegacy.LoggingMessageNotificationParams, prefix = '') {
 	let contents = typeof params.data === 'string' ? params.data : JSON.stringify(params.data);
 	if (params.logger) {
 		contents = `${params.logger}: ${contents}`;

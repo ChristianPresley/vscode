@@ -14,7 +14,7 @@ import { IWorkspaceFolderData } from '../../../../platform/workspace/common/work
 import { IResolvedValue } from '../../../services/configurationResolver/common/configurationResolverExpression.js';
 import { McpTaskManager } from './mcpTaskManager.js';
 import { IMcpServerConnection, LazyCollectionState, McpCollectionDefinition, McpCollectionReference, McpConnectionState, McpDefinitionReference, McpServerDefinition, McpServerLaunch, McpStartServerInteraction } from './mcpTypes.js';
-import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
 export const IMcpRegistry = createDecorator<IMcpRegistry>('mcpRegistry');
 
@@ -22,8 +22,8 @@ export const IMcpRegistry = createDecorator<IMcpRegistry>('mcpRegistry');
 export interface IMcpMessageTransport extends IDisposable {
 	readonly state: IObservable<McpConnectionState>;
 	readonly onDidLog: Event<{ level: LogLevel; message: string }>;
-	readonly onDidReceiveMessage: Event<MCP.JSONRPCMessage>;
-	send(message: MCP.JSONRPCMessage): void;
+	readonly onDidReceiveMessage: Event<MCPLegacy.JSONRPCMessage>;
+	send(message: MCPLegacy.JSONRPCMessage): void;
 	stop(): void;
 }
 

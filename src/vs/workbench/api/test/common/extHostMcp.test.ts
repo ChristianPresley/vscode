@@ -15,7 +15,6 @@ import { MainThreadMcpShape } from '../../common/extHost.protocol.js';
 import { createAuthMetadata, CommonRequestInit, CommonResponse, IAuthMetadata, McpHTTPHandle } from '../../common/extHostMcp.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { McpConnectionState, McpServerTransportHTTP, McpServerTransportType } from '../../../contrib/mcp/common/mcpTypes.js';
-import { MCP } from '../../../contrib/mcp/common/modelContextProtocol.js';
 
 // Test constants to avoid magic strings
 const TEST_MCP_URL = 'https://example.com/mcp';
@@ -519,7 +518,7 @@ suite('ExtHostMcp', () => {
 			await handle['_fetchWithAuthRetry'](TEST_MCP_URL, { method: 'POST', headers }, headers);
 			const metadataRequest = requests.find(request => request.url === metadataUrl);
 			assert.ok(metadataRequest);
-			assert.strictEqual(metadataRequest.headers['MCP-Protocol-Version'], MCP.LATEST_PROTOCOL_VERSION);
+			assert.strictEqual(metadataRequest.headers['MCP-Protocol-Version'], '2025-11-25');
 		});
 
 		suite('first destinations', () => {

@@ -12,16 +12,9 @@ import { Disposable } from '../../../base/common/lifecycle.js';
 import { hasKey } from '../../../base/common/types.js';
 import { ILogger } from '../../log/common/log.js';
 import { IMcpGatewaySingleServerInvoker } from '../common/mcpGateway.js';
-import { MCP } from '../common/modelContextProtocol.js';
+import { LEGACY_MCP_PROTOCOL_VERSIONS } from '../common/mcpProtocolVersions.js';
+import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
 
-const MCP_LATEST_PROTOCOL_VERSION = '2025-11-25';
-const MCP_SUPPORTED_PROTOCOL_VERSIONS = [
-	'2025-11-25',
-	'2025-06-18',
-	'2025-03-26',
-	'2024-11-05',
-	'2024-10-07',
-];
 const MCP_INVALID_REQUEST = -32600;
 const MCP_METHOD_NOT_FOUND = -32601;
 const MCP_INVALID_PARAMS = -32602;
@@ -185,13 +178,13 @@ export class McpGatewaySession extends Disposable {
 		}
 	}
 
-	private _handleInitialize(request: IJsonRpcRequest): MCP.InitializeResult {
+	private _handleInitialize(request: IJsonRpcRequest): MCPLegacy.InitializeResult {
 		const params = typeof request.params === 'object' && request.params ? request.params as Record<string, unknown> : undefined;
 		const clientVersion = typeof params?.protocolVersion === 'string' ? params.protocolVersion : undefined;
 		const clientInfo = params?.clientInfo as { name?: string; version?: string } | undefined;
-		const negotiatedVersion = clientVersion && MCP_SUPPORTED_PROTOCOL_VERSIONS.includes(clientVersion)
+		const negotiatedVersion = clientVersion && LEGACY_MCP_PROTOCOL_VERSIONS.includes(clientVersion)
 			? clientVersion
-			: MCP_LATEST_PROTOCOL_VERSION;
+			: MCPLegacy.LATEST_PROTOCOL_VERSION;
 
 		this._logService.info(`[McpGateway] Initialize: client=${clientInfo?.name ?? 'unknown'}/${clientInfo?.version ?? '?'}, clientProtocol=${clientVersion ?? '(none)'}, negotiated=${negotiatedVersion}`);
 		if (clientVersion && clientVersion !== negotiatedVersion) {
@@ -215,7 +208,7 @@ export class McpGatewaySession extends Disposable {
 		};
 	}
 
-	private async _handleCallTool(request: IJsonRpcRequest): Promise<MCP.CallToolResult> {
+	private async _handleCallTool(request: IJsonRpcRequest): Promise<MCPLegacy.CallToolResult> {
 		const params = typeof request.params === 'object' && request.params ? request.params as Record<string, unknown> : undefined;
 		if (!params || typeof params.name !== 'string') {
 			throw new JsonRpcError(MCP_INVALID_PARAMS, 'Missing tool call params');
@@ -241,19 +234,19 @@ export class McpGatewaySession extends Disposable {
 		}
 	}
 
-	private async _handleListTools(): Promise<MCP.ListToolsResult> {
+	private async _handleListTools(): Promise<MCPLegacy.ListToolsResult> {
 		const tools = await this._serverInvoker.listTools();
 		this._logService.debug(`[McpGateway][session ${this.id}] Listed ${tools.length} tool(s): [${tools.map(t => t.name).join(', ')}]`);
-		return { tools: tools as MCP.Tool[] };
+		return { tools: tools as MCPLegacy.Tool[] };
 	}
 
-	private async _handleListResources(): Promise<MCP.ListResourcesResult> {
+	private async _handleListResources(): Promise<MCPLegacy.ListResourcesResult> {
 		const resources = await this._serverInvoker.listResources();
 		this._logService.debug(`[McpGateway][session ${this.id}] Listed ${resources.length} resource(s)`);
-		return { resources: resources as MCP.Resource[] };
+		return { resources: resources as MCPLegacy.Resource[] };
 	}
 
-	private async _handleReadResource(request: IJsonRpcRequest): Promise<MCP.ReadResourceResult> {
+	private async _handleReadResource(request: IJsonRpcRequest): Promise<MCPLegacy.ReadResourceResult> {
 		const params = typeof request.params === 'object' && request.params ? request.params as Record<string, unknown> : undefined;
 		if (!params || typeof params.uri !== 'string') {
 			throw new JsonRpcError(MCP_INVALID_PARAMS, 'Missing resource URI');
@@ -270,10 +263,10 @@ export class McpGatewaySession extends Disposable {
 		}
 	}
 
-	private async _handleListResourceTemplates(): Promise<MCP.ListResourceTemplatesResult> {
+	private async _handleListResourceTemplates(): Promise<MCPLegacy.ListResourceTemplatesResult> {
 		const resourceTemplates = await this._serverInvoker.listResourceTemplates();
 		this._logService.debug(`[McpGateway][session ${this.id}] Listed ${resourceTemplates.length} resource template(s)`);
-		return { resourceTemplates: resourceTemplates as MCP.ResourceTemplate[] };
+		return { resourceTemplates: resourceTemplates as MCPLegacy.ResourceTemplate[] };
 	}
 }
 

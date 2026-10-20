@@ -25,7 +25,7 @@ import { IMcpRegistry } from '../../common/mcpRegistryTypes.js';
 import { McpResourceFilesystem } from '../../common/mcpResourceFilesystem.js';
 import { McpService } from '../../common/mcpService.js';
 import { IMcpService } from '../../common/mcpTypes.js';
-import { MCP } from '../../common/modelContextProtocol.js';
+import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { TestMcpMessageTransport, TestMcpRegistry } from './mcpRegistryTypes.js';
 
 
@@ -76,7 +76,7 @@ suite('Workbench - MCP - ResourceFilesystem', () => {
 				jsonrpc: '2.0',
 				result: {
 					contents: [{ uri: request.params.uri, text: 'Hello World' }],
-				} satisfies MCP.ReadResourceResult
+				} satisfies MCPLegacy.ReadResourceResult
 			};
 		});
 
@@ -93,7 +93,7 @@ suite('Workbench - MCP - ResourceFilesystem', () => {
 				jsonrpc: '2.0',
 				result: {
 					contents: [{ uri: request.params.uri, text: 'Hello World' }],
-				} satisfies MCP.ReadResourceResult
+				} satisfies MCPLegacy.ReadResourceResult
 			};
 		});
 
@@ -114,7 +114,7 @@ suite('Workbench - MCP - ResourceFilesystem', () => {
 						{ uri: 'custom://hello/file1.txt', text: 'File 1' },
 						{ uri: 'custom://hello/file2.txt', text: 'File 2' },
 					],
-				} satisfies MCP.ReadResourceResult
+				} satisfies MCPLegacy.ReadResourceResult
 			};
 		});
 
@@ -132,7 +132,7 @@ suite('Workbench - MCP - ResourceFilesystem', () => {
 				jsonrpc: '2.0',
 				result: {
 					contents: [],
-				} satisfies MCP.ReadResourceResult
+				} satisfies MCPLegacy.ReadResourceResult
 			};
 		});
 
@@ -155,7 +155,7 @@ suite('Workbench - MCP - ResourceFilesystem', () => {
 						{ uri: 'custom://hello/dir/file2.txt', text: 'File 2' },
 						{ uri: 'custom://hello/dir/subdir/file3.txt', text: 'File 3' },
 					],
-				} satisfies MCP.ReadResourceResult
+				} satisfies MCPLegacy.ReadResourceResult
 			};
 		});
 
@@ -175,7 +175,7 @@ suite('Workbench - MCP - ResourceFilesystem', () => {
 				jsonrpc: '2.0',
 				result: {
 					contents: [{ uri: request.params.uri, text: 'This is a file' }],
-				} satisfies MCP.ReadResourceResult
+				} satisfies MCPLegacy.ReadResourceResult
 			};
 		});
 
@@ -194,7 +194,7 @@ suite('Workbench - MCP - ResourceFilesystem', () => {
 				jsonrpc: '2.0',
 				result: {
 					contents: [{ uri: request.params.uri, text: 'File content' }],
-				} satisfies MCP.ReadResourceResult
+				} satisfies MCPLegacy.ReadResourceResult
 			};
 		});
 
@@ -262,7 +262,7 @@ suite('Workbench - MCP - ResourceFilesystem', () => {
 				jsonrpc: '2.0',
 				result: {
 					contents: [{ uri: params.params.uri, blob: blobBase64 }],
-				} satisfies MCP.ReadResourceResult
+				} satisfies MCPLegacy.ReadResourceResult
 			};
 		});
 

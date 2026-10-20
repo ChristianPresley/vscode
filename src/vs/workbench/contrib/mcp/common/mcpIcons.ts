@@ -8,7 +8,7 @@ import { URI } from '../../../../base/common/uri.js';
 import { ILogger } from '../../../../platform/log/common/log.js';
 import { Dto } from '../../../services/extensions/common/proxyIdentifier.js';
 import { IMcpIcons, McpServerLaunch, McpServerTransportType } from './mcpTypes.js';
-import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
 const mcpAllowableContentTypes: readonly string[] = [
 	'image/webp',
@@ -37,7 +37,7 @@ export type ParsedMcpIcons = IIcon[];
 export type StoredMcpIcons = Dto<IIcon>[];
 
 
-function validateIcon(icon: MCP.Icon, launch: McpServerLaunch, logger: ILogger): URI | undefined {
+function validateIcon(icon: MCPLegacy.Icon, launch: McpServerLaunch, logger: ILogger): URI | undefined {
 	const mimeType = icon.mimeType?.toLowerCase() || getMediaMime(icon.src);
 	if (!mimeType || !mcpAllowableContentTypes.includes(mimeType)) {
 		logger.debug(`Ignoring icon with unsupported mime type: ${icon.src} (${mimeType}), allowed: ${mcpAllowableContentTypes.join(', ')}`);
@@ -77,7 +77,7 @@ function validateIcon(icon: MCP.Icon, launch: McpServerLaunch, logger: ILogger):
 	return;
 }
 
-export function parseAndValidateMcpIcon(icons: MCP.Icons, launch: McpServerLaunch, logger: ILogger): ParsedMcpIcons {
+export function parseAndValidateMcpIcon(icons: MCPLegacy.Icons, launch: McpServerLaunch, logger: ILogger): ParsedMcpIcons {
 	const result: ParsedMcpIcons = [];
 	for (const icon of icons.icons || []) {
 		const uri = validateIcon(icon, launch, logger);

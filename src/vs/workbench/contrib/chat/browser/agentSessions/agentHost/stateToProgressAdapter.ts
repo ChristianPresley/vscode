@@ -55,7 +55,7 @@ import { ChatRequestOriginKind, type IChatRequestOrigin } from '../../../common/
 import { AgentHostCompletionReferenceKind, restoreChatTranscriptContextVariableEntry, restorePasteVariableEntryFromAttachment, toAgentHostCompletionVariableEntryFromMetadata, type IAgentFeedbackVariableEntry, type IChatRequestVariableEntry, type IElementVariableEntry } from '../../../common/attachments/chatVariableEntries.js';
 import { type IToolConfirmationMessages, type IToolData, type IPreparedToolInvocation, type IToolResult, type IToolResultInputOutputDetails, ToolDataSource, ToolInvocationPresentation } from '../../../common/tools/languageModelToolsService.js';
 import { ChatToolInvocationSummary, getToolInvocationSummaryFromInput } from '../../../common/tools/toolInvocationSummary.js';
-import { MCP } from '../../../../mcp/common/modelContextProtocol.js';
+import { MCPLegacy } from '../../../../mcp/common/modelContextProtocolLegacy.js';
 import { basename, isEqual } from '../../../../../../base/common/resources.js';
 import { hasKey, type Mutable } from '../../../../../../base/common/types.js';
 import { localize } from '../../../../../../nls.js';
@@ -1997,14 +1997,14 @@ function getToolInputOutputDetails(tc: ToolCallState, isError: boolean, errorStr
 }
 
 /**
- * Reconstructs an {@link MCP.CallToolResult} for the MCP App's `ui/notifications/tool-result`.
+ * Reconstructs an {@link MCPLegacy.CallToolResult} for the MCP App's `ui/notifications/tool-result`.
  * Translates AHP content blocks into MCP content blocks and preserves the structured result object.
  */
-function toMcpCallToolResult(tc: ToolCallState, isError: boolean, connectionAuthority: string): MCP.CallToolResult | undefined {
+function toMcpCallToolResult(tc: ToolCallState, isError: boolean, connectionAuthority: string): MCPLegacy.CallToolResult | undefined {
 	if (tc.status !== ToolCallStatus.Completed && tc.status !== ToolCallStatus.Running) {
 		return undefined;
 	}
-	const content: MCP.ContentBlock[] = [];
+	const content: MCPLegacy.ContentBlock[] = [];
 	for (const block of tc.content ?? []) {
 		const mcpBlock = toMcpContentBlock(block, connectionAuthority);
 		if (mcpBlock) {
@@ -2018,7 +2018,7 @@ function toMcpCallToolResult(tc: ToolCallState, isError: boolean, connectionAuth
 	return { content, ...(structuredContent !== undefined ? { structuredContent } : {}), isError: isError || undefined };
 }
 
-function toMcpContentBlock(block: ToolResultContent, connectionAuthority: string): MCP.ContentBlock | undefined {
+function toMcpContentBlock(block: ToolResultContent, connectionAuthority: string): MCPLegacy.ContentBlock | undefined {
 	switch (block.type) {
 		case ToolResultContentType.Text:
 			return { type: 'text', text: block.text };

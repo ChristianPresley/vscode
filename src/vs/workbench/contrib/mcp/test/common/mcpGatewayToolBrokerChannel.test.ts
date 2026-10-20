@@ -12,7 +12,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/tes
 import { ContributionEnablementState } from '../../../chat/common/enablement.js';
 import { NullLogService } from '../../../../../platform/log/common/log.js';
 import { IMcpGatewayServerDescriptor } from '../../../../../platform/mcp/common/mcpGateway.js';
-import { MCP } from '../../common/modelContextProtocol.js';
+import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { McpGatewayToolBrokerChannel } from '../../common/mcpGatewayToolBrokerChannel.js';
 import { IMcpIcons, IMcpServer, IMcpTool, IMcpToolCallContext, McpConnectionState, McpServerCacheState, McpToolVisibility } from '../../common/mcpTypes.js';
 import { TestMcpService } from './testMcpService.js';
@@ -34,10 +34,10 @@ suite('McpGatewayToolBrokerChannel', () => {
 
 		mcpService.servers.set([serverA, serverB], undefined);
 
-		const resultA = await channel.call<readonly MCP.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
+		const resultA = await channel.call<readonly MCPLegacy.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
 		assert.deepStrictEqual(resultA.map(t => t.name), ['mcp_serverA_echo']);
 
-		const resultB = await channel.call<readonly MCP.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverB' });
+		const resultB = await channel.call<readonly MCPLegacy.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverB' });
 		assert.deepStrictEqual(resultB.map(t => t.name), ['mcp_serverB_echo']);
 
 		channel.dispose();
@@ -63,20 +63,20 @@ suite('McpGatewayToolBrokerChannel', () => {
 
 		mcpService.servers.set([serverA, serverB], undefined);
 
-		const resultA = await channel.call<MCP.CallToolResult>(undefined, 'callToolForServer', {
+		const resultA = await channel.call<MCPLegacy.CallToolResult>(undefined, 'callToolForServer', {
 			serverId: 'serverA',
 			name: 'mcp_serverA_echo',
 			args: { name: 'one' },
 		});
-		const resultB = await channel.call<MCP.CallToolResult>(undefined, 'callToolForServer', {
+		const resultB = await channel.call<MCPLegacy.CallToolResult>(undefined, 'callToolForServer', {
 			serverId: 'serverB',
 			name: 'mcp_serverB_echo',
 			args: { name: 'two' },
 		});
 
 		assert.deepStrictEqual(invoked, ['A:one', 'B:two']);
-		assert.strictEqual((resultA.content[0] as MCP.TextContent).text, 'from A');
-		assert.strictEqual((resultB.content[0] as MCP.TextContent).text, 'from B');
+		assert.strictEqual((resultA.content[0] as MCPLegacy.TextContent).text, 'from A');
+		assert.strictEqual((resultB.content[0] as MCPLegacy.TextContent).text, 'from B');
 
 		channel.dispose();
 	});
@@ -118,7 +118,7 @@ suite('McpGatewayToolBrokerChannel', () => {
 		);
 
 		mcpService.servers.set([server], undefined);
-		await channel.call<readonly MCP.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
+		await channel.call<readonly MCPLegacy.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
 
 		assert.strictEqual(server.startCalls, 0);
 		channel.dispose();
@@ -136,7 +136,7 @@ suite('McpGatewayToolBrokerChannel', () => {
 		);
 
 		mcpService.servers.set([server], undefined);
-		const tools = await channel.call<readonly MCP.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
+		const tools = await channel.call<readonly MCPLegacy.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
 
 		// Server started during the grace period; tools are now available.
 		assert.strictEqual(server.startCalls, 1);
@@ -156,7 +156,7 @@ suite('McpGatewayToolBrokerChannel', () => {
 		);
 
 		mcpService.servers.set([server], undefined);
-		const tools = await channel.call<readonly MCP.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
+		const tools = await channel.call<readonly MCPLegacy.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
 
 		// Outdated server gets the same grace period as Unknown — started and tools returned.
 		assert.strictEqual(server.startCalls, 1);
@@ -178,11 +178,11 @@ suite('McpGatewayToolBrokerChannel', () => {
 			mcpService.servers.set([server], undefined);
 
 			// First call: waits up to the grace period, server never starts → empty result.
-			const tools = await channel.call<readonly MCP.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
+			const tools = await channel.call<readonly MCPLegacy.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
 			assert.deepStrictEqual(tools, []);
 
 			// Second call: grace-period promise already resolved; returns immediately without re-waiting.
-			const tools2 = await channel.call<readonly MCP.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
+			const tools2 = await channel.call<readonly MCPLegacy.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
 			assert.deepStrictEqual(tools2, []);
 
 			channel.dispose();
@@ -203,7 +203,7 @@ suite('McpGatewayToolBrokerChannel', () => {
 			mcpService.servers.set([server], undefined);
 
 			// First call: grace period elapses, server never starts → empty.
-			const tools1 = await channel.call<readonly MCP.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
+			const tools1 = await channel.call<readonly MCPLegacy.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
 			assert.deepStrictEqual(tools1, []);
 			assert.strictEqual(server.startCalls, 1);
 
@@ -215,7 +215,7 @@ suite('McpGatewayToolBrokerChannel', () => {
 
 			// Second call: stale grace entry should be discarded, a new grace race starts,
 			// and the server successfully starts → tools returned.
-			const tools2 = await channel.call<readonly MCP.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
+			const tools2 = await channel.call<readonly MCPLegacy.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
 			assert.deepStrictEqual(tools2.map(t => t.name), ['echo']);
 			assert.strictEqual(server.startCalls, 2);
 
@@ -238,13 +238,13 @@ suite('McpGatewayToolBrokerChannel', () => {
 			mcpService.servers.set([server], undefined);
 
 			// First call: server starts successfully during grace period.
-			const tools1 = await channel.call<readonly MCP.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
+			const tools1 = await channel.call<readonly MCPLegacy.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
 			assert.deepStrictEqual(tools1.map(t => t.name), ['echo']);
 			assert.strictEqual(server.startCalls, 1);
 
 			// Second call: cacheState is now Live (server started), grace entry should NOT
 			// be invalidated, so no additional start call is made.
-			const tools2 = await channel.call<readonly MCP.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
+			const tools2 = await channel.call<readonly MCPLegacy.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
 			assert.deepStrictEqual(tools2.map(t => t.name), ['echo']);
 			assert.strictEqual(server.startCalls, 1);
 
@@ -282,7 +282,7 @@ suite('McpGatewayToolBrokerChannel', () => {
 		mcpService.servers.set([server], undefined);
 
 		const sessionUri = 'vscode-chat-session://test/session-123';
-		await channel.call<MCP.CallToolResult>(undefined, 'callToolForServer', {
+		await channel.call<MCPLegacy.CallToolResult>(undefined, 'callToolForServer', {
 			serverId: 'serverA',
 			name: 'echo',
 			args: { input: 'hello' },
@@ -307,7 +307,7 @@ suite('McpGatewayToolBrokerChannel', () => {
 
 		mcpService.servers.set([server], undefined);
 
-		await channel.call<MCP.CallToolResult>(undefined, 'callToolForServer', {
+		await channel.call<MCPLegacy.CallToolResult>(undefined, 'callToolForServer', {
 			serverId: 'serverA',
 			name: 'echo',
 			args: { input: 'hello' },
@@ -442,10 +442,10 @@ function createNeverStartingServer(
 function createToolWithContextCapture(
 	name: string,
 	receivedContexts: (IMcpToolCallContext | undefined)[],
-	call: (params: Record<string, unknown>) => Promise<MCP.CallToolResult>,
+	call: (params: Record<string, unknown>) => Promise<MCPLegacy.CallToolResult>,
 	visibility: McpToolVisibility = McpToolVisibility.Model,
 ): IMcpTool {
-	const definition: MCP.Tool = {
+	const definition: MCPLegacy.Tool = {
 		name,
 		description: `Tool ${name}`,
 		inputSchema: { type: 'object', properties: { input: { type: 'string' } } },
@@ -469,8 +469,8 @@ function createToolWithContextCapture(
 	};
 }
 
-function createTool(name: string, call: (params: Record<string, unknown>) => Promise<MCP.CallToolResult>, visibility: McpToolVisibility = McpToolVisibility.Model): IMcpTool {
-	const definition: MCP.Tool = {
+function createTool(name: string, call: (params: Record<string, unknown>) => Promise<MCPLegacy.CallToolResult>, visibility: McpToolVisibility = McpToolVisibility.Model): IMcpTool {
+	const definition: MCPLegacy.Tool = {
 		name,
 		description: `Tool ${name}`,
 		inputSchema: {

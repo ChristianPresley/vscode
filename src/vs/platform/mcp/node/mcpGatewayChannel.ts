@@ -8,7 +8,7 @@ import { Disposable, DisposableMap, DisposableStore } from '../../../base/common
 import { IPCServer, IServerChannel } from '../../../base/parts/ipc/common/ipc.js';
 import { ILoggerService } from '../../log/common/log.js';
 import { IMcpGatewayServerDescriptor, IMcpGatewayServerInfo, IMcpGatewayService, McpGatewayToolBrokerChannelName } from '../common/mcpGateway.js';
-import { MCP } from '../common/modelContextProtocol.js';
+import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
 
 /**
  * IPC channel for the MCP Gateway service, used by the remote server.
@@ -72,11 +72,11 @@ export class McpGatewayChannel<TContext> extends Disposable implements IServerCh
 					onDidChangeTools: brokerChannel.listen<void>('onDidChangeTools'),
 					onDidChangeResources: brokerChannel.listen<void>('onDidChangeResources'),
 					listServers: () => currentServers,
-					listToolsForServer: serverId => brokerChannel.call<readonly MCP.Tool[]>('listToolsForServer', { serverId }),
-					callToolForServer: (serverId, name, callArgs) => brokerChannel.call<MCP.CallToolResult>('callToolForServer', { serverId, name, args: callArgs, chatSessionResource }),
-					listResourcesForServer: serverId => brokerChannel.call<readonly MCP.Resource[]>('listResourcesForServer', { serverId }),
-					readResourceForServer: (serverId, uri) => brokerChannel.call<MCP.ReadResourceResult>('readResourceForServer', { serverId, uri }),
-					listResourceTemplatesForServer: serverId => brokerChannel.call<readonly MCP.ResourceTemplate[]>('listResourceTemplatesForServer', { serverId }),
+					listToolsForServer: serverId => brokerChannel.call<readonly MCPLegacy.Tool[]>('listToolsForServer', { serverId }),
+					callToolForServer: (serverId, name, callArgs) => brokerChannel.call<MCPLegacy.CallToolResult>('callToolForServer', { serverId, name, args: callArgs, chatSessionResource }),
+					listResourcesForServer: serverId => brokerChannel.call<readonly MCPLegacy.Resource[]>('listResourcesForServer', { serverId }),
+					readResourceForServer: (serverId, uri) => brokerChannel.call<MCPLegacy.ReadResourceResult>('readResourceForServer', { serverId, uri }),
+					listResourceTemplatesForServer: serverId => brokerChannel.call<readonly MCPLegacy.ResourceTemplate[]>('listResourceTemplatesForServer', { serverId }),
 				});
 				// Forward server change events via IPC
 				const gatewayStore = new DisposableStore();

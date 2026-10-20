@@ -21,7 +21,7 @@ import { canLog, ILogService, LogLevel } from '../../../platform/log/common/log.
 import product from '../../../platform/product/common/product.js';
 import { StorageScope } from '../../../platform/storage/common/storage.js';
 import { extensionPrefixedIdentifier, McpCollectionDefinition, McpConnectionState, McpServerDefinition, McpServerEnvironmentVariableExpansion, McpServerLaunch, McpServerStaticMetadata, McpServerStaticToolAvailability, McpServerTransportHTTP, McpServerTransportType, UserInteractionRequiredError } from '../../contrib/mcp/common/mcpTypes.js';
-import { MCP } from '../../contrib/mcp/common/modelContextProtocol.js';
+import { MCPLegacy } from '../../contrib/mcp/common/modelContextProtocolLegacy.js';
 import { checkProposedApiEnabled, isProposedApiEnabled } from '../../services/extensions/common/extensions.js';
 import { ExtHostMcpShape, IMcpAuthenticationDetails, IAuthMetadataSource, IStartMcpOptions, MainContext, MainThreadMcpShape, IAuthResourceMetadataSource, IAuthServerMetadataSource } from './extHost.protocol.js';
 import { IExtHostInitDataService } from './extHostInitDataService.js';
@@ -218,12 +218,12 @@ export class ExtHostMcpService extends Disposable implements IExtHostMpcService 
 				const castAs2 = item as McpStdioServerDefinition | McpHttpServerDefinition;
 				if (isProposedApiEnabled(extension, 'mcpToolDefinitions') && castAs2.metadata) {
 					staticMetadata = {
-						capabilities: castAs2.metadata.capabilities as MCP.ServerCapabilities,
+						capabilities: castAs2.metadata.capabilities as MCPLegacy.ServerCapabilities,
 						instructions: castAs2.metadata.instructions,
-						serverInfo: castAs2.metadata.serverInfo as MCP.Implementation,
+						serverInfo: castAs2.metadata.serverInfo as MCPLegacy.Implementation,
 						tools: castAs2.metadata.tools?.map(t => ({
 							availability: t.availability === McpToolAvailability.Dynamic ? McpServerStaticToolAvailability.Dynamic : McpServerStaticToolAvailability.Initial,
-							definition: t.definition as MCP.Tool,
+							definition: t.definition as MCPLegacy.Tool,
 						})),
 					};
 				}
@@ -843,7 +843,7 @@ export class McpHTTPHandle extends Disposable {
 		let res = await doFetch();
 		if (isAuthStatusCode(res.status)) {
 			if (!this._authMetadata) {
-				const protocolHeaders = { 'MCP-Protocol-Version': MCP.LATEST_PROTOCOL_VERSION };
+				const protocolHeaders = { 'MCP-Protocol-Version': MCPLegacy.LATEST_PROTOCOL_VERSION };
 				this._authMetadata = await createAuthMetadata(mcpUrl, res.headers, {
 					sameOriginHeaders: {
 						...Object.fromEntries(this._launch.headers),
@@ -851,7 +851,7 @@ export class McpHTTPHandle extends Disposable {
 					},
 					fetch: (url, init) => this._fetch(url, init, {
 						isAuthMetadata: true,
-						transportHeaders: init.headers['MCP-Protocol-Version'] === MCP.LATEST_PROTOCOL_VERSION ? protocolHeaders : undefined,
+						transportHeaders: init.headers['MCP-Protocol-Version'] === MCPLegacy.LATEST_PROTOCOL_VERSION ? protocolHeaders : undefined,
 					}),
 					log: (level, message) => this._log(level, message)
 				});

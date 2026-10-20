@@ -34,7 +34,7 @@ import { ContributionEnablementState, IEnablementModel } from '../../chat/common
 import { ToolProgress } from '../../chat/common/tools/languageModelToolsService.js';
 import { ExternalDiscoverySource, IMcpServerSamplingConfiguration } from './mcpConfiguration.js';
 import { McpServerRequestHandler } from './mcpServerRequestHandler.js';
-import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 import { UriTemplate } from '../../../../base/common/uriTemplate.js';
 
 export const extensionMcpCollectionPrefix = 'ext.';
@@ -244,10 +244,10 @@ export const enum McpServerStaticToolAvailability {
 }
 
 export interface McpServerStaticMetadata {
-	tools?: { availability: McpServerStaticToolAvailability; definition: MCP.Tool }[];
+	tools?: { availability: McpServerStaticToolAvailability; definition: MCPLegacy.Tool }[];
 	instructions?: string;
-	capabilities?: MCP.ServerCapabilities;
-	serverInfo?: MCP.Implementation;
+	capabilities?: MCPLegacy.ServerCapabilities;
+	serverInfo?: MCPLegacy.Implementation;
 }
 
 /**
@@ -594,7 +594,7 @@ export interface IMcpPrompt {
 	readonly name: string;
 	readonly title?: string;
 	readonly description?: string;
-	readonly arguments: readonly MCP.PromptArgument[];
+	readonly arguments: readonly MCPLegacy.PromptArgument[];
 
 	/** Gets string completions for the given prompt part. */
 	complete(argument: string, prefix: string, alreadyResolved: Record<string, string>, token: CancellationToken): Promise<string[]>;
@@ -607,7 +607,7 @@ export const mcpPromptReplaceSpecialChars = (s: string) => s.replace(/[^a-z0-9_.
 export const mcpPromptPrefix = (definition: McpDefinitionReference) =>
 	`/mcp.` + mcpPromptReplaceSpecialChars(definition.label);
 
-export interface IMcpPromptMessage extends MCP.PromptMessage { }
+export interface IMcpPromptMessage extends MCPLegacy.PromptMessage { }
 
 export interface IMcpToolCallContext {
 	chatSessionResource: URI | undefined;
@@ -674,7 +674,7 @@ export interface IMcpTool {
 	/** Name for #referencing in chat */
 	readonly referenceName: string;
 	readonly icons: IMcpIcons;
-	readonly definition: MCP.Tool;
+	readonly definition: MCPLegacy.Tool;
 	/** Visibility of the tool (Model, App, or both). Defaults to Model | App. */
 	readonly visibility: McpToolVisibility;
 	/** Optional UI resource URI for MCP App rendering */
@@ -685,12 +685,12 @@ export interface IMcpTool {
 	 * @throws {@link MpcResponseError} if the tool fails to execute
 	 * @throws {@link McpConnectionFailedError} if the connection to the server fails
 	 */
-	call(params: Record<string, unknown>, context?: IMcpToolCallContext, token?: CancellationToken): Promise<MCP.CallToolResult>;
+	call(params: Record<string, unknown>, context?: IMcpToolCallContext, token?: CancellationToken): Promise<MCPLegacy.CallToolResult>;
 
 	/**
 	 * Identical to {@link call}, but reports progress.
 	 */
-	callWithProgress(params: Record<string, unknown>, progress: ToolProgress, context?: IMcpToolCallContext, token?: CancellationToken): Promise<MCP.CallToolResult>;
+	callWithProgress(params: Record<string, unknown>, progress: ToolProgress, context?: IMcpToolCallContext, token?: CancellationToken): Promise<MCPLegacy.CallToolResult>;
 }
 
 export const enum McpServerTransportType {
@@ -897,9 +897,9 @@ export interface IMcpServerConnection extends IDisposable {
 /** Client methods whose implementations are passed through the server connection. */
 export interface IMcpClientMethods {
 	/** Handler for `sampling/createMessage` */
-	createMessageRequestHandler?(req: MCP.CreateMessageRequest['params'], token?: CancellationToken): Promise<MCP.CreateMessageResult>;
+	createMessageRequestHandler?(req: MCPLegacy.CreateMessageRequest['params'], token?: CancellationToken): Promise<MCPLegacy.CreateMessageResult>;
 	/** Handler for `elicitation/create` */
-	elicitationRequestHandler?(req: MCP.ElicitRequest['params'], token?: CancellationToken): Promise<MCP.ElicitResult>;
+	elicitationRequestHandler?(req: MCPLegacy.ElicitRequest['params'], token?: CancellationToken): Promise<MCPLegacy.ElicitResult>;
 }
 
 /**
@@ -1206,11 +1206,11 @@ export const enum McpCapability {
 export interface ISamplingOptions {
 	server: IMcpServer;
 	isDuringToolCall: boolean;
-	params: MCP.CreateMessageRequest['params'];
+	params: MCPLegacy.CreateMessageRequest['params'];
 }
 
 export interface ISamplingResult {
-	sample: MCP.CreateMessageResult;
+	sample: MCPLegacy.CreateMessageResult;
 }
 
 export interface IMcpSamplingService {
@@ -1231,7 +1231,7 @@ export const IMcpSamplingService = createDecorator<IMcpSamplingService>('IMcpSer
 
 export class McpError extends Error {
 	public static methodNotFound(method: string) {
-		return new McpError(MCP.METHOD_NOT_FOUND, `Method not found: ${method}`);
+		return new McpError(MCPLegacy.METHOD_NOT_FOUND, `Method not found: ${method}`);
 	}
 
 	public static notAllowed() {
@@ -1239,7 +1239,7 @@ export class McpError extends Error {
 	}
 
 	public static unknown(e: Error) {
-		const mcpError = new McpError(MCP.INTERNAL_ERROR, `Unknown error: ${e.stack}`);
+		const mcpError = new McpError(MCPLegacy.INTERNAL_ERROR, `Unknown error: ${e.stack}`);
 		mcpError.cause = e;
 		return mcpError;
 	}
@@ -1271,7 +1271,7 @@ export interface IMcpElicitationService {
 	 * @param elicitation Request to elicit a response.
 	 * @returns A promise that resolves to an {@link ElicitationResult}.
 	 */
-	elicit(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCP.ElicitRequest['params'], token: CancellationToken): Promise<ElicitResult>;
+	elicit(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCPLegacy.ElicitRequest['params'], token: CancellationToken): Promise<ElicitResult>;
 }
 
 export const enum ElicitationKind {
@@ -1281,7 +1281,7 @@ export const enum ElicitationKind {
 
 export interface IUrlModeElicitResult extends IDisposable {
 	kind: ElicitationKind.URL;
-	value: MCP.ElicitResult;
+	value: MCPLegacy.ElicitResult;
 	/**
 	 * Waits until the server tells us the elicitation is completed before resolving.
 	 * Rejects with a CancellationError if the server stops before elicitation is
@@ -1292,7 +1292,7 @@ export interface IUrlModeElicitResult extends IDisposable {
 
 export interface IFormModeElicitResult extends IDisposable {
 	kind: ElicitationKind.Form;
-	value: MCP.ElicitResult;
+	value: MCPLegacy.ElicitResult;
 }
 
 export type ElicitResult = IUrlModeElicitResult | IFormModeElicitResult;

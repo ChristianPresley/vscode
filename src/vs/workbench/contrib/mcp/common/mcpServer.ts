@@ -45,7 +45,7 @@ import { McpServerRequestHandler } from './mcpServerRequestHandler.js';
 import { McpTaskManager } from './mcpTaskManager.js';
 import { ElicitationKind, extensionMcpCollectionPrefix, IMcpElicitationService, IMcpIcons, IMcpPotentialSandboxBlock, IMcpPrompt, IMcpPromptMessage, IMcpResource, IMcpResourceTemplate, IMcpSamplingService, IMcpServer, IMcpServerConnection, IMcpServerStartOpts, IMcpTool, IMcpToolCallContext, McpCapability, McpCollectionDefinition, McpCollectionReference, McpConnectionFailedError, McpConnectionState, McpDefinitionReference, mcpPromptReplaceSpecialChars, McpResourceURI, McpServerCacheState, McpServerDefinition, McpServerLaunch, McpServerStaticToolAvailability, McpServerTransportType, McpToolName, McpToolVisibility, MpcResponseError, UserInteractionRequiredError } from './mcpTypes.js';
 import { ContributionEnablementState, IEnablementModel } from '../../chat/common/enablement.js';
-import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 import { McpApps } from './modelContextProtocolApps.js';
 import { UriTemplate } from '../../../../base/common/uriTemplate.js';
 
@@ -111,7 +111,7 @@ type ServerBootStateClassification = {
 	time: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; isMeasurement: true; comment: 'Duration in milliseconds to reach that state' };
 };
 
-type StoredMcpPrompt = MCP.Prompt & { _icons: StoredMcpIcons };
+type StoredMcpPrompt = MCPLegacy.Prompt & { _icons: StoredMcpIcons };
 
 interface IToolCacheEntry {
 	readonly serverName: string | undefined;
@@ -264,7 +264,7 @@ export class McpPrefixGenerator {
 	}
 }
 
-type ValidatedMcpTool = MCP.Tool & {
+type ValidatedMcpTool = MCPLegacy.Tool & {
 	_icons: StoredMcpIcons;
 
 	/**
@@ -1054,7 +1054,7 @@ export class McpServer extends Disposable implements IMcpServer {
 		});
 	}
 
-	private async _normalizeTool(originalTool: MCP.Tool): Promise<ValidatedMcpTool | { error: string[] }> {
+	private async _normalizeTool(originalTool: MCPLegacy.Tool): Promise<ValidatedMcpTool | { error: string[] }> {
 		// Parse MCP Apps UI metadata from _meta.ui
 		const uiMeta = originalTool._meta?.ui as McpApps.McpUiToolMeta | undefined;
 
@@ -1122,7 +1122,7 @@ export class McpServer extends Disposable implements IMcpServer {
 		return { error: messages };
 	}
 
-	private async _getValidatedTools(tools: MCP.Tool[]): Promise<ValidatedMcpTool[]> {
+	private async _getValidatedTools(tools: MCPLegacy.Tool[]): Promise<ValidatedMcpTool[]> {
 		let error = '';
 
 		const validations = await Promise.all(tools.map(t => this._normalizeTool(t)));
@@ -1153,7 +1153,7 @@ export class McpServer extends Disposable implements IMcpServer {
 	 * against some of that connection's data. The icons may however be stored
 	 * and rehydrated later.
 	 */
-	private _parseIcons(icons: MCP.Icons) {
+	private _parseIcons(icons: MCPLegacy.Icons) {
 		const cnx = this._connection.get();
 		if (!cnx) {
 			return [];
@@ -1162,7 +1162,7 @@ export class McpServer extends Disposable implements IMcpServer {
 		return parseAndValidateMcpIcon(icons, cnx.launchDefinition, this._logger);
 	}
 
-	private _setServerTools(nonce: string | undefined, toolsPromise: Promise<MCP.Tool[]>, tx: ITransaction | undefined) {
+	private _setServerTools(nonce: string | undefined, toolsPromise: Promise<MCPLegacy.Tool[]>, tx: ITransaction | undefined) {
 		const toolPromiseSafe = toolsPromise.then(async tools => {
 			this._logger.info(`Discovered ${tools.length} tools`);
 			const data = await this._getValidatedTools(tools);
@@ -1173,7 +1173,7 @@ export class McpServer extends Disposable implements IMcpServer {
 		return toolPromiseSafe;
 	}
 
-	private _setServerPrompts(nonce: string | undefined, promptsPromise: Promise<MCP.Prompt[]>, tx: ITransaction | undefined) {
+	private _setServerPrompts(nonce: string | undefined, promptsPromise: Promise<MCPLegacy.Prompt[]>, tx: ITransaction | undefined) {
 		const promptsPromiseSafe = promptsPromise.then((result): { data: StoredMcpPrompt[]; nonce: string | undefined } => {
 			const data: StoredMcpPrompt[] = result.map(prompt => ({
 				...prompt,
@@ -1187,7 +1187,7 @@ export class McpServer extends Disposable implements IMcpServer {
 		return promptsPromiseSafe;
 	}
 
-	private _toStoredMetadata(serverInfo?: MCP.Implementation, instructions?: string): StoredServerMetadata {
+	private _toStoredMetadata(serverInfo?: MCPLegacy.Implementation, instructions?: string): StoredServerMetadata {
 		return {
 			serverName: serverInfo ? serverInfo.title || serverInfo.name : undefined,
 			serverInstructions: instructions,
@@ -1197,7 +1197,7 @@ export class McpServer extends Disposable implements IMcpServer {
 
 	private _setServerMetadata(
 		nonce: string | undefined,
-		{ serverInfo, instructions, capabilities }: { serverInfo: MCP.Implementation; instructions: string | undefined; capabilities: MCP.ServerCapabilities },
+		{ serverInfo, instructions, capabilities }: { serverInfo: MCPLegacy.Implementation; instructions: string | undefined; capabilities: MCPLegacy.ServerCapabilities },
 		tx: ITransaction | undefined,
 	) {
 		const serverMetadata: StoredServerMetadata = this._toStoredMetadata(serverInfo, instructions);
@@ -1256,7 +1256,7 @@ class McpPrompt implements IMcpPrompt {
 	readonly name: string;
 	readonly description?: string;
 	readonly title?: string;
-	readonly arguments: readonly MCP.PromptArgument[];
+	readonly arguments: readonly MCPLegacy.PromptArgument[];
 	readonly icons: IMcpIcons;
 
 	constructor(
@@ -1286,7 +1286,7 @@ class McpPrompt implements IMcpPrompt {
 	}
 }
 
-function encodeCapabilities(cap: MCP.ServerCapabilities): McpCapability {
+function encodeCapabilities(cap: MCPLegacy.ServerCapabilities): McpCapability {
 	let out = 0;
 	if (cap.logging) { out |= McpCapability.Logging; }
 	if (cap.completions) { out |= McpCapability.Completions; }
@@ -1321,7 +1321,7 @@ export class McpTool implements IMcpTool {
 	readonly icons: IMcpIcons;
 	readonly visibility: McpToolVisibility;
 
-	public get definition(): MCP.Tool { return this._definition; }
+	public get definition(): MCPLegacy.Tool { return this._definition; }
 	public get uiResourceUri(): string | undefined { return this._definition.uiResourceUri; }
 
 	constructor(
@@ -1336,7 +1336,7 @@ export class McpTool implements IMcpTool {
 		this.visibility = _definition.visibility ?? (McpToolVisibility.Model | McpToolVisibility.App);
 	}
 
-	async call(params: Record<string, unknown>, context?: IMcpToolCallContext, token?: CancellationToken): Promise<MCP.CallToolResult> {
+	async call(params: Record<string, unknown>, context?: IMcpToolCallContext, token?: CancellationToken): Promise<MCPLegacy.CallToolResult> {
 		if (context) { this._server.runningToolCalls.add(context); }
 		try {
 			return await this._callWithProgress(params, undefined, context, token);
@@ -1345,7 +1345,7 @@ export class McpTool implements IMcpTool {
 		}
 	}
 
-	async callWithProgress(params: Record<string, unknown>, progress: ToolProgress, context?: IMcpToolCallContext, token?: CancellationToken): Promise<MCP.CallToolResult> {
+	async callWithProgress(params: Record<string, unknown>, progress: ToolProgress, context?: IMcpToolCallContext, token?: CancellationToken): Promise<MCPLegacy.CallToolResult> {
 		if (context) { this._server.runningToolCalls.add(context); }
 		try {
 			return await this._callWithProgress(params, progress, context, token);
@@ -1354,7 +1354,7 @@ export class McpTool implements IMcpTool {
 		}
 	}
 
-	_callWithProgress(params: Record<string, unknown>, progress: ToolProgress | undefined, context?: IMcpToolCallContext, token = CancellationToken.None, allowRetry = true): Promise<MCP.CallToolResult> {
+	_callWithProgress(params: Record<string, unknown>, progress: ToolProgress | undefined, context?: IMcpToolCallContext, token = CancellationToken.None, allowRetry = true): Promise<MCPLegacy.CallToolResult> {
 		// serverToolName is always set now, but older cache entries (from 1.99-Insiders) may not have it.
 		const name = this._definition.serverToolName ?? this._definition.name;
 		const progressToken = progress ? generateUuid() : undefined;
@@ -1406,7 +1406,7 @@ export class McpTool implements IMcpTool {
 				return result;
 			} catch (err) {
 				// Handle URL elicitation required error
-				if (err instanceof MpcResponseError && err.code === MCP.URL_ELICITATION_REQUIRED && allowRetry) {
+				if (err instanceof MpcResponseError && err.code === MCPLegacy.URL_ELICITATION_REQUIRED && allowRetry) {
 					await this._handleElicitationErr(err, context, token);
 					return this._callWithProgress(params, progress, context, token, false);
 				}
@@ -1424,7 +1424,7 @@ export class McpTool implements IMcpTool {
 	}
 
 	private async _handleElicitationErr(err: MpcResponseError, context: IMcpToolCallContext | undefined, token: CancellationToken) {
-		const elicitations = (err.data as MCP.URLElicitationRequiredError['error']['data'])?.elicitations;
+		const elicitations = (err.data as MCPLegacy.URLElicitationRequiredError['error']['data'])?.elicitations;
 		if (Array.isArray(elicitations) && elicitations.length > 0) {
 			for (const elicitation of elicitations) {
 				const elicitResult = await this._elicitationService.elicit(this._server, context, elicitation, token);
@@ -1486,7 +1486,7 @@ class McpResource implements IMcpResource {
 
 	constructor(
 		server: McpServer,
-		original: MCP.Resource,
+		original: MCPLegacy.Resource,
 		public readonly icons: IMcpIcons,
 	) {
 		this.mcpUri = original.uri;
@@ -1508,7 +1508,7 @@ class McpResourceTemplate implements IMcpResourceTemplate {
 
 	constructor(
 		private readonly _server: McpServer,
-		private readonly _definition: MCP.ResourceTemplate,
+		private readonly _definition: MCPLegacy.ResourceTemplate,
 		public readonly icons: IMcpIcons,
 	) {
 		this.name = _definition.name;

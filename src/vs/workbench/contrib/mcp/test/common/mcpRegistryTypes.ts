@@ -15,7 +15,7 @@ import { IResolvedValue } from '../../../../services/configurationResolver/commo
 import { IMcpHostDelegate, IMcpMessageTransport, IMcpRegistry, IMcpResolveConnectionOptions } from '../../common/mcpRegistryTypes.js';
 import { McpServerConnection } from '../../common/mcpServerConnection.js';
 import { IMcpServerConnection, LazyCollectionState, McpCollectionDefinition, McpCollectionReference, McpConnectionState, McpDefinitionReference, McpServerDefinition, McpServerTransportType, McpServerTrust } from '../../common/mcpTypes.js';
-import { MCP } from '../../common/modelContextProtocol.js';
+import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 
 /**
  * Implementation of IMcpMessageTransport for testing purposes.
@@ -25,22 +25,22 @@ export class TestMcpMessageTransport extends Disposable implements IMcpMessageTr
 	private readonly _onDidLog = this._register(new Emitter<{ level: LogLevel; message: string }>());
 	public readonly onDidLog = this._onDidLog.event;
 
-	private readonly _onDidReceiveMessage = this._register(new Emitter<MCP.JSONRPCMessage>());
+	private readonly _onDidReceiveMessage = this._register(new Emitter<MCPLegacy.JSONRPCMessage>());
 	public readonly onDidReceiveMessage = this._onDidReceiveMessage.event;
 
 	private readonly _stateValue = observableValue<McpConnectionState>('testTransportState', { state: McpConnectionState.Kind.Starting });
 	public readonly state = this._stateValue;
 
-	private readonly _sentMessages: MCP.JSONRPCMessage[] = [];
+	private readonly _sentMessages: MCPLegacy.JSONRPCMessage[] = [];
 
 	constructor() {
 		super();
 
 		this.setResponder('initialize', () => ({
-			jsonrpc: MCP.JSONRPC_VERSION,
+			jsonrpc: MCPLegacy.JSONRPC_VERSION,
 			id: 1, // The handler uses 1 for the first request
 			result: {
-				protocolVersion: MCP.LATEST_PROTOCOL_VERSION,
+				protocolVersion: MCPLegacy.LATEST_PROTOCOL_VERSION,
 				serverInfo: {
 					name: 'Test MCP Server',
 					version: '1.0.0',
@@ -62,19 +62,19 @@ export class TestMcpMessageTransport extends Disposable implements IMcpMessageTr
 	 * The responder receives the sent message and should return a response object,
 	 * which will be simulated as a server response.
 	 */
-	public setResponder(method: string, responder: (message: unknown) => MCP.JSONRPCMessage | undefined): void {
+	public setResponder(method: string, responder: (message: unknown) => MCPLegacy.JSONRPCMessage | undefined): void {
 		if (!this._responders) {
 			this._responders = new Map();
 		}
 		this._responders.set(method, responder);
 	}
 
-	private _responders?: Map<string, (message: MCP.JSONRPCMessage) => MCP.JSONRPCMessage | undefined>;
+	private _responders?: Map<string, (message: MCPLegacy.JSONRPCMessage) => MCPLegacy.JSONRPCMessage | undefined>;
 
 	/**
 	 * Send a message through the transport.
 	 */
-	public send(message: MCP.JSONRPCMessage): void {
+	public send(message: MCPLegacy.JSONRPCMessage): void {
 		this._sentMessages.push(message);
 		if (this._responders && 'method' in message && typeof message.method === 'string') {
 			const responder = this._responders.get(message.method);
@@ -99,7 +99,7 @@ export class TestMcpMessageTransport extends Disposable implements IMcpMessageTr
 	/**
 	 * Simulate receiving a message from the server.
 	 */
-	public simulateReceiveMessage(message: MCP.JSONRPCMessage): void {
+	public simulateReceiveMessage(message: MCPLegacy.JSONRPCMessage): void {
 		this._onDidReceiveMessage.fire(message);
 	}
 
@@ -112,10 +112,10 @@ export class TestMcpMessageTransport extends Disposable implements IMcpMessageTr
 		}
 
 		this.simulateReceiveMessage({
-			jsonrpc: MCP.JSONRPC_VERSION,
-			id: (this.getSentMessages()[0] as MCP.JSONRPCRequest).id,
+			jsonrpc: MCPLegacy.JSONRPC_VERSION,
+			id: (this.getSentMessages()[0] as MCPLegacy.JSONRPCRequest).id,
 			result: {
-				protocolVersion: MCP.LATEST_PROTOCOL_VERSION,
+				protocolVersion: MCPLegacy.LATEST_PROTOCOL_VERSION,
 				capabilities: {
 					tools: {},
 				},
@@ -123,7 +123,7 @@ export class TestMcpMessageTransport extends Disposable implements IMcpMessageTr
 					name: 'Test Server',
 					version: '1.0.0'
 				},
-			} satisfies MCP.InitializeResult
+			} satisfies MCPLegacy.InitializeResult
 		});
 	}
 
@@ -144,7 +144,7 @@ export class TestMcpMessageTransport extends Disposable implements IMcpMessageTr
 	/**
 	 * Get all messages that have been sent.
 	 */
-	public getSentMessages(): readonly MCP.JSONRPCMessage[] {
+	public getSentMessages(): readonly MCPLegacy.JSONRPCMessage[] {
 		return [...this._sentMessages];
 	}
 

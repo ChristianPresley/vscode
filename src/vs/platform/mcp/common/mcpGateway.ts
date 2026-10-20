@@ -6,7 +6,7 @@
 import { Event } from '../../../base/common/event.js';
 import { URI } from '../../../base/common/uri.js';
 import { createDecorator } from '../../instantiation/common/instantiation.js';
-import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
 export const IMcpGatewayService = createDecorator<IMcpGatewayService>('IMcpGatewayService');
 
@@ -36,11 +36,11 @@ export interface IMcpGatewayServerInfo {
 export interface IMcpGatewaySingleServerInvoker {
 	readonly onDidChangeTools: Event<void>;
 	readonly onDidChangeResources: Event<void>;
-	listTools(): Promise<readonly MCP.Tool[]>;
-	callTool(name: string, args: Record<string, unknown>): Promise<MCP.CallToolResult>;
-	listResources(): Promise<readonly MCP.Resource[]>;
-	readResource(uri: string): Promise<MCP.ReadResourceResult>;
-	listResourceTemplates(): Promise<readonly MCP.ResourceTemplate[]>;
+	listTools(): Promise<readonly MCPLegacy.Tool[]>;
+	callTool(name: string, args: Record<string, unknown>): Promise<MCPLegacy.CallToolResult>;
+	listResources(): Promise<readonly MCPLegacy.Resource[]>;
+	readResource(uri: string): Promise<MCPLegacy.ReadResourceResult>;
+	listResourceTemplates(): Promise<readonly MCPLegacy.ResourceTemplate[]>;
 }
 
 /**
@@ -53,11 +53,11 @@ export interface IMcpGatewayToolInvoker {
 	readonly onDidChangeTools: Event<void>;
 	readonly onDidChangeResources: Event<void>;
 	listServers(): readonly IMcpGatewayServerDescriptor[];
-	listToolsForServer(serverId: string): Promise<readonly MCP.Tool[]>;
-	callToolForServer(serverId: string, name: string, args: Record<string, unknown>): Promise<MCP.CallToolResult>;
-	listResourcesForServer(serverId: string): Promise<readonly MCP.Resource[]>;
-	readResourceForServer(serverId: string, uri: string): Promise<MCP.ReadResourceResult>;
-	listResourceTemplatesForServer(serverId: string): Promise<readonly MCP.ResourceTemplate[]>;
+	listToolsForServer(serverId: string): Promise<readonly MCPLegacy.Tool[]>;
+	callToolForServer(serverId: string, name: string, args: Record<string, unknown>): Promise<MCPLegacy.CallToolResult>;
+	listResourcesForServer(serverId: string): Promise<readonly MCPLegacy.Resource[]>;
+	readResourceForServer(serverId: string, uri: string): Promise<MCPLegacy.ReadResourceResult>;
+	listResourceTemplatesForServer(serverId: string): Promise<readonly MCPLegacy.ResourceTemplate[]>;
 }
 
 /**

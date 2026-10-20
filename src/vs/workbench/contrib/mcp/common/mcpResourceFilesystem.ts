@@ -23,14 +23,14 @@ import { McpServer } from './mcpServer.js';
 import { McpServerRequestHandler } from './mcpServerRequestHandler.js';
 import { IMcpService, McpCapability, McpResourceURI } from './mcpTypes.js';
 import { canLoadMcpNetworkResourceDirectly } from './mcpTypesUtils.js';
-import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
 const MOMENTARY_CACHE_DURATION = 3000;
 
 interface IReadData {
-	contents: (MCP.TextResourceContents | MCP.BlobResourceContents)[];
+	contents: (MCPLegacy.TextResourceContents | MCPLegacy.BlobResourceContents)[];
 	resourceURI: URL;
-	forSameURI: (MCP.TextResourceContents | MCP.BlobResourceContents)[];
+	forSameURI: (MCPLegacy.TextResourceContents | MCPLegacy.BlobResourceContents)[];
 }
 
 export class McpResourceFilesystem extends Disposable implements IWorkbenchContribution,
@@ -305,7 +305,7 @@ function equalsUrlPath(a: string, b: URL): boolean {
 	return equalsIgnoreCase(new URL(a).pathname, b.pathname);
 }
 
-function contentToBuffer(content: MCP.TextResourceContents | MCP.BlobResourceContents): Uint8Array {
+function contentToBuffer(content: MCPLegacy.TextResourceContents | MCPLegacy.BlobResourceContents): Uint8Array {
 	if ('text' in content) {
 		return VSBuffer.fromString(content.text).buffer;
 	} else if ('blob' in content) {

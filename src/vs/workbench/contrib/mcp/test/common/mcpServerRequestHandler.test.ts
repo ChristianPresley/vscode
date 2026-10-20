@@ -16,7 +16,7 @@ import { TestLoggerService, TestProductService, TestStorageService } from '../..
 import { IMcpHostDelegate } from '../../common/mcpRegistryTypes.js';
 import { McpServerRequestHandler, McpTask } from '../../common/mcpServerRequestHandler.js';
 import { McpConnectionState, McpServerDefinition, McpServerLaunch } from '../../common/mcpTypes.js';
-import { MCP } from '../../common/modelContextProtocol.js';
+import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { TestMcpMessageTransport } from './mcpRegistryTypes.js';
 import { IOutputService } from '../../../../services/output/common/output.js';
 import { Disposable } from '../../../../../base/common/lifecycle.js';
@@ -97,6 +97,15 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 		store.add(handler);
 	});
 
+	test('sends initialize with the 2025-11-25 protocol version on the legacy wire', () => {
+		const sentMessages = transport.getSentMessages();
+		const initializeRequest = sentMessages[0] as MCPLegacy.JSONRPCRequest;
+		assert.strictEqual(initializeRequest.method, 'initialize');
+		// The literal is intentional: the wire version must not change when the generated schema moves on.
+		assert.strictEqual(initializeRequest.params?.protocolVersion, '2025-11-25');
+		assert.strictEqual(MCPLegacy.LATEST_PROTOCOL_VERSION, '2025-11-25');
+	});
+
 	test('should send and receive JSON-RPC requests', async () => {
 		// Setup request
 		const requestPromise = handler.listResources();
@@ -106,14 +115,14 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 		assert.strictEqual(sentMessages.length, 3); // initialize + listResources
 
 		// Verify listResources request format
-		const listResourcesRequest = sentMessages[2] as MCP.JSONRPCRequest;
+		const listResourcesRequest = sentMessages[2] as MCPLegacy.JSONRPCRequest;
 		assert.strictEqual(listResourcesRequest.method, 'resources/list');
-		assert.strictEqual(listResourcesRequest.jsonrpc, MCP.JSONRPC_VERSION);
+		assert.strictEqual(listResourcesRequest.jsonrpc, MCPLegacy.JSONRPC_VERSION);
 		assert.ok(typeof listResourcesRequest.id === 'number');
 
 		// Simulate server response with mock resources that match the expected Resource interface
 		transport.simulateReceiveMessage({
-			jsonrpc: MCP.JSONRPC_VERSION,
+			jsonrpc: MCPLegacy.JSONRPC_VERSION,
 			id: listResourcesRequest.id,
 			result: {
 				resources: [
@@ -136,11 +145,11 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 
 		// Get the first request and respond with pagination
 		const sentMessages = transport.getSentMessages();
-		const listResourcesRequest = sentMessages[2] as MCP.JSONRPCRequest;
+		const listResourcesRequest = sentMessages[2] as MCPLegacy.JSONRPCRequest;
 
 		// Send first page with nextCursor
 		transport.simulateReceiveMessage({
-			jsonrpc: MCP.JSONRPC_VERSION,
+			jsonrpc: MCPLegacy.JSONRPC_VERSION,
 			id: listResourcesRequest.id,
 			result: {
 				resources: [
@@ -160,13 +169,13 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 		const sentMessages2 = transport.getSentMessages();
 		assert.strictEqual(sentMessages2.length, 1);
 
-		const listResourcesRequest2 = sentMessages2[0] as MCP.JSONRPCRequest;
+		const listResourcesRequest2 = sentMessages2[0] as MCPLegacy.JSONRPCRequest;
 		assert.strictEqual(listResourcesRequest2.method, 'resources/list');
 		assert.deepStrictEqual(listResourcesRequest2.params, { cursor: 'page2' });
 
 		// Send final page with no nextCursor
 		transport.simulateReceiveMessage({
-			jsonrpc: MCP.JSONRPC_VERSION,
+			jsonrpc: MCPLegacy.JSONRPC_VERSION,
 			id: listResourcesRequest2.id,
 			result: {
 				resources: [
@@ -188,14 +197,14 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 
 		// Get the sent message
 		const sentMessages = transport.getSentMessages();
-		const readResourceRequest = sentMessages[2] as MCP.JSONRPCRequest; // [0] is initialize
+		const readResourceRequest = sentMessages[2] as MCPLegacy.JSONRPCRequest; // [0] is initialize
 
 		// Simulate error response
 		transport.simulateReceiveMessage({
-			jsonrpc: MCP.JSONRPC_VERSION,
+			jsonrpc: MCPLegacy.JSONRPC_VERSION,
 			id: readResourceRequest.id,
 			error: {
-				code: MCP.METHOD_NOT_FOUND,
+				code: MCPLegacy.METHOD_NOT_FOUND,
 				message: 'Resource not found'
 			}
 		});
@@ -206,14 +215,14 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 			assert.fail('Expected error was not thrown');
 		} catch (e: unknown) {
 			assert.strictEqual((e as Error).message, 'MPC -32601: Resource not found');
-			assert.strictEqual((e as { code: number }).code, MCP.METHOD_NOT_FOUND);
+			assert.strictEqual((e as { code: number }).code, MCPLegacy.METHOD_NOT_FOUND);
 		}
 	});
 
 	test('should handle server requests', async () => {
 		// Simulate ping request from server
-		const pingRequest: MCP.JSONRPCRequest & MCP.PingRequest = {
-			jsonrpc: MCP.JSONRPC_VERSION,
+		const pingRequest: MCPLegacy.JSONRPCRequest & MCPLegacy.PingRequest = {
+			jsonrpc: MCPLegacy.JSONRPC_VERSION,
 			id: 100,
 			method: 'ping'
 		};
@@ -224,7 +233,7 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 		const sentMessages = transport.getSentMessages();
 		const pingResponse = sentMessages.find(m =>
 			'id' in m && m.id === pingRequest.id && 'result' in m
-		) as MCP.JSONRPCResultResponse;
+		) as MCPLegacy.JSONRPCResultResponse;
 
 		assert.ok(pingResponse, 'No ping response was sent');
 		assert.deepStrictEqual(pingResponse.result, {});
@@ -238,8 +247,8 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 		];
 
 		// Simulate roots/list request from server
-		const rootsRequest: MCP.JSONRPCRequest & MCP.ListRootsRequest = {
-			jsonrpc: MCP.JSONRPC_VERSION,
+		const rootsRequest: MCPLegacy.JSONRPCRequest & MCPLegacy.ListRootsRequest = {
+			jsonrpc: MCPLegacy.JSONRPC_VERSION,
 			id: 101,
 			method: 'roots/list'
 		};
@@ -250,11 +259,11 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 		const sentMessages = transport.getSentMessages();
 		const rootsResponse = sentMessages.find(m =>
 			'id' in m && m.id === rootsRequest.id && 'result' in m
-		) as MCP.JSONRPCResultResponse;
+		) as MCPLegacy.JSONRPCResultResponse;
 
 		assert.ok(rootsResponse, 'No roots/list response was sent');
-		assert.strictEqual((rootsResponse.result as MCP.ListRootsResult).roots.length, 2);
-		assert.strictEqual((rootsResponse.result as MCP.ListRootsResult).roots[0].uri, 'file:///test/root1');
+		assert.strictEqual((rootsResponse.result as MCPLegacy.ListRootsResult).roots.length, 2);
+		assert.strictEqual((rootsResponse.result as MCPLegacy.ListRootsResult).roots[0].uri, 'file:///test/root1');
 	});
 
 	test('should handle server notifications', async () => {
@@ -267,8 +276,8 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 		}));
 
 		// Simulate progress notification with correct format
-		const progressNotification: MCP.JSONRPCNotification & MCP.ProgressNotification = {
-			jsonrpc: MCP.JSONRPC_VERSION,
+		const progressNotification: MCPLegacy.JSONRPCNotification & MCPLegacy.ProgressNotification = {
+			jsonrpc: MCPLegacy.JSONRPC_VERSION,
 			method: 'notifications/progress',
 			params: {
 				progressToken: 'token1',
@@ -288,7 +297,7 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 
 		// Get the request ID
 		const sentMessages = transport.getSentMessages();
-		const listResourcesRequest = sentMessages[2] as MCP.JSONRPCRequest;
+		const listResourcesRequest = sentMessages[2] as MCPLegacy.JSONRPCRequest;
 		const requestId = listResourcesRequest.id;
 
 		// Cancel the request
@@ -320,12 +329,12 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 
 		// Get the request ID
 		const sentMessages = transport.getSentMessages();
-		const listResourcesRequest = sentMessages[2] as MCP.JSONRPCRequest;
+		const listResourcesRequest = sentMessages[2] as MCPLegacy.JSONRPCRequest;
 		const requestId = listResourcesRequest.id;
 
 		// Simulate cancelled notification from server
-		const cancelledNotification: MCP.JSONRPCNotification & MCP.CancelledNotification = {
-			jsonrpc: MCP.JSONRPC_VERSION,
+		const cancelledNotification: MCPLegacy.JSONRPCNotification & MCPLegacy.CancelledNotification = {
+			jsonrpc: MCPLegacy.JSONRPC_VERSION,
 			method: 'notifications/cancelled',
 			params: {
 				requestId
@@ -397,7 +406,7 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 		});
 
 		const sentMessages = transport.getSentMessages();
-		const callRequest = sentMessages[2] as MCP.JSONRPCRequest & MCP.CallToolRequest;
+		const callRequest = sentMessages[2] as MCPLegacy.JSONRPCRequest & MCPLegacy.CallToolRequest;
 		assert.strictEqual(callRequest.method, 'tools/call');
 		assert.deepStrictEqual(callRequest.params._meta, {
 			traceparent,
@@ -406,7 +415,7 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 		});
 
 		transport.simulateReceiveMessage({
-			jsonrpc: MCP.JSONRPC_VERSION,
+			jsonrpc: MCPLegacy.JSONRPC_VERSION,
 			id: callRequest.id,
 			result: { content: [] },
 		});
@@ -427,7 +436,7 @@ suite.skip('Workbench - MCP - McpTask', () => { // TODO@connor4312 https://githu
 		clock.restore();
 	});
 
-	function createTask(overrides: Partial<MCP.Task> = {}): MCP.Task {
+	function createTask(overrides: Partial<MCPLegacy.Task> = {}): MCPLegacy.Task {
 		return {
 			taskId: 'task1',
 			status: 'working',

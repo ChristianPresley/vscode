@@ -25,7 +25,7 @@ import { IWorkbenchMcpGatewayService } from '../../contrib/mcp/common/mcpGateway
 import { IMcpMessageTransport, IMcpRegistry } from '../../contrib/mcp/common/mcpRegistryTypes.js';
 import { extensionPrefixedIdentifier, McpCollectionDefinition, McpCollectionProvenance, McpCollectionSortOrder, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, McpServerTrust, mcpOAuthClientSecretStorageKey, UserInteractionRequiredError } from '../../contrib/mcp/common/mcpTypes.js';
 import { IMcpEnterpriseManagedAuthIdpConfig, mcpEnterpriseManagedAuthIdpSection } from '../../contrib/mcp/common/mcpConfiguration.js';
-import { MCP } from '../../contrib/mcp/common/modelContextProtocol.js';
+import { MCPLegacy } from '../../contrib/mcp/common/modelContextProtocolLegacy.js';
 import { IAuthenticationMcpAccessService } from '../../services/authentication/browser/authenticationMcpAccessService.js';
 import { IAuthenticationMcpService } from '../../services/authentication/browser/authenticationMcpService.js';
 import { IAuthenticationMcpUsageService } from '../../services/authentication/browser/authenticationMcpUsageService.js';
@@ -635,7 +635,7 @@ class ExtHostMcpServerLaunch extends Disposable implements IMcpMessageTransport 
 	private readonly _onDidLog = this._register(new Emitter<{ level: LogLevel; message: string }>());
 	public readonly onDidLog = this._onDidLog.event;
 
-	private readonly _onDidReceiveMessage = this._register(new Emitter<MCP.JSONRPCMessage>());
+	private readonly _onDidReceiveMessage = this._register(new Emitter<MCPLegacy.JSONRPCMessage>());
 	public readonly onDidReceiveMessage = this._onDidReceiveMessage.event;
 
 	pushLog(level: LogLevel, message: string): void {
@@ -643,7 +643,7 @@ class ExtHostMcpServerLaunch extends Disposable implements IMcpMessageTransport 
 	}
 
 	pushMessage(message: string): void {
-		let parsed: MCP.JSONRPCMessage | undefined;
+		let parsed: MCPLegacy.JSONRPCMessage | undefined;
 		try {
 			parsed = JSON.parse(message);
 		} catch (e) {
@@ -662,7 +662,7 @@ class ExtHostMcpServerLaunch extends Disposable implements IMcpMessageTransport 
 	constructor(
 		extHostKind: ExtensionHostKind,
 		public readonly stop: () => void,
-		public readonly send: (message: MCP.JSONRPCMessage) => void,
+		public readonly send: (message: MCPLegacy.JSONRPCMessage) => void,
 	) {
 		super();
 

@@ -29,7 +29,7 @@ import { QueryBuilder } from '../../../services/search/common/queryBuilder.js';
 import { ISearchService } from '../../../services/search/common/search.js';
 import { ITerminalGroupService, ITerminalInstance, ITerminalService } from '../../terminal/browser/terminal.js';
 import { IMcpPrompt } from '../common/mcpTypes.js';
-import { MCP } from '../common/modelContextProtocol.js';
+import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
 
 type PickItem = IQuickPickItem & (
 	| { action: 'text' | 'command' | 'suggest' }
@@ -107,7 +107,7 @@ export class McpPromptArgumentPick extends Disposable {
 		return args;
 	}
 
-	private async _getArg(arg: MCP.PromptArgument, didRestoreState: boolean, argsSoFar: Record<string, string | undefined>, token?: CancellationToken): Promise<Action> {
+	private async _getArg(arg: MCPLegacy.PromptArgument, didRestoreState: boolean, argsSoFar: Record<string, string | undefined>, token?: CancellationToken): Promise<Action> {
 		const { quickPick } = this;
 		const store = new DisposableStore();
 
@@ -233,7 +233,7 @@ export class McpPromptArgumentPick extends Disposable {
 		}
 	}
 
-	private _promptCompletions(arg: MCP.PromptArgument, input: IObservable<string>, argsSoFar: Record<string, string | undefined>) {
+	private _promptCompletions(arg: MCPLegacy.PromptArgument, input: IObservable<string>, argsSoFar: Record<string, string | undefined>) {
 		const alreadyResolved: Record<string, string> = {};
 		for (const [key, value] of Object.entries(argsSoFar)) {
 			if (value) {

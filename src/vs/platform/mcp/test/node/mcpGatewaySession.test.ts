@@ -10,7 +10,7 @@ import { Emitter } from '../../../../base/common/event.js';
 import { IJsonRpcErrorResponse, IJsonRpcSuccessResponse } from '../../../../base/common/jsonRpcProtocol.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { MCP } from '../../common/modelContextProtocol.js';
+import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { McpGatewaySession } from '../../node/mcpGatewaySession.js';
 
 class TestServerResponse extends EventEmitter {
@@ -49,7 +49,7 @@ suite('McpGatewaySession', () => {
 	function createInvoker() {
 		const onDidChangeTools = new Emitter<void>();
 		const onDidChangeResources = new Emitter<void>();
-		const tools: readonly MCP.Tool[] = [{
+		const tools: readonly MCPLegacy.Tool[] = [{
 			name: 'test_tool',
 			description: 'Test tool',
 			inputSchema: {
@@ -60,7 +60,7 @@ suite('McpGatewaySession', () => {
 			}
 		}];
 
-		const resources: readonly MCP.Resource[] = [{
+		const resources: readonly MCPLegacy.Resource[] = [{
 			uri: 'file:///test/resource.txt',
 			name: 'resource.txt',
 		}];
@@ -231,7 +231,7 @@ suite('McpGatewaySession', () => {
 			params: { protocolVersion: '2025-03-26', capabilities: {} },
 		});
 
-		const result = (responses[0] as IJsonRpcSuccessResponse).result as MCP.InitializeResult;
+		const result = (responses[0] as IJsonRpcSuccessResponse).result as MCPLegacy.InitializeResult;
 		assert.deepStrictEqual(result, {
 			protocolVersion: '2025-03-26',
 			capabilities: {

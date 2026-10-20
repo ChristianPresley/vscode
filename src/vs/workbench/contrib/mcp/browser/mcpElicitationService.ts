@@ -23,42 +23,42 @@ import { ChatModel } from '../../chat/common/model/chatModel.js';
 import { ElicitationState, IChatQuestion, IChatQuestionAnswers, IChatQuestionValidation, IChatService } from '../../chat/common/chatService/chatService.js';
 import { ElicitationKind, ElicitResult, IFormModeElicitResult, IMcpElicitationService, IMcpServer, IMcpToolCallContext, IUrlModeElicitResult, McpConnectionState, MpcResponseError } from '../common/mcpTypes.js';
 import { mcpServerToSourceData } from '../common/mcpTypesUtils.js';
-import { MCP } from '../common/modelContextProtocol.js';
+import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
 
 const noneItem: IQuickPickItem = { id: undefined, label: localize('mcp.elicit.enum.none', 'None'), description: localize('mcp.elicit.enum.none.description', 'No selection'), alwaysShow: true };
 
-type Pre20251125ElicitationParams = Omit<MCP.ElicitRequestFormParams, 'mode'> & { mode?: undefined };
+type Pre20251125ElicitationParams = Omit<MCPLegacy.ElicitRequestFormParams, 'mode'> & { mode?: undefined };
 
-function isFormElicitation(params: MCP.ElicitRequest['params'] | Pre20251125ElicitationParams): params is (MCP.ElicitRequestFormParams | Pre20251125ElicitationParams) {
+function isFormElicitation(params: MCPLegacy.ElicitRequest['params'] | Pre20251125ElicitationParams): params is (MCPLegacy.ElicitRequestFormParams | Pre20251125ElicitationParams) {
 	return params.mode === 'form' || (params.mode === undefined && !!(params as Pre20251125ElicitationParams).requestedSchema);
 }
 
-function isUrlElicitation(params: MCP.ElicitRequest['params']): params is MCP.ElicitRequestURLParams {
+function isUrlElicitation(params: MCPLegacy.ElicitRequest['params']): params is MCPLegacy.ElicitRequestURLParams {
 	return params.mode === 'url';
 }
 
-function isLegacyTitledEnumSchema(schema: MCP.PrimitiveSchemaDefinition): schema is MCP.LegacyTitledEnumSchema & { enumNames: string[] } {
-	const cast = schema as MCP.LegacyTitledEnumSchema;
+function isLegacyTitledEnumSchema(schema: MCPLegacy.PrimitiveSchemaDefinition): schema is MCPLegacy.LegacyTitledEnumSchema & { enumNames: string[] } {
+	const cast = schema as MCPLegacy.LegacyTitledEnumSchema;
 	return cast.type === 'string' && Array.isArray(cast.enum) && Array.isArray(cast.enumNames);
 }
 
-function isUntitledEnumSchema(schema: MCP.PrimitiveSchemaDefinition): schema is MCP.LegacyTitledEnumSchema | MCP.UntitledSingleSelectEnumSchema {
-	const cast = schema as MCP.LegacyTitledEnumSchema | MCP.UntitledSingleSelectEnumSchema;
+function isUntitledEnumSchema(schema: MCPLegacy.PrimitiveSchemaDefinition): schema is MCPLegacy.LegacyTitledEnumSchema | MCPLegacy.UntitledSingleSelectEnumSchema {
+	const cast = schema as MCPLegacy.LegacyTitledEnumSchema | MCPLegacy.UntitledSingleSelectEnumSchema;
 	return cast.type === 'string' && Array.isArray(cast.enum);
 }
 
-function isTitledSingleEnumSchema(schema: MCP.PrimitiveSchemaDefinition): schema is MCP.TitledSingleSelectEnumSchema {
-	const cast = schema as MCP.TitledSingleSelectEnumSchema;
+function isTitledSingleEnumSchema(schema: MCPLegacy.PrimitiveSchemaDefinition): schema is MCPLegacy.TitledSingleSelectEnumSchema {
+	const cast = schema as MCPLegacy.TitledSingleSelectEnumSchema;
 	return cast.type === 'string' && Array.isArray(cast.oneOf);
 }
 
-function isUntitledMultiEnumSchema(schema: MCP.PrimitiveSchemaDefinition): schema is MCP.UntitledMultiSelectEnumSchema {
-	const cast = schema as MCP.UntitledMultiSelectEnumSchema;
+function isUntitledMultiEnumSchema(schema: MCPLegacy.PrimitiveSchemaDefinition): schema is MCPLegacy.UntitledMultiSelectEnumSchema {
+	const cast = schema as MCPLegacy.UntitledMultiSelectEnumSchema;
 	return cast.type === 'array' && !!cast.items?.enum;
 }
 
-function isTitledMultiEnumSchema(schema: MCP.PrimitiveSchemaDefinition): schema is MCP.TitledMultiSelectEnumSchema {
-	const cast = schema as MCP.TitledMultiSelectEnumSchema;
+function isTitledMultiEnumSchema(schema: MCPLegacy.PrimitiveSchemaDefinition): schema is MCPLegacy.TitledMultiSelectEnumSchema {
+	const cast = schema as MCPLegacy.TitledMultiSelectEnumSchema;
 	return cast.type === 'array' && !!cast.items?.anyOf;
 }
 
@@ -72,20 +72,20 @@ export class McpElicitationService implements IMcpElicitationService {
 		@IOpenerService private readonly _openerService: IOpenerService,
 	) { }
 
-	public elicit(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCP.ElicitRequest['params'], token: CancellationToken): Promise<ElicitResult> {
+	public elicit(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCPLegacy.ElicitRequest['params'], token: CancellationToken): Promise<ElicitResult> {
 		if (isFormElicitation(elicitation)) {
 			return this._elicitForm(server, context, elicitation, token);
 		} else if (isUrlElicitation(elicitation)) {
 			return this._elicitUrl(server, context, elicitation, token);
 		} else {
 			softAssertNever(elicitation);
-			return Promise.reject(new MpcResponseError('Unsupported elicitation type', MCP.INVALID_PARAMS, undefined));
+			return Promise.reject(new MpcResponseError('Unsupported elicitation type', MCPLegacy.INVALID_PARAMS, undefined));
 		}
 	}
 
-	private async _elicitForm(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCP.ElicitRequestFormParams | Pre20251125ElicitationParams, token: CancellationToken): Promise<IFormModeElicitResult> {
+	private async _elicitForm(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCPLegacy.ElicitRequestFormParams | Pre20251125ElicitationParams, token: CancellationToken): Promise<IFormModeElicitResult> {
 		const store = new DisposableStore();
-		const value = await new Promise<MCP.ElicitResult>(resolve => {
+		const value = await new Promise<MCPLegacy.ElicitResult>(resolve => {
 			const chatModel = context?.chatSessionResource && this._chatService.getSession(context.chatSessionResource);
 			if (chatModel instanceof ChatModel) {
 				const request = chatModel.getRequests().at(-1);
@@ -141,7 +141,7 @@ export class McpElicitationService implements IMcpElicitationService {
 		return { kind: ElicitationKind.Form, value, dispose: () => { } };
 	}
 
-	private async _elicitUrl(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCP.ElicitRequestURLParams, token: CancellationToken): Promise<IUrlModeElicitResult> {
+	private async _elicitUrl(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCPLegacy.ElicitRequestURLParams, token: CancellationToken): Promise<IUrlModeElicitResult> {
 		const promiseStore = new DisposableStore();
 
 		// We create this ahead of time in case e.g. a user manually opens the URL beforehand
@@ -163,7 +163,7 @@ export class McpElicitationService implements IMcpElicitationService {
 		}).finally(() => promiseStore.dispose());
 
 		const store = new DisposableStore();
-		const value = await new Promise<MCP.ElicitResult>(resolve => {
+		const value = await new Promise<MCPLegacy.ElicitResult>(resolve => {
 			const chatModel = context?.chatSessionResource && this._chatService.getSession(context.chatSessionResource);
 			if (chatModel instanceof ChatModel) {
 				const request = chatModel.getRequests().at(-1);
@@ -213,7 +213,7 @@ export class McpElicitationService implements IMcpElicitationService {
 		};
 	}
 
-	private async _doElicitUrl(elicitation: MCP.ElicitRequestURLParams, token: CancellationToken): Promise<MCP.ElicitResult> {
+	private async _doElicitUrl(elicitation: MCPLegacy.ElicitRequestURLParams, token: CancellationToken): Promise<MCPLegacy.ElicitResult> {
 		if (token.isCancellationRequested) {
 			return { action: 'cancel' };
 		}
@@ -229,7 +229,7 @@ export class McpElicitationService implements IMcpElicitationService {
 		return { action: 'decline' };
 	}
 
-	private async _doElicitForm(elicitation: MCP.ElicitRequestFormParams | Pre20251125ElicitationParams, token: CancellationToken): Promise<MCP.ElicitResult> {
+	private async _doElicitForm(elicitation: MCPLegacy.ElicitRequestFormParams | Pre20251125ElicitationParams, token: CancellationToken): Promise<MCPLegacy.ElicitResult> {
 		const quickPick = this._quickInputService.createQuickPick<IQuickPickItem>();
 		const store = new DisposableStore();
 
@@ -304,7 +304,7 @@ export class McpElicitationService implements IMcpElicitationService {
 		}
 	}
 
-	private _getFieldPlaceholder(schema: MCP.PrimitiveSchemaDefinition, required: boolean): string {
+	private _getFieldPlaceholder(schema: MCPLegacy.PrimitiveSchemaDefinition, required: boolean): string {
 		let placeholder = schema.description || '';
 		if (!required) {
 			placeholder = placeholder ? `${placeholder} (${localize('optional', 'Optional')})` : localize('optional', 'Optional');
@@ -391,7 +391,7 @@ export class McpElicitationService implements IMcpElicitationService {
 
 	private async _handleInputField(
 		quickPick: IQuickPick<IQuickPickItem>,
-		schema: MCP.NumberSchema | MCP.StringSchema,
+		schema: MCPLegacy.NumberSchema | MCPLegacy.StringSchema,
 		required: boolean,
 		store: DisposableStore,
 		token: CancellationToken
@@ -454,7 +454,7 @@ export class McpElicitationService implements IMcpElicitationService {
 		});
 	}
 
-	private _validateInput(value: string, schema: MCP.NumberSchema | MCP.StringSchema): { isValid: boolean; message?: string } {
+	private _validateInput(value: string, schema: MCPLegacy.NumberSchema | MCPLegacy.StringSchema): { isValid: boolean; message?: string } {
 		switch (schema.type) {
 			case 'string':
 				return this._validateString(value, schema);
@@ -466,7 +466,7 @@ export class McpElicitationService implements IMcpElicitationService {
 		}
 	}
 
-	private _validateString(value: string, schema: MCP.StringSchema): { isValid: boolean; parsedValue?: string; message?: string } {
+	private _validateString(value: string, schema: MCPLegacy.StringSchema): { isValid: boolean; parsedValue?: string; message?: string } {
 		if (schema.minLength && value.length < schema.minLength) {
 			return { isValid: false, message: localize('mcp.elicit.validation.minLength', 'Minimum length is {0}', schema.minLength) };
 		}
@@ -515,7 +515,7 @@ export class McpElicitationService implements IMcpElicitationService {
 		}
 	}
 
-	private _validateNumber(value: string, schema: MCP.NumberSchema): { isValid: boolean; parsedValue?: number; message?: string } {
+	private _validateNumber(value: string, schema: MCPLegacy.NumberSchema): { isValid: boolean; parsedValue?: number; message?: string } {
 		const parsed = Number(value);
 		if (isNaN(parsed)) {
 			return { isValid: false, message: localize('mcp.elicit.validation.number', 'Please enter a valid number') };
@@ -536,7 +536,7 @@ export class McpElicitationService implements IMcpElicitationService {
 	 * Converts an MCP elicitation schema into IChatQuestion[] for the carousel UI.
 	 * Returns the questions and a map from question ID to schema property name.
 	 */
-	private _convertSchemaToQuestions(elicitation: MCP.ElicitRequestFormParams | Pre20251125ElicitationParams): { questions: IChatQuestion[]; idToPropertyMap: Map<string, string> } {
+	private _convertSchemaToQuestions(elicitation: MCPLegacy.ElicitRequestFormParams | Pre20251125ElicitationParams): { questions: IChatQuestion[]; idToPropertyMap: Map<string, string> } {
 		const properties = Object.entries(elicitation.requestedSchema.properties);
 		const requiredFields = new Set(elicitation.requestedSchema.required || []);
 		const questions: IChatQuestion[] = [];
@@ -667,7 +667,7 @@ export class McpElicitationService implements IMcpElicitationService {
 	private _convertCarouselAnswersToElicitResult(
 		answers: IChatQuestionAnswers,
 		idToPropertyMap: Map<string, string>,
-		schemaProperties: Record<string, MCP.PrimitiveSchemaDefinition>,
+		schemaProperties: Record<string, MCPLegacy.PrimitiveSchemaDefinition>,
 	): Record<string, string | number | boolean | string[]> {
 		const content: Record<string, string | number | boolean | string[]> = {};
 

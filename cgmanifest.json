@@ -768,6 +768,18 @@
 				"DEALINGS IN THE SOFTWARE."
 			],
 			"license": "MIT"
+		},
+		{
+			"component": {
+				"type": "git",
+				"git": {
+					"name": "modelcontextprotocol/modelcontextprotocol",
+					"repositoryUrl": "https://github.com/modelcontextprotocol/modelcontextprotocol",
+					"commitHash": "046fa30efd374370afb87ef830bd788eac5f217e"
+				}
+			},
+			"version": "2026-07-28",
+			"license": "MIT AND Apache-2.0"
 		}
 	],
 	"version": 1

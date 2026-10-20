@@ -41,7 +41,7 @@ import { IAgentHostMcpServer } from '../../../../../../sessions/common/agentHost
 import { resolveMcpServerAuthentication, agentHostMcpServerId, autoAuthenticateMcpServer, authenticateCopilotConnectorCredential, isCopilotConnectorMcpAuthentication } from './agentHostAuth.js';
 import { IOutputService } from '../../../../../services/output/common/output.js';
 import { IMcpService } from '../../../../../contrib/mcp/common/mcpTypes.js';
-import { MCP } from '../../../../mcp/common/modelContextProtocol.js';
+import { MCPLegacy } from '../../../../mcp/common/modelContextProtocolLegacy.js';
 import { ContributionEnablementState } from '../../../common/enablement.js';
 import { getLocalAgentHostSessionProvider } from './agentHostSessionUri.js';
 
@@ -748,11 +748,11 @@ class AgentHostCopilotConnectorAuthorization {
 	}
 }
 
-async function listMcpServerTools(handleMcpRequest: NonNullable<IAgentHostCustomizationTarget['handleMcpRequest']>, channel: string): Promise<readonly MCP.Tool[]> {
-	const tools: MCP.Tool[] = [];
+async function listMcpServerTools(handleMcpRequest: NonNullable<IAgentHostCustomizationTarget['handleMcpRequest']>, channel: string): Promise<readonly MCPLegacy.Tool[]> {
+	const tools: MCPLegacy.Tool[] = [];
 	let cursor: string | undefined;
 	do {
-		const result = await handleMcpRequest(channel, 'tools/list', cursor ? { cursor } : {}) as MCP.ListToolsResult;
+		const result = await handleMcpRequest(channel, 'tools/list', cursor ? { cursor } : {}) as MCPLegacy.ListToolsResult;
 		tools.push(...result.tools);
 		cursor = result.nextCursor;
 	} while (cursor);

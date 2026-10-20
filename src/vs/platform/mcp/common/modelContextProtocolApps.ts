@@ -3,40 +3,40 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
-type CallToolResult = MCP.CallToolResult;
-type ContentBlock = MCP.ContentBlock;
-type Implementation = MCP.Implementation;
-type RequestId = MCP.RequestId;
-type Tool = MCP.Tool;
+type CallToolResult = MCPLegacy.CallToolResult;
+type ContentBlock = MCPLegacy.ContentBlock;
+type Implementation = MCPLegacy.Implementation;
+type RequestId = MCPLegacy.RequestId;
+type Tool = MCPLegacy.Tool;
 
 export namespace McpApps {
 	export type AppRequest =
-		| MCP.CallToolRequest
-		| MCP.ReadResourceRequest
-		| MCP.CreateMessageRequest
-		| MCP.PingRequest
-		| (McpUiOpenLinkRequest & MCP.JSONRPCRequest)
-		| (McpUiDownloadFileRequest & MCP.JSONRPCRequest)
-		| (McpUiUpdateModelContextRequest & MCP.JSONRPCRequest)
-		| (McpUiMessageRequest & MCP.JSONRPCRequest)
-		| (McpUiRequestDisplayModeRequest & MCP.JSONRPCRequest)
-		| (McpApps.McpUiInitializeRequest & MCP.JSONRPCRequest);
+		| MCPLegacy.CallToolRequest
+		| MCPLegacy.ReadResourceRequest
+		| MCPLegacy.CreateMessageRequest
+		| MCPLegacy.PingRequest
+		| (McpUiOpenLinkRequest & MCPLegacy.JSONRPCRequest)
+		| (McpUiDownloadFileRequest & MCPLegacy.JSONRPCRequest)
+		| (McpUiUpdateModelContextRequest & MCPLegacy.JSONRPCRequest)
+		| (McpUiMessageRequest & MCPLegacy.JSONRPCRequest)
+		| (McpUiRequestDisplayModeRequest & MCPLegacy.JSONRPCRequest)
+		| (McpApps.McpUiInitializeRequest & MCPLegacy.JSONRPCRequest);
 
 	export type AppNotification =
 		| McpUiInitializedNotification
 		| McpUiSizeChangedNotification
-		| MCP.LoggingMessageNotification
+		| MCPLegacy.LoggingMessageNotification
 		| CustomSandboxWheelNotification;
 
 	export type AppMessage = AppRequest | AppNotification;
 
 	export type HostResult =
-		| MCP.CallToolResult
-		| MCP.ReadResourceResult
-		| MCP.CreateMessageResult
-		| MCP.EmptyResult
+		| MCPLegacy.CallToolResult
+		| MCPLegacy.ReadResourceResult
+		| MCPLegacy.CreateMessageResult
+		| MCPLegacy.EmptyResult
 		| McpApps.McpUiInitializeResult
 		| McpUiMessageResult
 		| McpUiOpenLinkResult
@@ -236,7 +236,7 @@ export namespace McpApps {
 		method: "ui/download-file";
 		params: {
 			/** @description Resources to download, either inline or as links for the host to resolve. */
-			contents: (MCP.EmbeddedResource | MCP.ResourceLink)[];
+			contents: (MCPLegacy.EmbeddedResource | MCPLegacy.ResourceLink)[];
 		};
 	}
 

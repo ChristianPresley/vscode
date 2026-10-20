@@ -23,7 +23,7 @@ import { McpCommandIds } from './mcpCommandIds.js';
 import { IMcpServerSamplingConfiguration, mcpServerSamplingSection } from './mcpConfiguration.js';
 import { McpSamplingLog } from './mcpSamplingLog.js';
 import { IMcpSamplingService, IMcpServer, ISamplingOptions, ISamplingResult, McpError } from './mcpTypes.js';
-import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
 const enum ModelMatch {
 	UnsureAllowedDuringChat,
@@ -232,7 +232,7 @@ export class McpSamplingService extends Disposable implements IMcpSamplingServic
 	 * Gets the matching model for the MCP server in this context, or
 	 * a reason why no model could be selected.
 	 */
-	private async _getMatchingModelInner(server: IMcpServer, isDuringToolCall: boolean, preferences: MCP.ModelPreferences | undefined): Promise<ModelMatch | string> {
+	private async _getMatchingModelInner(server: IMcpServer, isDuringToolCall: boolean, preferences: MCPLegacy.ModelPreferences | undefined): Promise<ModelMatch | string> {
 		const config = this.getConfig(server);
 		// 1. Ensure the server is allowed to sample in this context
 		if (isDuringToolCall && !config.allowedDuringChat && !this._sessionSets.allowedDuringChat.has(server.definition.id)) {

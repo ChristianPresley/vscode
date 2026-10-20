@@ -61,3 +61,6 @@
 # Vendored third-party libraries
 src/vs/base/common/lit-html/**
 src/vs/base/common/signals-core/**
+
+# Vendored upstream MCP schema (generator input, see build/mcp/sync-mcp-schema.ts)
+build/mcp/mcp-schema-2026-07-28.ts

@@ -31,6 +31,8 @@
     "typecheck-client": "tsc --project ./src/tsconfig.json --noEmit --skipLibCheck",
     "codex:gen-protocol": "node build/codex/generate-protocol.mjs",
     "codex:check-protocol": "node build/codex/check-protocol-sync.ts",
+    "mcp:sync-schema": "node build/mcp/sync-mcp-schema.ts",
+    "mcp:check-schema": "node build/mcp/sync-mcp-schema.ts --check",
     "agent-host:generate-copilot-meta": "node build/agentHost/generateCopilotMetadata.ts",
     "agent-host:check-copilot-meta": "node build/agentHost/generateCopilotMetadata.ts --check",
     "watch": "npm-run-all2 -lp watch-client-transpile watch-client watch-extensions watch-copilot",

@@ -34,7 +34,7 @@ import { IMcpRegistry } from '../../common/mcpRegistryTypes.js';
 import { McpServerConnection } from '../../common/mcpServerConnection.js';
 import { McpService } from '../../common/mcpService.js';
 import { McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType } from '../../common/mcpTypes.js';
-import { MCP } from '../../common/modelContextProtocol.js';
+import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { TestMcpMessageTransport, TestMcpRegistry } from './mcpRegistryTypes.js';
 
 suite('Workbench - MCP - McpService', () => {
@@ -121,8 +121,8 @@ suite('Workbench - MCP - McpService', () => {
 				const transport = store.add(new TestMcpMessageTransport());
 				transports.push(transport);
 				transport.setResponder('tools/list', message => ({
-					jsonrpc: MCP.JSONRPC_VERSION,
-					id: (message as MCP.JSONRPCRequest).id,
+					jsonrpc: MCPLegacy.JSONRPC_VERSION,
+					id: (message as MCPLegacy.JSONRPCRequest).id,
 					result: { tools: [] },
 				}));
 				return transport;
@@ -146,20 +146,20 @@ suite('Workbench - MCP - McpService', () => {
 			registry.makeTestTransport = () => {
 				const transport = createTransport();
 				transport.setResponder('initialize', message => ({
-					jsonrpc: MCP.JSONRPC_VERSION,
-					id: (message as MCP.JSONRPCRequest).id,
+					jsonrpc: MCPLegacy.JSONRPC_VERSION,
+					id: (message as MCPLegacy.JSONRPCRequest).id,
 					result: {
-						protocolVersion: MCP.LATEST_PROTOCOL_VERSION,
+						protocolVersion: MCPLegacy.LATEST_PROTOCOL_VERSION,
 						serverInfo: { name: 'Policy Fixture', version: '1.0.0' },
 						capabilities: { tools: {}, prompts: {} },
 					}
 				}));
 				transport.setResponder('tools/list', message => ({
-					jsonrpc: MCP.JSONRPC_VERSION, id: (message as MCP.JSONRPCRequest).id,
+					jsonrpc: MCPLegacy.JSONRPC_VERSION, id: (message as MCPLegacy.JSONRPCRequest).id,
 					result: { tools: [{ name: 'cached_tool', inputSchema: { type: 'object', properties: {} } }] },
 				}));
 				transport.setResponder('prompts/list', message => ({
-					jsonrpc: MCP.JSONRPC_VERSION, id: (message as MCP.JSONRPCRequest).id,
+					jsonrpc: MCPLegacy.JSONRPC_VERSION, id: (message as MCPLegacy.JSONRPCRequest).id,
 					result: { prompts: [{ name: 'cached_prompt' }] },
 				}));
 				return transport;
@@ -619,8 +619,8 @@ suite('Workbench - MCP - McpService', () => {
 		registry.makeTestTransport = () => {
 			const transport = new TestMcpMessageTransport();
 			transport.setResponder('tools/list', message => ({
-				jsonrpc: MCP.JSONRPC_VERSION,
-				id: (message as MCP.JSONRPCRequest).id,
+				jsonrpc: MCPLegacy.JSONRPC_VERSION,
+				id: (message as MCPLegacy.JSONRPCRequest).id,
 				result: { tools: [{ name: 'search_index', inputSchema: { type: 'object' } }] },
 			}));
 			return transport;
@@ -668,8 +668,8 @@ suite('Workbench - MCP - McpService', () => {
 		registry.makeTestTransport = () => {
 			const transport = new TestMcpMessageTransport();
 			transport.setResponder('tools/list', message => ({
-				jsonrpc: MCP.JSONRPC_VERSION,
-				id: (message as MCP.JSONRPCRequest).id,
+				jsonrpc: MCPLegacy.JSONRPC_VERSION,
+				id: (message as MCPLegacy.JSONRPCRequest).id,
 				result: { tools: [] }
 			}));
 			return transport;

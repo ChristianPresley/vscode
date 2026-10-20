@@ -11,18 +11,18 @@ import { Disposable, DisposableMap, DisposableStore, IDisposable, toDisposable }
 import { generateUuid } from '../../../../base/common/uuid.js';
 import type { McpServerRequestHandler } from './mcpServerRequestHandler.js';
 import { McpError } from './mcpTypes.js';
-import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
 export interface IMcpTaskInternal extends IDisposable {
 	readonly id: string;
-	onDidUpdateState(task: MCP.Task): void;
+	onDidUpdateState(task: MCPLegacy.Task): void;
 	setHandler(handler: McpServerRequestHandler | undefined): void;
 }
 
 interface TaskEntry extends IDisposable {
-	task: MCP.Task;
-	result?: MCP.Result;
-	error?: MCP.Error;
+	task: MCPLegacy.Task;
+	result?: MCPLegacy.Result;
+	error?: MCPLegacy.Error;
 	cts: CancellationTokenSource;
 	/** Time when the task was created (client time), used to calculate TTL expiration */
 	createdAtTime: number;
@@ -38,7 +38,7 @@ interface TaskEntry extends IDisposable {
 export class McpTaskManager extends Disposable {
 	private readonly _serverTasks = this._register(new DisposableMap<string, TaskEntry>());
 	private readonly _clientTasks = this._register(new DisposableMap<string, IMcpTaskInternal>());
-	private readonly _onDidUpdateTask = this._register(new Emitter<MCP.Task>());
+	private readonly _onDidUpdateTask = this._register(new Emitter<MCPLegacy.Task>());
 	public readonly onDidUpdateTask = this._onDidUpdateTask.event;
 
 	/**
@@ -76,15 +76,15 @@ export class McpTaskManager extends Disposable {
 	 * Create a new task and execute it asynchronously.
 	 * Returns the task immediately while execution continues in the background.
 	 */
-	public createTask<TResult extends MCP.Result>(
+	public createTask<TResult extends MCPLegacy.Result>(
 		ttl: number | null,
 		executor: (token: CancellationToken) => Promise<TResult>
-	): MCP.CreateTaskResult {
+	): MCPLegacy.CreateTaskResult {
 		const taskId = generateUuid();
 		const createdAt = new Date().toISOString();
 		const createdAtTime = Date.now();
 
-		const task: MCP.Task = {
+		const task: MCPLegacy.Task = {
 			taskId,
 			status: 'working',
 			createdAt,
@@ -125,7 +125,7 @@ export class McpTaskManager extends Disposable {
 	/**
 	 * Execute a task asynchronously and update its state.
 	 */
-	private async _executeTask<TResult extends MCP.Result>(
+	private async _executeTask<TResult extends MCPLegacy.Result>(
 		taskId: string,
 		executor: (token: CancellationToken) => Promise<TResult>,
 		token: CancellationToken
@@ -144,12 +144,12 @@ export class McpTaskManager extends Disposable {
 				});
 			} else if (error instanceof Error) {
 				this._updateTaskStatus(taskId, 'failed', error.message, undefined, {
-					code: MCP.INTERNAL_ERROR,
+					code: MCPLegacy.INTERNAL_ERROR,
 					message: error.message,
 				});
 			} else {
 				this._updateTaskStatus(taskId, 'failed', 'Unknown error', undefined, {
-					code: MCP.INTERNAL_ERROR,
+					code: MCPLegacy.INTERNAL_ERROR,
 					message: 'Unknown error',
 				});
 			}
@@ -161,10 +161,10 @@ export class McpTaskManager extends Disposable {
 	 */
 	private _updateTaskStatus(
 		taskId: string,
-		status: MCP.TaskStatus,
+		status: MCPLegacy.TaskStatus,
 		statusMessage?: string,
-		result?: MCP.Result,
-		error?: MCP.Error
+		result?: MCPLegacy.Result,
+		error?: MCPLegacy.Error
 	): void {
 		const entry = this._serverTasks.get(taskId);
 		if (!entry) {
@@ -191,10 +191,10 @@ export class McpTaskManager extends Disposable {
 	 * Get the current state of a task.
 	 * Returns an error if the task doesn't exist or has expired.
 	 */
-	public getTask(taskId: string): MCP.GetTaskResult {
+	public getTask(taskId: string): MCPLegacy.GetTaskResult {
 		const entry = this._serverTasks.get(taskId);
 		if (!entry) {
-			throw new McpError(MCP.INVALID_PARAMS, `Task not found: ${taskId}`);
+			throw new McpError(MCPLegacy.INVALID_PARAMS, `Task not found: ${taskId}`);
 		}
 
 		return { ...entry.task };
@@ -204,10 +204,10 @@ export class McpTaskManager extends Disposable {
 	 * Get the result of a completed task.
 	 * Blocks until the task completes if it's still in progress.
 	 */
-	public async getTaskResult(taskId: string): Promise<MCP.GetTaskPayloadResult> {
+	public async getTaskResult(taskId: string): Promise<MCPLegacy.GetTaskPayloadResult> {
 		const entry = this._serverTasks.get(taskId);
 		if (!entry) {
-			throw new McpError(MCP.INVALID_PARAMS, `Task not found: ${taskId}`);
+			throw new McpError(MCPLegacy.INVALID_PARAMS, `Task not found: ${taskId}`);
 		}
 
 		if (entry.task.status === 'working' || entry.task.status === 'input_required') {
@@ -217,7 +217,7 @@ export class McpTaskManager extends Disposable {
 		// Refresh entry after waiting
 		const updatedEntry = this._serverTasks.get(taskId);
 		if (!updatedEntry) {
-			throw new McpError(MCP.INVALID_PARAMS, `Task not found: ${taskId}`);
+			throw new McpError(MCPLegacy.INVALID_PARAMS, `Task not found: ${taskId}`);
 		}
 
 		if (updatedEntry.error) {
@@ -225,7 +225,7 @@ export class McpTaskManager extends Disposable {
 		}
 
 		if (!updatedEntry.result) {
-			throw new McpError(MCP.INTERNAL_ERROR, 'Task completed but no result available');
+			throw new McpError(MCPLegacy.INTERNAL_ERROR, 'Task completed but no result available');
 		}
 
 		return updatedEntry.result;
@@ -234,15 +234,15 @@ export class McpTaskManager extends Disposable {
 	/**
 	 * Cancel a task.
 	 */
-	public cancelTask(taskId: string): MCP.CancelTaskResult {
+	public cancelTask(taskId: string): MCPLegacy.CancelTaskResult {
 		const entry = this._serverTasks.get(taskId);
 		if (!entry) {
-			throw new McpError(MCP.INVALID_PARAMS, `Task not found: ${taskId}`);
+			throw new McpError(MCPLegacy.INVALID_PARAMS, `Task not found: ${taskId}`);
 		}
 
 		// Check if already in terminal status
 		if (entry.task.status === 'completed' || entry.task.status === 'failed' || entry.task.status === 'cancelled') {
-			throw new McpError(MCP.INVALID_PARAMS, `Cannot cancel task in ${entry.task.status} status`);
+			throw new McpError(MCPLegacy.INVALID_PARAMS, `Cannot cancel task in ${entry.task.status} status`);
 		}
 
 		entry.task.status = 'cancelled';
@@ -255,8 +255,8 @@ export class McpTaskManager extends Disposable {
 	/**
 	 * List all tasks.
 	 */
-	public listTasks(): MCP.ListTasksResult {
-		const tasks: MCP.Task[] = [];
+	public listTasks(): MCPLegacy.ListTasksResult {
+		const tasks: MCPLegacy.Task[] = [];
 
 		for (const entry of this._serverTasks.values()) {
 			tasks.push({ ...entry.task });
