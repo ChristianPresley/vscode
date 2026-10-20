@@ -792,6 +792,32 @@
 			},
 			"developmentDependency": true,
 			"license": "MIT"
+		},
+		{
+			"component": {
+				"type": "git",
+				"git": {
+					"name": "GoogleCloudPlatform/mcp-grpc-transport-proto",
+					"repositoryUrl": "https://github.com/GoogleCloudPlatform/mcp-grpc-transport-proto",
+					"commitHash": "1d2216c1eca5ac20267f49cd666efaeac2fd2eb9"
+				}
+			},
+			"version": "v0.2.0",
+			"developmentDependency": true,
+			"license": "MIT"
+		},
+		{
+			"component": {
+				"type": "git",
+				"git": {
+					"name": "ChristianPresley/zig-sdk",
+					"repositoryUrl": "https://github.com/ChristianPresley/zig-sdk",
+					"commitHash": "03b8049d59d2abdb6fa6c08beaac33c370de8eb0"
+				}
+			},
+			"version": "v0.5.2",
+			"developmentDependency": true,
+			"license": "Apache-2.0"
 		}
 	],
 	"version": 1

@@ -1,0 +1,16 @@
+{
+	"name": "vscode-mcp-grpc-tests",
+	"version": "0.0.1",
+	"private": true,
+	"type": "module",
+	"description": "Interop checks of VS Code's MCP gRPC bindings against @grpc/grpc-js and protobufjs",
+	"scripts": {
+		"start-fixture": "node src/fixtureServer.ts",
+		"test": "node --test src/*.test.ts"
+	},
+	"devDependencies": {
+		"@grpc/grpc-js": "^1.14.6",
+		"@grpc/proto-loader": "^0.8.1",
+		"protobufjs": "^8.8.1"
+	}
+}

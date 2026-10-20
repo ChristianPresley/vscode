@@ -1,0 +1,79 @@
+name: MCP gRPC Interop
+
+on:
+  pull_request:
+    paths:
+      - 'src/vs/base/common/protobuf/**'
+      - 'src/vs/base/common/grpc/**'
+      - 'src/vs/base/node/grpcChannel.ts'
+      - 'src/vs/platform/mcp/**'
+      - 'test/mcp-grpc/**'
+      - '.github/workflows/mcp-grpc-interop.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-grpc-interop-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  grpc-js-interop:
+    name: grpc-js interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install build dependencies
+        working-directory: build
+        run: |
+          set -e
+
+          for i in {1..5}; do # try 5 times
+            npm ci && break
+            if [ $i -eq 5 ]; then
+              echo "Npm install failed too many times" >&2
+              exit 1
+            fi
+            echo "Npm install failed $i, trying again..."
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          set -e
+
+          for i in {1..5}; do # try 5 times
+            npm ci --ignore-scripts --no-workspaces && break
+            if [ $i -eq 5 ]; then
+              echo "Npm install failed too many times" >&2
+              exit 1
+            fi
+            echo "Npm install failed $i, trying again..."
+          done
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Transpile client
+        run: npm run transpile-client
+
+      - name: Install MCP gRPC interop dependencies
+        run: npm ci --prefix test/mcp-grpc --no-audit --no-fund
+
+      - name: 🧪 Run grpc-js and protobufjs interop checks
+        run: npm --prefix test/mcp-grpc test
+
+      # One brace pattern: the node test runner takes a single --runGlob (glob@5).
+      - name: 🧪 Run protobuf, gRPC and MCP gRPC unit tests
+        run: npm run test-node -- --runGlob "{**/{protobuf,grpc}/**/*.test.js,**/grpcChannel.test.js,**/mcp/test/**/*Grpc*.test.js}"
