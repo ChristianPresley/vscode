@@ -91,6 +91,38 @@ const rules: readonly IChangeRule[] = [
 			'build/azure-pipelines/win32/exec.ps1',
 		],
 	},
+	{
+		// The MCP conformance suite and the MCP static checks (.github/workflows/mcp-conformance.yml).
+		output: 'mcp',
+		paths: [
+			'src/vs/platform/mcp/',
+			'src/vs/workbench/contrib/mcp/',
+			'src/vs/workbench/api/common/extHostMcp.ts',
+			'src/vs/workbench/api/node/extHostMcpNode.ts',
+			'src/vs/workbench/api/node/extHostMcpGrpc.ts',
+			'src/vs/workbench/api/node/mcpConformanceClient.ts',
+			'src/vs/workbench/api/node/mcpConformanceClientMain.ts',
+			'src/vs/workbench/api/node/mcpConformanceOAuth.ts',
+			'src/vs/workbench/api/node/mcpConformanceProxy.ts',
+			'src/vs/workbench/api/node/mcpConformanceScenarios.ts',
+			'src/vs/workbench/api/browser/mainThreadMcp.ts',
+			'src/vs/base/common/oauth.ts',
+			'src/vs/base/common/oauthClient.ts',
+			'src/vs/base/common/jsonRpcProtocol.ts',
+			'src/vs/base/common/jsonSchemaValidator/',
+			'src/vs/base/common/protobuf/',
+			'src/vs/base/common/grpc/',
+			'src/vs/base/node/grpcChannel.ts',
+			'src/vs/base/node/grpcServer.ts',
+			'test/mcp-conformance/',
+			'test/mcp-grpc/',
+			// The jobs install the root dependencies.
+			'package.json',
+			'package-lock.json',
+			'.github/workflows/mcp-conformance.yml',
+			'.github/workflows/mcp-grpc-interop.yml',
+		],
+	},
 ];
 
 function matchesAny(path: string, patterns: readonly string[]): boolean {

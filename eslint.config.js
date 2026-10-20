@@ -2498,6 +2498,14 @@ export default defineConfig(
 					]
 				},
 				{
+					// The MCP conformance harness drives the official suite with node built-ins only.
+					'target': 'test/mcp-conformance/**',
+					'restrictions': [
+						'test/mcp-conformance/**',
+						'*' // node modules
+					]
+				},
+				{
 					// The MCP gRPC interop package runs the transpiled codec from out/ against grpc-js and protobufjs.
 					'target': 'test/mcp-grpc/**',
 					'restrictions': [

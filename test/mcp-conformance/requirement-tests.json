@@ -1,0 +1,123 @@
+{
+	"$comment": "Maps requirements of requirements-2026-07-28.json to the tests that cover them. A test is a repository-relative file (optionally \":<test name>\") or \"conformance:<leg>/<scenario>\", which must be a driven row of requirement-matrix.md. The status is tested (the default), gap or n-a; gap and n-a need a reason. node run.ts check-matrix checks this file.",
+	"harness": "@modelcontextprotocol/conformance@0.2.0-alpha.11",
+	"requirements": "requirements-2026-07-28.json",
+	"mappings": [
+		{
+			"id": "basic#014-4c9652",
+			"status": "tested",
+			"tests": [
+				"conformance:client/sep-2322-client-request-state",
+				"src/vs/workbench/contrib/mcp/test/common/mcpServerRequestHandler.test.ts"
+			]
+		},
+		{
+			"id": "basic#053-3b953b",
+			"status": "tested",
+			"tests": [
+				"conformance:client/request-metadata",
+				"src/vs/workbench/contrib/mcp/test/common/mcpProtocolMeta.test.ts"
+			]
+		},
+		{
+			"id": "basic#056-b03baa",
+			"status": "tested",
+			"tests": [
+				"conformance:client/request-metadata",
+				"src/vs/workbench/contrib/mcp/test/common/mcpProtocolMeta.test.ts"
+			]
+		},
+		{
+			"id": "basic/patterns/mrtr#025-0387ee",
+			"status": "tested",
+			"tests": [
+				"conformance:client/sep-2322-client-request-state",
+				"src/vs/workbench/contrib/mcp/test/common/mcpServerRequestHandler.test.ts"
+			]
+		},
+		{
+			"id": "basic/patterns/mrtr#027-11edf5",
+			"status": "tested",
+			"tests": [
+				"conformance:client/sep-2322-client-request-state",
+				"src/vs/workbench/contrib/mcp/test/common/mcpServerRequestHandler.test.ts"
+			]
+		},
+		{
+			"id": "basic/patterns/mrtr#028-cbc1a1",
+			"status": "tested",
+			"tests": [
+				"conformance:client/sep-2322-client-request-state"
+			]
+		},
+		{
+			"id": "basic/transports/streamable-http#009-6aa4f4",
+			"status": "tested",
+			"tests": [
+				"src/vs/workbench/api/test/common/extHostMcpModern.test.ts"
+			]
+		},
+		{
+			"id": "basic/transports/streamable-http#010-32ff8c",
+			"status": "tested",
+			"tests": [
+				"conformance:client/request-metadata",
+				"conformance:client/http-standard-headers",
+				"src/vs/workbench/api/test/common/extHostMcpModern.test.ts"
+			]
+		},
+		{
+			"id": "basic/transports/streamable-http#036-f12d51",
+			"status": "tested",
+			"tests": [
+				"conformance:client/http-custom-headers",
+				"src/vs/platform/mcp/test/common/mcpHttpHeaders.test.ts"
+			]
+		},
+		{
+			"id": "basic/transports/streamable-http#046-998b88",
+			"status": "tested",
+			"tests": [
+				"conformance:client/http-invalid-tool-headers",
+				"src/vs/platform/mcp/test/common/mcpHttpHeaders.test.ts"
+			]
+		},
+		{
+			"id": "basic/transports/streamable-http#050-f69c51",
+			"status": "tested",
+			"tests": [
+				"conformance:client/http-custom-headers",
+				"src/vs/platform/mcp/test/common/mcpHttpHeaders.test.ts"
+			]
+		},
+		{
+			"id": "basic/transports/streamable-http#067-338f54",
+			"status": "tested",
+			"tests": [
+				"conformance:client/http-custom-headers"
+			]
+		},
+		{
+			"id": "basic/versioning#002-ecd784",
+			"status": "tested",
+			"tests": [
+				"conformance:client/request-metadata"
+			]
+		},
+		{
+			"id": "basic/authorization#009-4d66f7",
+			"status": "gap",
+			"reason": "The conformance client has no OAuth client yet (milestone M5); the auth/metadata-* scenarios are baselined."
+		},
+		{
+			"id": "basic/authorization/security-considerations#011-49ea51",
+			"status": "gap",
+			"reason": "The conformance client has no OAuth client yet (milestone M5)."
+		},
+		{
+			"id": "basic/authorization/client-registration#028-e7ba6f",
+			"status": "gap",
+			"reason": "The conformance client has no OAuth client yet (milestone M5); auth/authorization-server-migration is baselined."
+		}
+	]
+}

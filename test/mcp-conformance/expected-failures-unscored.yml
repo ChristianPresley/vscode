@@ -1,0 +1,53 @@
+# Known failures of the scenarios the requirement sets run but do not score
+# (`not_scored` in the suite's requirements/<revision>.yaml). run.ts runs each
+# of them alone, with `--force`, at every revision that lists it and judges it
+# against this file: a failure that is not listed fails the run, and so does a
+# listed scenario or check that passes.
+#
+# The client implements none of the authorization extensions (OAuth client
+# credentials, enterprise-managed authorization, DPoP, workload identity
+# federation), so their six scenarios are listed whole.
+client:
+  - auth/client-credentials-basic
+  - auth/client-credentials-jwt
+  - auth/dpop
+  - auth/dpop-nonce
+  - auth/enterprise-managed-authorization
+  - auth/wif-jwt-bearer
+# The server leg runs against the gateway fixture (milestone M6). The gateway
+# does not implement the Tasks extension (`io.modelcontextprotocol/tasks`,
+# SEP-2663) yet; it lands in milestone M9, which narrows this list to the
+# `wire-schema-valid` checks the suite cannot pass (it validates a
+# CreateTaskResult against the core CallToolResult schema, which requires
+# `content`). `tasks-status-notifications` reports no checks.
+server:
+  - tasks-capability-negotiation:tasks-extension-advertised
+  - tasks-capability-negotiation:sep-2663-tasks-methods-non-declaring
+  - tasks-capability-negotiation:sep-2663-server-rejects-undeclared-client
+  - tasks-capability-negotiation:tasks-per-request-meta-opt-in
+  - tasks-dispatch-and-envelope:tasks-server-directed-creation-no-hint
+  - tasks-dispatch-and-envelope:sep-2663-legacy-task-param-ignored
+  - tasks-dispatch-and-envelope:tasks-immediate-result-shortcut
+  - tasks-dispatch-and-envelope:tasks-result-type-complete-on-non-task-responses
+  - tasks-dispatch-and-envelope:sep-2663-durable-create-strong-consistency
+  - tasks-dispatch-and-envelope:sep-2663-tasks-get-invalid-task-id-32602
+  - tasks-lifecycle:tasks-sync-tool-call
+  - tasks-lifecycle:sep-2663-result-type-task-on-create
+  - tasks-lifecycle:sep-2663-tasks-get-status-working
+  - tasks-lifecycle:sep-2663-tasks-get-status-completed
+  - tasks-lifecycle:sep-2663-tool-error-uses-completed-status
+  - tasks-lifecycle:sep-2663-tasks-get-status-failed
+  - tasks-lifecycle:sep-2663-cancel-ack-empty-result
+  - tasks-lifecycle:tasks-cancel-terminal-idempotent-ack
+  - tasks-mrtr-composition:sep-2663-mrtr-synchronous-before-task-creation
+  - tasks-mrtr-input:sep-2663-tasks-get-status-input-required
+  - tasks-mrtr-input:tasks-mrtr-tasks-update-resumes
+  - tasks-mrtr-input:tasks-mrtr-partial-fulfillment
+  - tasks-request-headers:tasks-headers-tolerate-mcp-method-on-tools-call
+  - tasks-request-headers:sep-2663-routing-headers-accepted-on-tasks-get
+  - tasks-request-headers:sep-2663-server-rejects-mismatched-mcp-name-on-tasks-get
+  - tasks-request-state-removal:tasks-request-state-removal-setup
+  - tasks-required-task-error:sep-2663-server-returns-missing-capability-when-required
+  - tasks-wire-fields:tasks-wire-field-renames
+  - tasks-wire-fields:tasks-no-early-ttl-expiry
+  - tasks-wire-fields:tasks-no-related-task-meta-on-inlined-result

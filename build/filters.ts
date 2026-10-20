@@ -111,6 +111,8 @@ export const indentationFilter = Object.freeze<string[]>([
 	'!test/automation/out/**',
 	'!test/monaco/out/**',
 	'!test/smoke/out/**',
+	// the expected-failures baselines of the MCP conformance suite are YAML, indented with spaces
+	'!test/mcp-conformance/**/*.yml',
 	'!extensions/terminal-suggest/src/shell/zshBuiltinsCache.ts',
 	'!extensions/terminal-suggest/src/shell/fishBuiltinsCache.ts',
 	'!extensions/terminal-suggest/src/completions/upstream/**',

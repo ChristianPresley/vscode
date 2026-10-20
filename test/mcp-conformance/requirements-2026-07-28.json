@@ -1,0 +1,204 @@
+{
+	"$comment": "A skeleton of the normative sentences of the MCP 2026-07-28 specification, one entry per sentence, with the ids of the zig-sdk extraction (docs/spec/requirements.zon of github.com/ChristianPresley/zig-sdk). It lists only the client requirements requirement-tests.json maps so far; it grows as the mapping does.",
+	"revision": "2026-07-28",
+	"source": {
+		"repo": "https://github.com/modelcontextprotocol/modelcontextprotocol",
+		"commit": "046fa30efd374370afb87ef830bd788eac5f217e",
+		"path": "docs/specification/2026-07-28"
+	},
+	"requirements": [
+		{
+			"id": "basic#014-4c9652",
+			"page": "basic",
+			"section": "ResultType",
+			"anchor": "resulttype",
+			"level": "must",
+			"keywords": [
+				"MUST"
+			],
+			"party": "client",
+			"text": "For backward compatibility with servers implementing earlier protocol versions, which do not include `resultType`, clients MUST treat an absent `resultType` as `\"complete\"`."
+		},
+		{
+			"id": "basic#053-3b953b",
+			"page": "basic",
+			"section": "`_meta`",
+			"anchor": "_meta",
+			"level": "must",
+			"keywords": [
+				"MUST"
+			],
+			"party": "client",
+			"text": "Client requests carry the following `io.modelcontextprotocol/*` fields in `_meta`; fields marked as required MUST be included on every request."
+		},
+		{
+			"id": "basic#056-b03baa",
+			"page": "basic",
+			"section": "`_meta`",
+			"anchor": "_meta",
+			"level": "should",
+			"keywords": [
+				"SHOULD"
+			],
+			"party": "client",
+			"text": "Clients SHOULD include `io.modelcontextprotocol/clientInfo` on every request unless specifically configured not to do so."
+		},
+		{
+			"id": "basic/patterns/mrtr#025-0387ee",
+			"page": "basic/patterns/mrtr",
+			"section": "Client Requirements (Basic Workflow)",
+			"anchor": "client-requirements-basic-workflow",
+			"level": "must",
+			"keywords": [
+				"MUST"
+			],
+			"party": "client",
+			"text": "If an `InputRequiredResult` contains the `requestState` field, the client MUST echo back the exact value of that field when retrying the original request."
+		},
+		{
+			"id": "basic/patterns/mrtr#027-11edf5",
+			"page": "basic/patterns/mrtr",
+			"section": "Client Requirements (Basic Workflow)",
+			"anchor": "client-requirements-basic-workflow",
+			"level": "must_not",
+			"keywords": [
+				"MUST NOT"
+			],
+			"party": "client",
+			"text": "If the `InputRequiredResult` does not contain a `requestState` field, the client MUST NOT include one in the retry."
+		},
+		{
+			"id": "basic/patterns/mrtr#028-cbc1a1",
+			"page": "basic/patterns/mrtr",
+			"section": "Client Requirements (Basic Workflow)",
+			"anchor": "client-requirements-basic-workflow",
+			"level": "must",
+			"keywords": [
+				"MUST"
+			],
+			"party": "both",
+			"text": "The JSON-RPC `id` MUST be different between the initial request and the retry, as they are independent requests."
+		},
+		{
+			"id": "basic/transports/streamable-http#009-6aa4f4",
+			"page": "basic/transports/streamable-http",
+			"section": "Sending Messages",
+			"anchor": "sending-messages",
+			"level": "must",
+			"keywords": [
+				"MUST"
+			],
+			"party": "client",
+			"text": "The client MUST include an `Accept` header listing both `application/json` and `text/event-stream` as supported content types."
+		},
+		{
+			"id": "basic/transports/streamable-http#010-32ff8c",
+			"page": "basic/transports/streamable-http",
+			"section": "Sending Messages",
+			"anchor": "sending-messages",
+			"level": "must",
+			"keywords": [
+				"MUST"
+			],
+			"party": "client",
+			"text": "The client MUST include the request metadata headers on each POST request."
+		},
+		{
+			"id": "basic/transports/streamable-http#036-f12d51",
+			"page": "basic/transports/streamable-http",
+			"section": "Custom Headers from Tool Parameters",
+			"anchor": "custom-headers-from-tool-parameters",
+			"level": "must",
+			"keywords": [
+				"MUST"
+			],
+			"party": "client",
+			"text": "When a server's tool definition includes `x-mcp-header` annotations, conforming clients MUST mirror the designated parameter values into HTTP headers."
+		},
+		{
+			"id": "basic/transports/streamable-http#046-998b88",
+			"page": "basic/transports/streamable-http",
+			"section": "Schema Extension",
+			"anchor": "schema-extension",
+			"level": "must",
+			"keywords": [
+				"MUST"
+			],
+			"party": "client",
+			"text": "Rejection means the client MUST exclude the invalid tool from the result of `tools/list`."
+		},
+		{
+			"id": "basic/transports/streamable-http#050-f69c51",
+			"page": "basic/transports/streamable-http",
+			"section": "Value Encoding",
+			"anchor": "value-encoding",
+			"level": "must",
+			"keywords": [
+				"MUST"
+			],
+			"party": "client",
+			"text": "When a value cannot be safely represented as a plain ASCII header value (e.g., it contains non-ASCII characters, control characters, or has leading/trailing whitespace), clients MUST use Base64 encoding of the UTF-8 representation with the following format:"
+		},
+		{
+			"id": "basic/transports/streamable-http#067-338f54",
+			"page": "basic/transports/streamable-http",
+			"section": "Server Behavior for Custom Headers",
+			"anchor": "server-behavior-for-custom-headers",
+			"level": "must",
+			"keywords": [
+				"MUST"
+			],
+			"party": "client",
+			"text": "Parameter value is `null`: Client MUST omit the header"
+		},
+		{
+			"id": "basic/versioning#002-ecd784",
+			"page": "basic/versioning",
+			"section": "Protocol Version Negotiation",
+			"anchor": "protocol-version-negotiation",
+			"level": "should",
+			"keywords": [
+				"SHOULD"
+			],
+			"party": "client",
+			"text": "The client SHOULD select a mutually supported version from the `supported` list and retry the request, or surface an error to the user if no compatible version exists."
+		},
+		{
+			"id": "basic/authorization#009-4d66f7",
+			"page": "basic/authorization",
+			"section": "Overview",
+			"anchor": "overview",
+			"level": "must",
+			"keywords": [
+				"MUST"
+			],
+			"party": "client",
+			"text": "MCP clients MUST use OAuth 2.0 Protected Resource Metadata for authorization server discovery."
+		},
+		{
+			"id": "basic/authorization/security-considerations#011-49ea51",
+			"page": "basic/authorization/security-considerations",
+			"section": "Authorization Code Protection",
+			"anchor": "authorization-code-protection",
+			"level": "must",
+			"keywords": [
+				"MUST"
+			],
+			"party": "client",
+			"text": "To mitigate this, MCP clients MUST implement PKCE according to OAuth 2.1 Section 7.5.2 and MUST verify PKCE support before proceeding with authorization."
+		},
+		{
+			"id": "basic/authorization/client-registration#028-e7ba6f",
+			"page": "basic/authorization/client-registration",
+			"section": "Authorization Server Binding",
+			"anchor": "authorization-server-binding",
+			"level": "must_not",
+			"keywords": [
+				"MUST NOT",
+				"MUST"
+			],
+			"party": "client",
+			"text": "When the authorization server changes (detected via updated protected resource metadata), clients MUST NOT reuse client credentials from a different authorization server and MUST re-register with the new authorization server."
+		}
+	]
+}

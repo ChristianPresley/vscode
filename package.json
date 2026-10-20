@@ -17,6 +17,7 @@
     "test-extension": "vscode-test",
     "test-build-scripts": "cd build && npm run test",
     "test-agent-host-e2e": "node test/integration/agentHost/runner.ts",
+    "test-mcp-conformance": "node test/mcp-conformance/run.ts all && node test/mcp-conformance/run.ts check-matrix",
     "markdown-editor-package-json-check": "npm --prefix extensions/markdown-language-features run check-markdown-editor-package-json",
     "test-agent-host-e2e-coverage": "node test/integration/agentHost/coverage.ts",
     "check-cyclic-dependencies": "node build/lib/checkCyclicDependencies.ts out",
