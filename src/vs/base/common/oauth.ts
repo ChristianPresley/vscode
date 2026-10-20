@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { decodeBase64 } from './buffer.js';
+import { decodeBase64, encodeBase64, VSBuffer } from './buffer.js';
 
 const WELL_KNOWN_ROUTE = '/.well-known';
 export const AUTH_PROTECTED_RESOURCE_METADATA_DISCOVERY_PATH = `${WELL_KNOWN_ROUTE}/oauth-protected-resource`;
@@ -351,6 +351,17 @@ export interface IAuthorizationServerMetadata {
 	 * ref https://datatracker.ietf.org/doc/html/draft-parecki-oauth-client-id-metadata-document-03
 	 */
 	client_id_metadata_document_supported?: boolean;
+
+	/**
+	 * OPTIONAL. Boolean flag indicating whether the authorization server includes the
+	 * `iss` parameter in authorization responses (RFC 9207 section 3).
+	 */
+	authorization_response_iss_parameter_supported?: boolean;
+
+	/**
+	 * OPTIONAL. JSON array containing a list of the JWS algorithms supported for DPoP proofs (RFC 9449).
+	 */
+	dpop_signing_alg_values_supported?: string[];
 }
 
 /**
@@ -944,34 +955,49 @@ const grantTypesSupported = ['authorization_code', 'refresh_token', 'urn:ietf:pa
  * the spec and require an exact match.
  */
 export const DEFAULT_AUTH_FLOW_PORT = 33418;
-export async function fetchDynamicRegistration(serverMetadata: IAuthorizationServerMetadata, clientName: string, scopes?: string[]): Promise<IAuthorizationDynamicClientRegistrationResponse> {
+export interface IFetchDynamicRegistrationOptions {
+	/** The token endpoint authentication method to register; defaults to `none` (a public native client). */
+	tokenEndpointAuthMethod?: OAuthTokenEndpointAuthMethod;
+	/** Redirect URIs to register; defaults to the VS Code set. */
+	redirectUris?: readonly string[];
+	/** The `client_uri` to register; defaults to the VS Code site. */
+	clientUri?: string;
+	/** Optional custom fetch implementation (defaults to global fetch). */
+	fetch?: typeof fetch;
+}
+
+/** The redirect URIs VS Code registers by default. */
+export const DEFAULT_REDIRECT_URIS: readonly string[] = [
+	'https://insiders.vscode.dev/redirect',
+	'https://vscode.dev/redirect',
+	'http://127.0.0.1/',
+	// Added these for any server that might do
+	// only exact match on the redirect URI even
+	// though the spec says it should not care
+	// about the port.
+	`http://127.0.0.1:${DEFAULT_AUTH_FLOW_PORT}/`
+];
+
+export async function fetchDynamicRegistration(serverMetadata: IAuthorizationServerMetadata, clientName: string, scopes?: string[], options: IFetchDynamicRegistrationOptions = {}): Promise<IAuthorizationDynamicClientRegistrationResponse> {
 	if (!serverMetadata.registration_endpoint) {
 		throw new Error('Server does not support dynamic registration');
 	}
 
 	const requestBody: IAuthorizationDynamicClientRegistrationRequest = {
 		client_name: clientName,
-		client_uri: 'https://code.visualstudio.com',
+		client_uri: options.clientUri ?? 'https://code.visualstudio.com',
 		grant_types: serverMetadata.grant_types_supported
 			? serverMetadata.grant_types_supported.filter(gt => grantTypesSupported.includes(gt))
 			: grantTypesSupported,
 		response_types: ['code'],
-		redirect_uris: [
-			'https://insiders.vscode.dev/redirect',
-			'https://vscode.dev/redirect',
-			'http://127.0.0.1/',
-			// Added these for any server that might do
-			// only exact match on the redirect URI even
-			// though the spec says it should not care
-			// about the port.
-			`http://127.0.0.1:${DEFAULT_AUTH_FLOW_PORT}/`
-		],
+		redirect_uris: [...(options.redirectUris ?? DEFAULT_REDIRECT_URIS)],
 		scope: scopes?.join(AUTH_SCOPE_SEPARATOR),
-		token_endpoint_auth_method: 'none',
+		token_endpoint_auth_method: options.tokenEndpointAuthMethod ?? 'none',
 		application_type: 'native'
 	};
 
-	const response = await fetch(serverMetadata.registration_endpoint, {
+	const fetchImpl = options.fetch ?? fetch;
+	const response = await fetchImpl(serverMetadata.registration_endpoint, {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json'
@@ -1299,6 +1325,33 @@ export interface IFetchAuthorizationServerMetadataOptions {
 	 * Optional custom fetch implementation (defaults to global fetch)
 	 */
 	fetch?: IFetcher;
+	/**
+	 * Whether the `issuer` of the fetched metadata must match the authorization
+	 * server URL the discovery started from (RFC 8414 section 3.3). A mismatch
+	 * is recorded as an {@link OAuthIssuerMismatchError} and the next discovery
+	 * URL is tried. Defaults to false so existing callers keep today's lenient
+	 * behaviour; the MCP 2026-07-28 client turns it on.
+	 */
+	validateIssuer?: boolean;
+	/**
+	 * How the issuer is compared. `exact` (the default and the specification's
+	 * rule) is plain string equality; `trailing-slash` additionally tolerates a
+	 * single trailing slash on either side, for servers that advertise their
+	 * issuer inconsistently.
+	 */
+	issuerTolerance?: 'exact' | 'trailing-slash';
+}
+
+/** True when a fetched metadata `issuer` identifies `authorizationServer` under `tolerance`. */
+export function issuerMatches(issuer: string, authorizationServer: string, tolerance: 'exact' | 'trailing-slash' = 'exact'): boolean {
+	if (issuer === authorizationServer) {
+		return true;
+	}
+	if (tolerance === 'trailing-slash') {
+		const strip = (s: string) => s.endsWith('/') ? s.substring(0, s.length - 1) : s;
+		return strip(issuer) === strip(authorizationServer);
+	}
+	return false;
 }
 
 /** Helper to try parsing the response as authorization server metadata */
@@ -1354,7 +1407,9 @@ export async function fetchAuthorizationServerMetadata(
 ): Promise<{ metadata: IAuthorizationServerMetadata; discoveryUrl: string; errors: Error[] }> {
 	const {
 		additionalHeaders = {},
-		fetch: fetchImpl = fetch
+		fetch: fetchImpl = fetch,
+		validateIssuer = false,
+		issuerTolerance = 'exact',
 	} = options;
 
 	const authorizationServerUrl = new URL(authorizationServer);
@@ -1373,6 +1428,10 @@ export async function fetchAuthorizationServerMetadata(
 			});
 			const metadata = await tryParseAuthServerMetadata(rawResponse);
 			if (metadata) {
+				if (validateIssuer && !issuerMatches(metadata.issuer, authorizationServer, issuerTolerance)) {
+					errors.push(new OAuthIssuerMismatchError(authorizationServer, metadata.issuer, url));
+					return undefined;
+				}
 				return metadata;
 			}
 			// No metadata found, collect error from response
@@ -1421,3 +1480,215 @@ export async function fetchAuthorizationServerMetadata(
 		throw new AggregateError(errors, 'Failed to fetch authorization server metadata from all attempted URLs');
 	}
 }
+
+//#region MCP 2026-07-28 authorization helpers
+
+export type OAuthClientErrorCode =
+	| 'resource_mismatch'
+	| 'issuer_mismatch'
+	| 'iss_missing'
+	| 'iss_mismatch'
+	| 'state_mismatch'
+	| 'pkce_unsupported'
+	| 'insecure_endpoint'
+	| 'registration_failed'
+	| 'issuer_not_registered'
+	| 'invalid_client_metadata_url'
+	| 'token_request_failed'
+	| 'authorization_denied'
+	| 'discovery_failed'
+	| 'step_up_limit'
+	| 'challenge_limit';
+
+/** A terminal, classified failure of the OAuth client flow. */
+export class OAuthClientError extends Error {
+	constructor(
+		public readonly code: OAuthClientErrorCode,
+		message: string,
+		public readonly detail?: unknown,
+	) {
+		super(message);
+		this.name = 'OAuthClientError';
+	}
+}
+
+/** The fetched authorization server metadata names a different issuer than the one discovery started from. */
+export class OAuthIssuerMismatchError extends OAuthClientError {
+	constructor(
+		public readonly expectedIssuer: string,
+		public readonly actualIssuer: string,
+		public readonly discoveryUrl: string,
+	) {
+		super('issuer_mismatch', `Authorization server metadata from ${discoveryUrl} names issuer '${actualIssuer}', expected '${expectedIssuer}'`);
+	}
+}
+
+export type OAuthTokenEndpointAuthMethod = 'none' | 'client_secret_basic' | 'client_secret_post';
+
+const TOKEN_ENDPOINT_AUTH_METHODS: readonly OAuthTokenEndpointAuthMethod[] = ['none', 'client_secret_basic', 'client_secret_post'];
+
+function isTokenEndpointAuthMethod(value: unknown): value is OAuthTokenEndpointAuthMethod {
+	return typeof value === 'string' && (TOKEN_ENDPOINT_AUTH_METHODS as readonly string[]).includes(value);
+}
+
+/**
+ * Picks the token endpoint authentication method to request when registering
+ * a client. VS Code is a public native client, so `none` is preferred; when
+ * the server does not offer it, a confidential method it supports is chosen
+ * so that registration succeeds and the issued secret is used later.
+ */
+export function selectRegistrationAuthMethod(supported?: readonly string[]): OAuthTokenEndpointAuthMethod {
+	if (!supported || supported.length === 0 || supported.includes('none')) {
+		return 'none';
+	}
+	if (supported.includes('client_secret_basic')) {
+		return 'client_secret_basic';
+	}
+	if (supported.includes('client_secret_post')) {
+		return 'client_secret_post';
+	}
+	return 'none';
+}
+
+/**
+ * Picks the method used at the token endpoint: the method the registration
+ * recorded wins; otherwise a client without a secret is public, and a client
+ * with a secret uses `client_secret_basic` unless the server only supports
+ * `client_secret_post`.
+ */
+export function selectTokenEndpointAuthMethod(registered: string | undefined, supported: readonly string[] | undefined, hasSecret: boolean): OAuthTokenEndpointAuthMethod {
+	if (isTokenEndpointAuthMethod(registered)) {
+		return registered;
+	}
+	if (!hasSecret) {
+		return 'none';
+	}
+	if (supported && supported.length > 0 && !supported.includes('client_secret_basic') && supported.includes('client_secret_post')) {
+		return 'client_secret_post';
+	}
+	return 'client_secret_basic';
+}
+
+/**
+ * The headers and form fields that authenticate a client at the token
+ * endpoint (RFC 6749 section 2.3.1). For `client_secret_basic` the id and
+ * secret are form-urlencoded before Base64, as the RFC requires.
+ */
+export function buildClientAuthentication(method: OAuthTokenEndpointAuthMethod, clientId: string, clientSecret?: string): { headers: Record<string, string>; body: Record<string, string> } {
+	switch (method) {
+		case 'client_secret_basic': {
+			const credentials = `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret ?? '')}`;
+			return { headers: { Authorization: `Basic ${encodeBase64(VSBuffer.fromString(credentials))}` }, body: { client_id: clientId } };
+		}
+		case 'client_secret_post':
+			return { headers: {}, body: clientSecret === undefined ? { client_id: clientId } : { client_id: clientId, client_secret: clientSecret } };
+		case 'none':
+			return { headers: {}, body: { client_id: clientId } };
+	}
+}
+
+/**
+ * Applies the RFC 9207 `iss` validation table of the MCP authorization
+ * specification: a present `iss` is compared to the recorded issuer by plain
+ * string equality (no scheme/host case folding, port elision, trailing-slash
+ * or percent-encoding normalization); an absent `iss` is only an error when
+ * the server advertised `authorization_response_iss_parameter_supported`.
+ * Returns the error to surface, or `undefined` when the response may proceed.
+ */
+export function validateIssuerParameter(advertised: boolean | undefined, iss: string | undefined, expectedIssuer: string): OAuthClientError | undefined {
+	if (iss === undefined) {
+		return advertised === true
+			? new OAuthClientError('iss_missing', 'The authorization response omitted the iss parameter although the authorization server advertises support for it')
+			: undefined;
+	}
+	if (iss !== expectedIssuer) {
+		return new OAuthClientError('iss_mismatch', `The authorization response iss parameter '${iss}' does not match the authorization server issuer '${expectedIssuer}'`, { iss, expectedIssuer });
+	}
+	return undefined;
+}
+
+export interface IAuthorizationRedirectParams {
+	readonly code?: string;
+	readonly state?: string;
+	readonly iss?: string;
+	readonly error?: string;
+	readonly errorDescription?: string;
+	readonly errorUri?: string;
+}
+
+/** Parses the query of an authorization redirect (form-urlencoded per RFC 6749 section 4.1.2). */
+export function parseAuthorizationRedirect(query: string | URLSearchParams): IAuthorizationRedirectParams {
+	const params = typeof query === 'string' ? new URLSearchParams(query.startsWith('?') ? query.substring(1) : query) : query;
+	const get = (name: string) => { const value = params.get(name); return value === null ? undefined : value; };
+	return {
+		code: get('code'),
+		state: get('state'),
+		iss: get('iss'),
+		error: get('error'),
+		errorDescription: get('error_description'),
+		errorUri: get('error_uri'),
+	};
+}
+
+/**
+ * The canonical form of an MCP server URL used as the RFC 8707 `resource`
+ * indicator: lowercase scheme and host, default port removed, no fragment;
+ * the path (including any trailing slash) is kept as given.
+ */
+export function canonicalResourceUri(url: string): string {
+	const parsed = new URL(url);
+	parsed.hash = '';
+	// URL lowercases scheme and host and drops default ports already.
+	return parsed.toString();
+}
+
+/**
+ * True when `url` may serve as a Client ID Metadata Document identifier:
+ * https, a host, a non-root path, no fragment, no credentials.
+ */
+export function isValidClientMetadataUrl(url: string): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return false;
+	}
+	return parsed.protocol === 'https:'
+		&& parsed.hostname.length > 0
+		&& parsed.pathname.length > 1
+		&& parsed.hash === ''
+		&& parsed.username === ''
+		&& parsed.password === '';
+}
+
+/** True for `http(s)://localhost`, `127.0.0.0/8` and `[::1]` URLs. */
+export function isLoopbackUrl(url: string): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return false;
+	}
+	const host = parsed.hostname.toLowerCase();
+	return host === 'localhost' || host === '[::1]' || host === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
+/** True when the authorization server advertises the `S256` PKCE method. */
+export function pkceSupported(metadata: IAuthorizationServerMetadata): boolean {
+	return Array.isArray(metadata.code_challenge_methods_supported) && metadata.code_challenge_methods_supported.includes('S256');
+}
+
+/**
+ * Creates a PKCE verifier/challenge pair (RFC 7636): a 32-byte random
+ * verifier and its `S256` challenge, both base64url without padding. The
+ * randomness and hash primitives are injected so the helper stays
+ * environment-neutral.
+ */
+export async function createPkcePair(random: (bytes: number) => Uint8Array, sha256: (data: Uint8Array) => Promise<Uint8Array>): Promise<{ verifier: string; challenge: string }> {
+	const verifier = encodeBase64(VSBuffer.wrap(random(32)), false, true);
+	const digest = await sha256(new TextEncoder().encode(verifier));
+	const challenge = encodeBase64(VSBuffer.wrap(digest), false, true);
+	return { verifier, challenge };
+}
+
+//#endregion

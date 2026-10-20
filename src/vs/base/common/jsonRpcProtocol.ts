@@ -6,7 +6,7 @@
 import { DeferredPromise } from './async.js';
 import { CancellationToken, CancellationTokenSource } from './cancellation.js';
 import { CancellationError } from './errors.js';
-import { Disposable, toDisposable } from './lifecycle.js';
+import { Disposable } from './lifecycle.js';
 import { hasKey } from './types.js';
 
 export type JsonRpcId = string | number;
@@ -75,6 +75,8 @@ export class JsonRpcProtocol extends Disposable {
 
 	private _nextRequestId = 1;
 	private readonly _pendingRequests = new Map<JsonRpcId, IPendingRequest>();
+	/** Incoming requests currently being handled, keyed by the peer's request id. */
+	private readonly _pendingIncoming = new Map<JsonRpcId, CancellationTokenSource>();
 
 	constructor(
 		private readonly _send: (message: JsonRpcMessage) => void,
@@ -91,11 +93,20 @@ export class JsonRpcProtocol extends Disposable {
 	}
 
 	public sendRequest<T = unknown>(request: Omit<IJsonRpcRequest, 'jsonrpc' | 'id'>, token: CancellationToken = CancellationToken.None, onCancel?: (id: JsonRpcId) => void): Promise<T> {
+		return this.sendRequestWithId<T>(request, token, onCancel).result;
+	}
+
+	/**
+	 * Like {@link sendRequest}, but also exposes the id the request was sent
+	 * with, so callers can correlate transport-level events (aborts,
+	 * cancellation) with the pending request.
+	 */
+	public sendRequestWithId<T = unknown>(request: Omit<IJsonRpcRequest, 'jsonrpc' | 'id'>, token: CancellationToken = CancellationToken.None, onCancel?: (id: JsonRpcId) => void): { readonly id: JsonRpcId; readonly result: Promise<T> } {
+		const id = this._nextRequestId++;
 		if (this._store.isDisposed) {
-			return Promise.reject(new CancellationError());
+			return { id, result: Promise.reject(new CancellationError()) };
 		}
 
-		const id = this._nextRequestId++;
 		const promise = new DeferredPromise<unknown>();
 		const cts = new CancellationTokenSource();
 		this._pendingRequests.set(id, { promise, cts });
@@ -116,11 +127,50 @@ export class JsonRpcProtocol extends Disposable {
 			...request,
 		});
 
-		return promise.p.finally(() => {
+		const result = promise.p.finally(() => {
 			cancelListener.dispose();
 			this._pendingRequests.delete(id);
 			cts.dispose(true);
 		}) as Promise<T>;
+		return { id, result };
+	}
+
+	/** True while an outgoing request with `id` awaits its response. */
+	public hasPendingRequest(id: JsonRpcId): boolean {
+		return this._pendingRequests.has(id);
+	}
+
+	/**
+	 * Fails a pending outgoing request locally (for instance because the
+	 * transport reported that the request can no longer be answered). A later
+	 * response with the same id is ignored. Returns false when no such
+	 * request is pending.
+	 */
+	public failPendingRequest(id: JsonRpcId, error: Error): boolean {
+		const request = this._pendingRequests.get(id);
+		if (!request) {
+			return false;
+		}
+		this._pendingRequests.delete(id);
+		request.cts.cancel();
+		request.promise.error(error);
+		request.cts.dispose(true);
+		return true;
+	}
+
+	/**
+	 * Cancels the handling of an incoming request (the peer sent
+	 * `notifications/cancelled` for it). The handler observes its
+	 * cancellation token; no response is sent for a cancelled request.
+	 * Returns false when no such request is in flight.
+	 */
+	public cancelIncomingRequest(id: JsonRpcId): boolean {
+		const cts = this._pendingIncoming.get(id);
+		if (!cts) {
+			return false;
+		}
+		cts.cancel();
+		return true;
 	}
 
 	/**
@@ -167,6 +217,9 @@ export class JsonRpcProtocol extends Disposable {
 			pending.promise.cancel();
 			pending.cts.dispose(true);
 		}
+		for (const cts of this._pendingIncoming.values()) {
+			cts.cancel();
+		}
 	}
 
 	private async _handleMessage(message: JsonRpcMessage): Promise<JsonRpcResponse | undefined> {
@@ -212,7 +265,7 @@ export class JsonRpcProtocol extends Disposable {
 		}
 	}
 
-	private async _handleRequest(request: IJsonRpcRequest): Promise<JsonRpcResponse> {
+	private async _handleRequest(request: IJsonRpcRequest): Promise<JsonRpcResponse | undefined> {
 		if (!this._handlers.handleRequest) {
 			const response: IJsonRpcErrorResponse = {
 				jsonrpc: '2.0',
@@ -227,11 +280,15 @@ export class JsonRpcProtocol extends Disposable {
 		}
 
 		const cts = new CancellationTokenSource();
-		this._register(toDisposable(() => cts.dispose(true)));
+		this._pendingIncoming.set(request.id, cts);
 
 		try {
 			const resultOrThenable = this._handlers.handleRequest(request, cts.token);
 			const result = isThenable(resultOrThenable) ? await resultOrThenable : resultOrThenable;
+			if (cts.token.isCancellationRequested) {
+				// The peer cancelled the request; it ignores any response.
+				return undefined;
+			}
 			const response: IJsonRpcSuccessResponse = {
 				jsonrpc: '2.0',
 				id: request.id,
@@ -240,6 +297,9 @@ export class JsonRpcProtocol extends Disposable {
 			this._send(response);
 			return response;
 		} catch (error) {
+			if (cts.token.isCancellationRequested) {
+				return undefined;
+			}
 			let response: IJsonRpcErrorResponse;
 			if (error instanceof JsonRpcError) {
 				response = {
@@ -264,6 +324,9 @@ export class JsonRpcProtocol extends Disposable {
 			this._send(response);
 			return response;
 		} finally {
+			if (this._pendingIncoming.get(request.id) === cts) {
+				this._pendingIncoming.delete(request.id);
+			}
 			cts.dispose(true);
 		}
 	}
