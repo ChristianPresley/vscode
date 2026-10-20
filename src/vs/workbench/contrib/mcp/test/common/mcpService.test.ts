@@ -33,9 +33,21 @@ import { TestContextService, TestLoggerService, TestProductService, TestStorageS
 import { IMcpRegistry } from '../../common/mcpRegistryTypes.js';
 import { McpServerConnection } from '../../common/mcpServerConnection.js';
 import { McpService } from '../../common/mcpService.js';
-import { McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType } from '../../common/mcpTypes.js';
+import { IMcpServer, McpCapability, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, MpcResponseError } from '../../common/mcpTypes.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
-import { TestMcpMessageTransport, TestMcpRegistry } from './mcpRegistryTypes.js';
+import { ITestMcpTransportOptions, TestMcpMessageTransport, TestMcpRegistry } from './mcpRegistryTypes.js';
+import { McpServerRequestHandler } from '../../common/mcpServerRequestHandler.js';
+import { McpServerMetadataCache } from '../../common/mcpServer.js';
+import { MCP } from '../../../../../platform/mcp/common/modelContextProtocol.js';
+import { IJsonRpcRequest, JsonRpcMessage } from '../../../../../base/common/jsonRpcProtocol.js';
+import { CancellationToken } from '../../../../../base/common/cancellation.js';
+
+/** Exposes the user-scoped metadata cache for assertions. */
+class TestableMcpService extends McpService {
+	getCachedEntry(definitionId: string): ReturnType<McpServerMetadataCache['get']> {
+		return this.userCache.get(definitionId);
+	}
+}
 
 suite('Workbench - MCP - McpService', () => {
 
@@ -58,7 +70,7 @@ suite('Workbench - MCP - McpService', () => {
 		const registry = new TestMcpRegistry(parentInstantiationService);
 		const instantiationService = store.add(parentInstantiationService.createChild(new ServiceCollection([IMcpRegistry, registry])));
 		const configurationService = new TestConfigurationService({ [mcpAutoStartConfig]: McpAutoStartValue.NewAndOutdated });
-		const mcpService = store.add(new McpService(instantiationService, registry, new NullLogService(), configurationService, storageService));
+		const mcpService = store.add(new TestableMcpService(instantiationService, registry, new NullLogService(), configurationService, storageService));
 		return { mcpService, registry, instantiationService };
 	};
 
@@ -717,5 +729,175 @@ suite('Workbench - MCP - McpService', () => {
 		mcpService.updateCollectedServers();
 
 		assert.strictEqual(stopStub.callCount, 1);
+	});
+
+	suite('2026-07-28 servers', () => {
+		const calcTool: MCPLegacy.Tool = {
+			name: 'calc',
+			description: 'Adds numbers',
+			inputSchema: { type: 'object', properties: {} },
+			outputSchema: { type: 'object', properties: { sum: { type: 'number' } }, required: ['sum'] },
+		};
+
+		interface IModernServerOptions {
+			readonly transport?: ITestMcpTransportOptions;
+			readonly tools?: MCPLegacy.Tool[];
+			readonly listHint?: { ttlMs: number; cacheScope: 'public' | 'private' };
+			readonly callResult?: MCPLegacy.CallToolResult;
+		}
+
+		const modernResult = (request: IJsonRpcRequest, result: object): JsonRpcMessage => ({ jsonrpc: MCP.JSONRPC_VERSION, id: request.id, result: { resultType: 'complete', ...result } });
+
+		/** A service whose test server speaks 2026-07-28; every connection gets a fresh transport. */
+		const createModernServer = (options: IModernServerOptions = {}) => {
+			const { mcpService, registry } = createMcpService();
+			const transports: TestMcpMessageTransport[] = [];
+			registry.makeTestTransport = () => {
+				const transport = new TestMcpMessageTransport({ era: 'modern', ...options.transport });
+				transports.push(transport);
+				transport.setResponder('tools/list', req => modernResult(req, { tools: options.tools ?? [], ...options.listHint }));
+				transport.setResponder('prompts/list', req => modernResult(req, { prompts: [] }));
+				transport.setResponder('tools/call', req => modernResult(req, options.callResult ?? { content: [] }));
+				return transport;
+			};
+			mcpService.updateCollectedServers();
+			return { mcpService, registry, server: mcpService.servers.get()[0], transports };
+		};
+
+		const startAndWaitForHandler = async (server: IMcpServer): Promise<McpServerRequestHandler> => {
+			const state = await server.start({ promptType: 'never', errorOnUserInteraction: true });
+			assert.strictEqual(state.state, McpConnectionState.Kind.Running);
+			const connection = server.connection.get();
+			assert.ok(connection, 'the server has a connection');
+			const handler = await waitForState(connection.handler, Boolean);
+			assert.ok(handler);
+			return handler;
+		};
+
+		test('a 2026-07-28 server has the StatelessProtocol capability', async () => {
+			const { server, transports } = createModernServer();
+			const handler = await startAndWaitForHandler(server);
+			assert.strictEqual(handler.era, 'modern');
+			const capabilities = await waitForState(server.capabilities, c => c !== undefined);
+			assert.ok(capabilities !== undefined);
+			assert.strictEqual(capabilities & McpCapability.StatelessProtocol, McpCapability.StatelessProtocol);
+			assert.strictEqual(capabilities & McpCapability.ToolsListChanged, McpCapability.ToolsListChanged);
+			assert.strictEqual(capabilities & McpCapability.Completions, McpCapability.Completions);
+			assert.strictEqual(transports[0].getSentRequests('initialize').length, 0);
+		});
+
+		test('a legacy server has no StatelessProtocol capability', async () => {
+			const { mcpService, registry } = createMcpService();
+			registry.makeTestTransport = () => {
+				const transport = new TestMcpMessageTransport();
+				transport.setResponder('tools/list', req => ({ jsonrpc: MCPLegacy.JSONRPC_VERSION, id: req.id, result: { tools: [] } }));
+				return transport;
+			};
+			mcpService.updateCollectedServers();
+			const server = mcpService.servers.get()[0];
+			const handler = await startAndWaitForHandler(server);
+			assert.strictEqual(handler.era, 'legacy');
+			const capabilities = await waitForState(server.capabilities, c => c !== undefined);
+			assert.strictEqual((capabilities ?? 0) & McpCapability.StatelessProtocol, 0);
+			assert.deepStrictEqual(mcpService.getCachedEntry('test-server')?.protocol, { era: 'legacy', version: '2025-11-25' });
+		});
+
+		test('the cache remembers the protocol and the list freshness, and the next connection uses them as hints', async () => {
+			const { mcpService, server, transports } = createModernServer({ tools: [calcTool], listHint: { ttlMs: 60_000, cacheScope: 'public' } });
+			const first = await startAndWaitForHandler(server);
+			await waitForState(server.tools, tools => tools.length === 1);
+
+			const entry = mcpService.getCachedEntry('test-server');
+			assert.deepStrictEqual(entry?.protocol, { era: 'modern', version: '2026-07-28' });
+			assert.strictEqual(entry?.freshness?.tools?.ttlMs, 60_000);
+			assert.strictEqual(entry?.freshness?.tools?.cacheScope, 'public');
+			assert.strictEqual(typeof entry?.freshness?.tools?.receivedAt, 'number');
+			assert.strictEqual(entry?.freshness?.prompts, undefined, 'a list without a hint stores no freshness');
+			assert.strictEqual(first.lastNegotiation?.usedHint, false);
+
+			await server.stop();
+			const second = await startAndWaitForHandler(server);
+			assert.notStrictEqual(second, first);
+			assert.strictEqual(second.era, 'modern');
+			assert.strictEqual(second.lastNegotiation?.usedHint, true);
+			assert.strictEqual(transports.length, 2);
+			// a modern hint pins the revision but server/discover is still needed for the capabilities
+			assert.strictEqual(transports[1].getSentRequests('server/discover').length, 1);
+			assert.strictEqual(transports[1].getSentRequests('initialize').length, 0);
+		});
+
+		for (const cacheScope of ['public', 'private'] as const) {
+			test(`a fresh ${cacheScope} tool list is ${cacheScope === 'public' ? 'reused' : 're-listed'} on reconnect`, async () => {
+				const { server, transports } = createModernServer({ tools: [calcTool], listHint: { ttlMs: 60_000, cacheScope } });
+				await startAndWaitForHandler(server);
+				await waitForState(server.tools, tools => tools.length === 1);
+				assert.strictEqual(transports[0].getSentRequests('tools/list').length, 1);
+
+				await server.stop();
+				await startAndWaitForHandler(server);
+				await timeout(0);
+				assert.strictEqual(transports[1].getSentRequests('tools/list').length, cacheScope === 'public' ? 0 : 1);
+				assert.deepStrictEqual(server.tools.get().map(t => t.definition.name), ['calc']);
+			});
+		}
+
+		test('an expired public tool list is re-listed on reconnect', async () => {
+			const { server, transports } = createModernServer({ tools: [calcTool], listHint: { ttlMs: 0, cacheScope: 'public' } });
+			await startAndWaitForHandler(server);
+			await waitForState(server.tools, tools => tools.length === 1);
+			await server.stop();
+			await startAndWaitForHandler(server);
+			await timeout(0);
+			assert.strictEqual(transports[1].getSentRequests('tools/list').length, 1);
+		});
+
+		test('structured content that does not match the output schema rejects the tool call', async () => {
+			const { server } = createModernServer({ tools: [calcTool], callResult: { content: [{ type: 'text', text: 'nope' }], structuredContent: { sum: 'not a number' } } });
+			await startAndWaitForHandler(server);
+			const [tool] = await waitForState(server.tools, tools => tools.length === 1);
+
+			await assert.rejects(tool.call({}), (e: unknown) => e instanceof MpcResponseError && e.code === MCPLegacy.INVALID_PARAMS && e.code === -32602);
+		});
+
+		test('structured content matching the output schema is returned', async () => {
+			const { server } = createModernServer({ tools: [calcTool], callResult: { content: [{ type: 'text', text: '3' }], structuredContent: { sum: 3 } } });
+			await startAndWaitForHandler(server);
+			const [tool] = await waitForState(server.tools, tools => tools.length === 1);
+
+			const result = await tool.call({});
+			assert.deepStrictEqual(result.structuredContent, { sum: 3 });
+		});
+
+		test('an isError result skips the output schema check', async () => {
+			const { server } = createModernServer({ tools: [calcTool], callResult: { isError: true, content: [{ type: 'text', text: 'failed' }], structuredContent: { sum: 'n/a' } } });
+			await startAndWaitForHandler(server);
+			const [tool] = await waitForState(server.tools, tools => tools.length === 1);
+
+			const result = await tool.call({});
+			assert.strictEqual(result.isError, true);
+		});
+
+		for (const completions of [false, true]) {
+			test(`prompt completion is ${completions ? 'requested from' : 'skipped for'} a server ${completions ? 'with' : 'without'} the completions capability`, async () => {
+				const { mcpService, registry } = createMcpService();
+				const transports: TestMcpMessageTransport[] = [];
+				registry.makeTestTransport = () => {
+					const transport = new TestMcpMessageTransport({ initializeResult: { capabilities: completions ? { tools: {}, prompts: {}, completions: {} } : { tools: {}, prompts: {} } } });
+					transports.push(transport);
+					transport.setResponder('tools/list', req => ({ jsonrpc: MCPLegacy.JSONRPC_VERSION, id: req.id, result: { tools: [] } }));
+					transport.setResponder('prompts/list', req => ({ jsonrpc: MCPLegacy.JSONRPC_VERSION, id: req.id, result: { prompts: [{ name: 'greet', arguments: [{ name: 'who' }] }] } }));
+					transport.setResponder('completion/complete', req => ({ jsonrpc: MCPLegacy.JSONRPC_VERSION, id: req.id, result: { completion: { values: ['Ada', 'Alan'] } } }));
+					return transport;
+				};
+				mcpService.updateCollectedServers();
+				const server = mcpService.servers.get()[0];
+				await startAndWaitForHandler(server);
+				const [prompt] = await waitForState(server.prompts, prompts => prompts.length === 1);
+
+				const values = await prompt.complete('who', 'A', {}, CancellationToken.None);
+				assert.deepStrictEqual(values, completions ? ['Ada', 'Alan'] : []);
+				assert.strictEqual(transports[0].getSentRequests('completion/complete').length, completions ? 1 : 0);
+			});
+		}
 	});
 });

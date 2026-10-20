@@ -9,6 +9,7 @@ import { decodeHex, encodeHex, VSBuffer } from '../../../../base/common/buffer.j
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Event } from '../../../../base/common/event.js';
 import { JsonRpcId } from '../../../../base/common/jsonRpcProtocol.js';
+import { McpProtocolEra } from '../../../../platform/mcp/common/mcpProtocolVersions.js';
 import { IMarkdownString } from '../../../../base/common/htmlContent.js';
 import { Disposable, IDisposable } from '../../../../base/common/lifecycle.js';
 import { equals as objectsEqual } from '../../../../base/common/objects.js';
@@ -217,6 +218,12 @@ export interface McpServerDefinition {
 	readonly environmentVariableExpansion?: McpServerEnvironmentVariableExpansion;
 	/** Nonce used for caching the server. Changing the nonce will indicate that tools need to be refreshed. */
 	readonly cacheNonce: string;
+	/**
+	 * An optional protocol revision the user pinned in the configuration. The
+	 * client skips era detection and speaks that revision (non-strict: it still
+	 * falls back when the server rejects it).
+	 */
+	readonly protocolVersionHint?: string;
 	/** Dev mode configuration for the server */
 	readonly devMode?: IMcpDevModeConfig;
 	/** Optional server version metadata from the source configuration. */
@@ -303,6 +310,7 @@ export namespace McpServerDefinition {
 		readonly id: string;
 		readonly label: string;
 		readonly cacheNonce: string;
+		readonly protocolVersionHint?: string;
 		readonly launch: McpServerLaunch.Serialized;
 		readonly defaultCwd?: UriComponents;
 		readonly variableReplacement?: McpServerDefinitionVariableReplacement.Serialized;
@@ -322,6 +330,7 @@ export namespace McpServerDefinition {
 			id: def.id,
 			label: def.label,
 			cacheNonce: def.cacheNonce,
+			protocolVersionHint: def.protocolVersionHint,
 			staticMetadata: def.staticMetadata,
 			launch: McpServerLaunch.fromSerialized(def.launch),
 			defaultCwd: def.defaultCwd ? URI.revive(def.defaultCwd) : undefined,
@@ -887,7 +896,7 @@ export interface IMcpServerConnection extends IDisposable {
 	 * Starts the server if it's stopped. Returns a promise that resolves once
 	 * server exits a 'starting' state.
 	 */
-	start(methods: IMcpClientMethods): Promise<McpConnectionState>;
+	start(methods: IMcpClientMethods, hints?: IMcpNegotiationHints): Promise<McpConnectionState>;
 
 	/**
 	 * Stops the server.
@@ -897,10 +906,26 @@ export interface IMcpServerConnection extends IDisposable {
 
 /** Client methods whose implementations are passed through the server connection. */
 export interface IMcpClientMethods {
-	/** Handler for `sampling/createMessage` */
-	createMessageRequestHandler?(req: MCPLegacy.CreateMessageRequest['params'], token?: CancellationToken): Promise<MCPLegacy.CreateMessageResult>;
-	/** Handler for `elicitation/create` */
-	elicitationRequestHandler?(req: MCPLegacy.ElicitRequest['params'], token?: CancellationToken): Promise<MCPLegacy.ElicitResult>;
+	/** Handler for `sampling/createMessage` (a server request in the legacy era, an input request in the modern era). */
+	createMessageRequestHandler?(req: MCPLegacy.CreateMessageRequest['params'], token?: CancellationToken, context?: IMcpToolCallContext): Promise<MCPLegacy.CreateMessageResult>;
+	/** Handler for `elicitation/create` (a server request in the legacy era, an input request in the modern era). */
+	elicitationRequestHandler?(req: MCPLegacy.ElicitRequest['params'], token?: CancellationToken, context?: IMcpToolCallContext, options?: IMcpElicitOptions): Promise<MCPLegacy.ElicitResult>;
+}
+
+/**
+ * Hints the protocol engine uses when it connects. Without hints it probes:
+ * `server/discover` first, then the legacy `initialize` handshake.
+ */
+export interface IMcpNegotiationHints {
+	/** The era the server spoke last time (from the metadata cache). Skips the probe; a failure re-probes. */
+	readonly era?: McpProtocolEra;
+	/** The revision to speak (from the cache or a configured pin). */
+	readonly protocolVersion?: string;
+	/**
+	 * Never fall back to the other era. Used by the conformance client, which
+	 * must speak exactly the revision the suite requested.
+	 */
+	readonly strict?: boolean;
 }
 
 /**
@@ -1125,6 +1150,32 @@ export interface IWorkbenchMcpServer {
 	getReadme(token: CancellationToken): Promise<string>;
 	getManifest(token: CancellationToken): Promise<IGalleryMcpServerConfiguration>;
 }
+export type McpClientErrorReason =
+	/** The stdio server answered neither `server/discover` nor `initialize` within the probe timeout. */
+	| 'probe-timeout'
+	/** The server advertises no revision the client speaks. */
+	| 'no-supported-version'
+	/** A result carried an unknown `resultType`. */
+	| 'invalid-result-type'
+	/** The server kept asking for input beyond the round limit. */
+	| 'too-many-rounds'
+	/** The server asked for an input kind the client did not declare. */
+	| 'undeclared-input-request'
+	/** An `input_required` result was malformed. */
+	| 'invalid-input-request'
+	/** The user's elicitation answer does not match the requested schema. */
+	| 'invalid-elicit-content'
+	/** The transport reported that the request can no longer be answered. */
+	| 'request-aborted';
+
+/** A failure of the client protocol engine itself (as opposed to an error the server returned). */
+export class McpClientError extends Error {
+	constructor(public readonly reason: McpClientErrorReason, message: string, public readonly detail?: unknown) {
+		super(message);
+		this.name = 'McpClientError';
+	}
+}
+
 
 export const IMcpWorkbenchService = createDecorator<IMcpWorkbenchService>('IMcpWorkbenchService');
 
@@ -1319,7 +1370,16 @@ export interface IMcpElicitationService {
 	 * @param elicitation Request to elicit a response.
 	 * @returns A promise that resolves to an {@link ElicitationResult}.
 	 */
-	elicit(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCPLegacy.ElicitRequest['params'], token: CancellationToken): Promise<ElicitResult>;
+	elicit(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCPLegacy.ElicitRequest['params'], token: CancellationToken, options?: IMcpElicitOptions): Promise<ElicitResult>;
+}
+
+export interface IMcpElicitOptions {
+	/**
+	 * The same URL elicitation is being asked for again after the user already
+	 * opened it (a modern server re-asked in a later round): show a "Continue"
+	 * affordance instead of opening the URL again.
+	 */
+	readonly resume?: boolean;
 }
 
 export const enum ElicitationKind {
@@ -1343,6 +1403,8 @@ export interface IFormModeElicitResult extends IDisposable {
 	value: MCPLegacy.ElicitResult;
 }
 
+	/** The server speaks a stateless (2026-07-28 or later) revision. */
+	StatelessProtocol = 1 << 9,
 export type ElicitResult = IUrlModeElicitResult | IFormModeElicitResult;
 
 export const IMcpElicitationService = createDecorator<IMcpElicitationService>('IMcpElicitationService');

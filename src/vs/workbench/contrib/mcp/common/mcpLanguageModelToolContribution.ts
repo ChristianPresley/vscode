@@ -145,8 +145,8 @@ export class McpLanguageModelToolContribution extends Disposable implements IWor
 					id: tool.id,
 					source: collectionData.value.source,
 					icon: icons || Codicon.tools,
-					// duplicative: https://github.com/modelcontextprotocol/modelcontextprotocol/pull/813
-					displayName: tool.definition.annotations?.title || tool.definition.title || tool.definition.name,
+					// Display name precedence per the 2026-07-28 spec: title, then annotations.title, then name
+					displayName: tool.definition.title || tool.definition.annotations?.title || tool.definition.name,
 					toolReferenceName: tool.referenceName,
 					modelDescription: tool.definition.description ?? '',
 					userDescription: tool.definition.description ?? '',
@@ -225,8 +225,8 @@ class McpToolImplementation implements IToolImpl {
 			this._productService.nameShort
 		);
 
-		// duplicative: https://github.com/modelcontextprotocol/modelcontextprotocol/pull/813
-		const title = tool.definition.annotations?.title || tool.definition.title || ('`' + tool.definition.name + '`');
+		// Display name precedence per the 2026-07-28 spec: title, then annotations.title, then name
+		const title = tool.definition.title || tool.definition.annotations?.title || ('`' + tool.definition.name + '`');
 
 		let confirm: IToolConfirmationMessages | undefined;
 		if (!isSandboxedServer) {
@@ -394,6 +394,12 @@ class McpToolImplementation implements IToolImpl {
 		// Add raw MCP output for MCP App UI rendering if this tool has UI
 		if (this._tool.uiResourceUri) {
 			details.mcpOutput = callResult;
+		}
+
+		// An `isError` result is a tool error for the model and the UI, not a successful output
+		if (callResult.isError === true) {
+			const firstText = callResult.content.find(c => c.type === 'text');
+			result.toolResultError = firstText?.type === 'text' && firstText.text ? firstText.text : true;
 		}
 
 		result.toolResultDetails = details;

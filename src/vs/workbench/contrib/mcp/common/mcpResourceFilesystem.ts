@@ -128,21 +128,14 @@ export class McpResourceFilesystem extends Disposable implements IWorkbenchContr
 			callCts.value = new CancellationTokenSource();
 			watchedOnHandler = handler;
 
-			const token = callCts.value.token;
-			handler.subscribe({ uri: resourceURI.toString() }, token).then(
-				() => {
-					if (!token.isCancellationRequested) {
-						watchListener.value = handler.onDidUpdateResource(e => {
-							if (equalsUrlPath(e.params.uri, resourceURI)) {
-								this._onDidChangeFile.fire([{ resource: uri, type: FileChangeType.UPDATED }]);
-							}
-						});
-					}
-				}, err => {
-					handler.logger.warn(`Failed to subscribe to resource changes for ${resourceURI}: ${err}`);
-					watchedOnHandler = undefined;
-				},
-			);
+			const subscription = new DisposableStore();
+			subscription.add(handler.subscribeResource(resourceURI.toString()));
+			subscription.add(handler.onDidUpdateResource(e => {
+				if (equalsUrlPath(e.uri, resourceURI)) {
+					this._onDidChangeFile.fire([{ resource: uri, type: FileChangeType.UPDATED }]);
+				}
+			}));
+			watchListener.value = subscription;
 		}));
 
 		return store;

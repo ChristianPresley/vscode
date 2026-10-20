@@ -356,6 +356,9 @@ suite('Workbench - MCP - ServerConnection', () => {
 				info: (message: string) => {
 					loggedMessages.push(message);
 				},
+				debug: () => { },
+				trace: () => { },
+				warn: () => { },
 				error: () => { },
 				dispose: () => { }
 			} as Partial<ILogger> as ILogger,
