@@ -21,6 +21,17 @@ declare module 'vscode' {
 		 * External processes can connect to this URI to interact with this MCP server.
 		 */
 		readonly address: Uri;
+
+		/**
+		 * The gRPC endpoint of the same MCP server, when the gateway serves gRPC:
+		 * `grpc://127.0.0.1:<port>/<routeId>`. A gRPC client connects to the
+		 * authority with cleartext HTTP/2 and calls either the JSON-RPC tunnel
+		 * `mcp.zig.transport.v1.Mcp/Call` or the typed service
+		 * `model_context_protocol.Mcp`, sending the path without its leading
+		 * slash as the `mcp-gateway-route` metadata (it may be left out when the
+		 * gateway exposes a single server).
+		 */
+		readonly grpcAddress?: Uri;
 	}
 
 	/**

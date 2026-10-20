@@ -24,6 +24,8 @@ export interface IMcpGatewayListenStream {
 
 interface IListenEntry {
 	readonly requestId: JsonRpcId;
+	/** Who opened the stream (see the route's client key); a cancellation of another client does not reach it. */
+	readonly owner: string | undefined;
 	readonly filter: MCP.SubscriptionFilter;
 	readonly stream: IMcpGatewayListenStream;
 	readonly subscriptions: DisposableStore;
@@ -37,7 +39,8 @@ interface IListenEntry {
  * gets its acknowledgement first, then only the notification kinds the
  * server honoured, every one tagged with the stream's subscription id (the
  * JSON-RPC id of the listen request). The protocol is stateless, so two
- * clients may well use the same request id: entries are kept per stream.
+ * clients may well use the same request id: entries are kept per stream,
+ * each with the key of the client that opened it.
  */
 export class McpGatewayListenRegistry extends Disposable {
 	private readonly _entries = new Set<IListenEntry>();
@@ -80,12 +83,12 @@ export class McpGatewayListenRegistry extends Disposable {
 	 * `-32603` {@link McpGatewayRpcError} when {@link MAX_LISTEN_STREAMS}
 	 * streams are already open.
 	 */
-	register(requestId: JsonRpcId, requested: MCP.SubscriptionFilter, stream: IMcpGatewayListenStream): IDisposable {
+	register(requestId: JsonRpcId, requested: MCP.SubscriptionFilter, stream: IMcpGatewayListenStream, owner?: string): IDisposable {
 		if (this._entries.size >= MAX_LISTEN_STREAMS) {
 			throw new McpGatewayRpcError(MCP.INTERNAL_ERROR, `Too many open subscriptions/listen streams (limit ${MAX_LISTEN_STREAMS})`);
 		}
 		const filter = this._dispatcher.honoredFilter(requested);
-		const entry: IListenEntry = { requestId, filter, stream, subscriptions: new DisposableStore(), closed: false };
+		const entry: IListenEntry = { requestId, owner, filter, stream, subscriptions: new DisposableStore(), closed: false };
 		this._entries.add(entry);
 		stream.notify({ method: 'notifications/subscriptions/acknowledged', params: { _meta: { [META_SUBSCRIPTION_ID]: requestId }, notifications: filter } });
 		this._logger.debug(`[McpGateway][listen ${String(requestId)}] Opened with filter ${JSON.stringify(filter)} (open streams: ${this._entries.size})`);
@@ -96,9 +99,12 @@ export class McpGatewayListenRegistry extends Disposable {
 		return entry.registration;
 	}
 
-	/** Closes every stream opened with this request id gracefully; returns false when none is open. */
-	close(requestId: JsonRpcId): boolean {
-		const entries = this._find(requestId);
+	/**
+	 * Closes every stream opened with this request id gracefully, only those
+	 * of `owner` when it is given; returns false when none is open.
+	 */
+	close(requestId: JsonRpcId, owner?: string): boolean {
+		const entries = this._find(requestId).filter(entry => owner === undefined || entry.owner === owner);
 		for (const entry of entries) {
 			this._close(entry);
 		}

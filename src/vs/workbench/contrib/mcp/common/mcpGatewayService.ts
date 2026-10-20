@@ -16,6 +16,13 @@ export const IWorkbenchMcpGatewayService = createDecorator<IWorkbenchMcpGatewayS
 export interface IMcpGatewayResultServer {
 	readonly label: string;
 	readonly address: URI;
+	/**
+	 * The gRPC endpoint of the same server, when the gateway serves gRPC:
+	 * `grpc://127.0.0.1:<port>/<routeId>`. Clients connect to the authority
+	 * and send the route id (the path without its slash) as the
+	 * `mcp-gateway-route` metadata.
+	 */
+	readonly grpcAddress?: URI;
 }
 
 /**

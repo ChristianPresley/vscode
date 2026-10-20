@@ -117,6 +117,19 @@ suite('MCP - GatewayListenRegistry', () => {
 		assert.strictEqual(registry.size, 0);
 	});
 
+	test('close with an owner closes only that client\'s streams', () => {
+		const { registry } = setup();
+		const mine = new TestListenStream();
+		const theirs = new TestListenStream();
+		registry.register(1, { toolsListChanged: true }, mine, 'me');
+		registry.register(1, { toolsListChanged: true }, theirs, 'them');
+		assert.strictEqual(registry.close(1, 'nobody'), false);
+		assert.strictEqual(registry.close(1, 'them'), true);
+		assert.deepStrictEqual([mine.results.length, theirs.results.length], [0, 1]);
+		assert.strictEqual(registry.size, 1);
+		registry.closeAll();
+	});
+
 	test(`the stream after ${MAX_LISTEN_STREAMS} open ones is refused with -32603`, () => {
 		const { registry } = setup();
 		const streams: TestListenStream[] = [];

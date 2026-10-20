@@ -98,6 +98,14 @@ suite('MCP - GatewayConformanceInvoker', () => {
 		await assert.rejects(invoker.callTool('nope', {}), (e: unknown) => e instanceof McpGatewayRpcError && e.code === MCP.INVALID_PARAMS);
 	});
 
+	test('test_reconnection asks its transport to close the stream for polling, then completes', async () => {
+		const invoker = store.add(new McpGatewayConformanceInvoker());
+		let closed = 0;
+		assert.strictEqual(textOf(await invoker.callTool('test_reconnection', {}, invokeContext({ closeSseStream: () => closed++ }))), 'Reconnection test completed');
+		assert.strictEqual(closed, 1);
+		assert.strictEqual(textOf(await invoker.callTool('test_reconnection', {}, invokeContext())), 'Reconnection test completed', 'without a closable stream it just completes');
+	});
+
 	test('progress and log callbacks are driven through the invoke context', async () => {
 		const invoker = store.add(new McpGatewayConformanceInvoker());
 		const progress: number[] = [];

@@ -6,6 +6,7 @@ on:
       - 'src/vs/base/common/protobuf/**'
       - 'src/vs/base/common/grpc/**'
       - 'src/vs/base/node/grpcChannel.ts'
+      - 'src/vs/base/node/grpcServer.ts'
       - 'src/vs/platform/mcp/**'
       - 'test/mcp-grpc/**'
       - '.github/workflows/mcp-grpc-interop.yml'
@@ -76,4 +77,255 @@ jobs:
 
       # One brace pattern: the node test runner takes a single --runGlob (glob@5).
       - name: 🧪 Run protobuf, gRPC and MCP gRPC unit tests
-        run: npm run test-node -- --runGlob "{**/{protobuf,grpc}/**/*.test.js,**/grpcChannel.test.js,**/mcp/test/**/*Grpc*.test.js}"
+        run: npm run test-node -- --runGlob "{**/{protobuf,grpc}/**/*.test.js,**/{grpcChannel,grpcServer}.test.js,**/mcp/test/**/*Grpc*.test.js,**/api/test/node/extHostMcpGrpc.test.js}"
+
+      - name: 🧪 Run the VS Code gRPC client against the grpc-js fixture (tunnel and typed)
+        run: |
+          node test/mcp-grpc/src/fixtureServer.ts > fixture.log 2>&1 &
+          port=
+          for i in $(seq 1 100); do
+            port=$(sed -n 's/^READY:\([0-9][0-9]*\)$/\1/p' fixture.log)
+            [ -n "$port" ] && break
+            sleep 0.2
+          done
+          if [ -z "$port" ]; then cat fixture.log; exit 1; fi
+          MCP_GRPC_INTEROP_PORT=$port MCP_GRPC_INTEROP_TYPED=1 npm run test-node -- --run src/vs/workbench/api/test/node/extHostMcpGrpc.interop.test.ts
+
+  # The VS Code gRPC client against the zig-sdk conformance server (both
+  # bindings), built from a pinned tag. Not required for PR gating.
+  zig-interop:
+    name: zig-sdk interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout zig-sdk
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ChristianPresley/zig-sdk
+          ref: v0.5.2
+          path: .build/zig-sdk
+          persist-credentials: false
+
+      - name: Setup Zig
+        uses: ./.build/zig-sdk/.github/actions/setup-zig
+        with:
+          pin-file: .build/zig-sdk/.github/zig.json
+
+      - name: Build the zig-sdk conformance server
+        working-directory: .build/zig-sdk
+        run: |
+          zig version
+          zig build conformance-server -Doptimize=ReleaseSafe
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install build dependencies
+        working-directory: build
+        run: |
+          set -e
+
+          for i in {1..5}; do # try 5 times
+            npm ci && break
+            if [ $i -eq 5 ]; then
+              echo "Npm install failed too many times" >&2
+              exit 1
+            fi
+            echo "Npm install failed $i, trying again..."
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          set -e
+
+          for i in {1..5}; do # try 5 times
+            npm ci --ignore-scripts --no-workspaces && break
+            if [ $i -eq 5 ]; then
+              echo "Npm install failed too many times" >&2
+              exit 1
+            fi
+            echo "Npm install failed $i, trying again..."
+          done
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Transpile client
+        run: npm run transpile-client
+
+      - name: Start the zig-sdk conformance server
+        run: |
+          .build/zig-sdk/zig-out/bin/mcp-conformance-server --port 3000 --grpc-port 50051 --grpc-typed > server.log 2>&1 &
+          for i in $(seq 1 100); do
+            grep -q 'listening for gRPC' server.log && exit 0
+            sleep 0.2
+          done
+          cat server.log
+          exit 1
+
+      - name: 🧪 Run the VS Code gRPC client against the zig-sdk server (tunnel and typed)
+        run: npm run test-node -- --run src/vs/workbench/api/test/node/extHostMcpGrpc.interop.test.ts
+        env:
+          MCP_GRPC_INTEROP_PORT: 50051
+          MCP_GRPC_INTEROP_TYPED: 1
+
+      - name: Upload the server log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zig-sdk-server-log
+          path: server.log
+          if-no-files-found: ignore
+
+  # Foreign clients against VS Code's MCP gateway as a gRPC server: the test
+  # starts `mcpGatewayConformanceMain.js --grpc` and calls all eight typed RPCs
+  # and the tunnel from @grpc/grpc-js, then the tunnel from curl over HTTP/2
+  # with prior knowledge.
+  gateway-grpc-js-interop:
+    name: gateway gRPC listener (grpc-js, curl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install build dependencies
+        working-directory: build
+        run: |
+          set -e
+
+          for i in {1..5}; do # try 5 times
+            npm ci && break
+            if [ $i -eq 5 ]; then
+              echo "Npm install failed too many times" >&2
+              exit 1
+            fi
+            echo "Npm install failed $i, trying again..."
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          set -e
+
+          for i in {1..5}; do # try 5 times
+            npm ci --ignore-scripts --no-workspaces && break
+            if [ $i -eq 5 ]; then
+              echo "Npm install failed too many times" >&2
+              exit 1
+            fi
+            echo "Npm install failed $i, trying again..."
+          done
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Transpile client
+        run: npm run transpile-client
+
+      - name: Install MCP gRPC interop dependencies
+        run: npm ci --prefix test/mcp-grpc --no-audit --no-fund
+
+      - name: 🧪 Run grpc-js and curl against the gateway's gRPC listener
+        run: |
+          curl --version
+          node --test test/mcp-grpc/src/gatewayInterop.test.ts
+        env:
+          MCP_GATEWAY_GRPC_INTEROP: 1
+
+  # The zig-sdk example client (`grpc_client`: tunnel only, discovers, lists
+  # and calls `add`) against the gateway's default route, built from a pinned
+  # tag. Not required for PR gating.
+  gateway-zig-interop:
+    name: gateway gRPC listener (zig-sdk client)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout zig-sdk
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ChristianPresley/zig-sdk
+          ref: v0.5.2
+          path: .build/zig-sdk
+          persist-credentials: false
+
+      - name: Setup Zig
+        uses: ./.build/zig-sdk/.github/actions/setup-zig
+        with:
+          pin-file: .build/zig-sdk/.github/zig.json
+
+      - name: Build the zig-sdk example gRPC client
+        working-directory: .build/zig-sdk
+        run: |
+          zig version
+          zig build examples -Doptimize=ReleaseSafe
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install build dependencies
+        working-directory: build
+        run: |
+          set -e
+
+          for i in {1..5}; do # try 5 times
+            npm ci && break
+            if [ $i -eq 5 ]; then
+              echo "Npm install failed too many times" >&2
+              exit 1
+            fi
+            echo "Npm install failed $i, trying again..."
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          set -e
+
+          for i in {1..5}; do # try 5 times
+            npm ci --ignore-scripts --no-workspaces && break
+            if [ $i -eq 5 ]; then
+              echo "Npm install failed too many times" >&2
+              exit 1
+            fi
+            echo "Npm install failed $i, trying again..."
+          done
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Transpile client
+        run: npm run transpile-client
+
+      - name: Install MCP gRPC interop dependencies
+        run: npm ci --prefix test/mcp-grpc --no-audit --no-fund
+
+      - name: 🧪 Run the zig-sdk example client against the gateway's gRPC listener
+        run: node --test --test-name-pattern "zig-sdk" test/mcp-grpc/src/gatewayInterop.test.ts
+        env:
+          MCP_GATEWAY_GRPC_INTEROP: 1
+          MCP_ZIG_GRPC_CLIENT: ${{ github.workspace }}/.build/zig-sdk/zig-out/bin/grpc_client

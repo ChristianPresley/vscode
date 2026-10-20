@@ -14,7 +14,9 @@ import { applyModernEnvelope, GATEWAY_SERVER_INFO, hasClientCapability, honorSub
 import { LATEST_MCP_PROTOCOL_VERSION, McpProtocolEra } from '../common/mcpProtocolVersions.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
+import { McpTasks } from '../common/modelContextProtocolTasks.js';
 import { McpGatewaySealedState } from './mcpGatewaySealedState.js';
+import { clientDeclaresTasks, IMcpGatewayTaskInvokeContext, IMcpGatewayTaskOptions, IMcpGatewayTaskRunInput, isStartTaskResult, McpGatewayTaskStore, missingTasksExtensionError, taskOptionsOf, taskSupportOf, withoutTaskSupport } from './mcpGatewayTasks.js';
 
 /** The most input rounds the gateway runs for one request. */
 export const MAX_GATEWAY_INPUT_ROUNDS = 10;
@@ -59,6 +61,8 @@ export interface IMcpGatewayDispatchContext {
 	notify(notification: IMcpGatewayNotification): void;
 	/** Legacy sessions: sends a server→client request on the client's stream and resolves with its result. */
 	sendServerRequest?(request: IMcpGatewayNotification): Promise<unknown>;
+	/** 2025-11-25 sessions: closes the request's SSE stream for polling (see {@link IMcpGatewayInvokeContext.closeSseStream}). */
+	readonly closeSseStream?: () => void;
 	readonly chatSessionResource?: string;
 }
 
@@ -68,6 +72,12 @@ export interface IMcpGatewayDispatcherOptions {
 	readonly serverInfo?: MCP.Implementation;
 	readonly cacheHints?: IMcpGatewayCacheHints;
 	readonly instructions?: string;
+	/**
+	 * Serves the Tasks extension (`io.modelcontextprotocol/tasks`) on the
+	 * 2026-07-28 wire; defaults to the invoker's own task options (an
+	 * {@link IMcpGatewayTaskCapableInvoker}). Without either, no task is created.
+	 */
+	readonly tasks?: IMcpGatewayTaskOptions;
 }
 
 export type ModernRequestPreparation =
@@ -110,8 +120,10 @@ export function requiredCapabilitiesFor(capability: McpInputRequestCapability): 
  * progress and log forwarding, and the 2026-07-28 result envelope.
  */
 export class McpGatewayDispatcher extends Disposable {
-	private _toolSchemas: Map<string, unknown> | undefined;
+	private _tools: Map<string, MCPLegacy.Tool> | undefined;
 	private readonly _serverInfo: MCP.Implementation;
+	/** The tasks of this route; undefined when the route serves no Tasks extension. */
+	private readonly _tasks: McpGatewayTaskStore | undefined;
 
 	constructor(
 		private readonly _routeId: string,
@@ -122,7 +134,14 @@ export class McpGatewayDispatcher extends Disposable {
 	) {
 		super();
 		this._serverInfo = _options.serverInfo ?? GATEWAY_SERVER_INFO;
-		this._register(_invoker.onDidChangeTools(() => { this._toolSchemas = undefined; }));
+		this._register(_invoker.onDidChangeTools(() => { this._tools = undefined; }));
+		const taskOptions = _options.tasks ?? taskOptionsOf(_invoker);
+		this._tasks = taskOptions ? this._register(new McpGatewayTaskStore(taskOptions, _logger, `[McpGateway][route ${_routeId}]`)) : undefined;
+	}
+
+	/** The task store of the route (tests and diagnostics); undefined without the Tasks extension. */
+	get tasks(): McpGatewayTaskStore | undefined {
+		return this._tasks;
 	}
 
 	get serverInfo(): MCP.Implementation {
@@ -133,7 +152,16 @@ export class McpGatewayDispatcher extends Disposable {
 		return this._options.cacheHints ?? this._invoker.cacheHints ?? DEFAULT_CACHE_HINTS;
 	}
 
-	/** The capabilities the gateway advertises for this server, in the 2026-07-28 shape. */
+	/**
+	 * The capabilities the gateway advertises for this server, in the
+	 * 2026-07-28 shape. One rule for both eras (`server/discover` and the
+	 * legacy `initialize`): a capability is advertised exactly when the
+	 * gateway serves its methods ({@link supportsMethod}). Declared
+	 * capabilities (dispatcher options, then the invoker's) win; otherwise
+	 * they are derived from the invoker's methods. A declared capability
+	 * whose method the invoker lacks is served empty (no prompts, no
+	 * completion values) rather than refused.
+	 */
 	serverCapabilities(): MCP.ServerCapabilities {
 		const declared = this._options.capabilities ?? this._invoker.capabilities;
 		const caps: MCP.ServerCapabilities = {};
@@ -151,20 +179,45 @@ export class McpGatewayDispatcher extends Disposable {
 		if (declared?.logging ?? true) {
 			caps.logging = {};
 		}
+		if (this._tasks) {
+			// SEP-2663: under `extensions`, never the 2025-11-25 `capabilities.tasks` slot.
+			caps.extensions = { [McpTasks.EXTENSION_ID]: {} };
+		}
 		return caps;
 	}
 
-	/** The legacy `initialize` capabilities; completions/logging/subscribe are always announced so legacy SDK clients allow the calls. */
+	/**
+	 * The legacy `initialize` capabilities: the same ones as
+	 * {@link serverCapabilities}, in the 2025-11-25 shape. SDK clients that
+	 * enforce capabilities then allow exactly the calls the gateway serves
+	 * (`logging/setLevel` with `logging`, `resources/subscribe` with
+	 * `resources.subscribe`, `completion/complete` with `completions`). The
+	 * Tasks extension is a 2026-07-28 surface (its methods are not served to
+	 * legacy sessions), so it is not announced here.
+	 */
 	legacyInitializeCapabilities(): MCPLegacy.ServerCapabilities {
 		const caps = this.serverCapabilities();
-		return {
-			tools: { listChanged: true },
-			resources: { subscribe: true, listChanged: true },
-			prompts: { listChanged: true },
-			logging: {},
-			completions: {},
-			...(caps.extensions ? { extensions: caps.extensions as MCPLegacy.ServerCapabilities['extensions'] } : {}),
-		};
+		const legacy: MCPLegacy.ServerCapabilities = {};
+		if (caps.tools) {
+			legacy.tools = { listChanged: caps.tools.listChanged };
+		}
+		if (caps.resources) {
+			legacy.resources = { subscribe: caps.resources.subscribe, listChanged: caps.resources.listChanged };
+		}
+		if (caps.prompts) {
+			legacy.prompts = { listChanged: caps.prompts.listChanged };
+		}
+		if (caps.logging) {
+			legacy.logging = {};
+		}
+		if (caps.completions) {
+			legacy.completions = {};
+		}
+		const extensions = caps.extensions ? Object.entries(caps.extensions).filter(([id]) => id !== McpTasks.EXTENSION_ID) : [];
+		if (extensions.length > 0) {
+			legacy.extensions = Object.fromEntries(extensions) as MCPLegacy.ServerCapabilities['extensions'];
+		}
+		return legacy;
 	}
 
 	discoverResult(): MCP.DiscoverResult {
@@ -205,6 +258,11 @@ export class McpGatewayDispatcher extends Disposable {
 				return !!this.serverCapabilities().completions;
 			case 'ping':
 				return era === 'legacy';
+			case 'tasks/get':
+			case 'tasks/update':
+			case 'tasks/cancel':
+				// `tasks/list` and `tasks/result` were removed by SEP-2663: -32601 like any unknown method.
+				return era === 'modern' && !!this._tasks;
 			default:
 				return false;
 		}
@@ -257,8 +315,10 @@ export class McpGatewayDispatcher extends Disposable {
 			case 'tools/list': {
 				this._checkCursor(params);
 				const tools = await this._invoke(ctx, () => this._invoker.listTools());
-				this._toolSchemas = new Map(tools.map(t => [t.name, t.inputSchema]));
-				return { tools: [...tools] } satisfies MCPLegacy.ListToolsResult;
+				this._tools = new Map(tools.map(t => [t.name, t]));
+				// The gateway runs tasks on the 2026-07-28 wire only: legacy sessions see no task support.
+				const listed = ctx.era === 'legacy' && this._tasks ? tools.map(withoutTaskSupport) : tools;
+				return { tools: [...listed] } satisfies MCPLegacy.ListToolsResult;
 			}
 			case 'tools/call': {
 				if (typeof params.name !== 'string') {
@@ -269,11 +329,40 @@ export class McpGatewayDispatcher extends Disposable {
 				}
 				const name = params.name;
 				const args = isObject(params.arguments) ? params.arguments : {};
-				return this._withInputRounds(ctx, method, name, params, invokeCtx => this._invoker.callTool(name, args, invokeCtx));
+				const tasks = this._tasks;
+				const taskSupport = tasks && ctx.era === 'modern' ? taskSupportOf(await this._toolDefinition(name)) : undefined;
+				// Per request (SEP-2575): the extension in this request's `_meta.clientCapabilities` opts in.
+				const optedIn = !!taskSupport && clientDeclaresTasks(ctx.clientCapabilities);
+				if (taskSupport === 'required' && !optedIn) {
+					throw missingTasksExtensionError();
+				}
+				return this._withInputRounds(ctx, method, name, params, async (invokeCtx): Promise<MCPLegacy.CallToolResult | McpTasks.CreateTaskResult | IMcpGatewayInputRequired> => {
+					const result = await this._invoker.callTool(name, args, invokeCtx);
+					if (!isStartTaskResult(result)) {
+						return result;
+					}
+					if (tasks && optedIn) {
+						const base = invokeCtx;
+						return tasks.create(name, run => this._runTaskBody(name, args, base, run), { inputResponses: invokeCtx.inputResponses, requestState: invokeCtx.requestState });
+					}
+					// No task for this request: the body runs at once, inside the request.
+					const synthetic: IMcpGatewayTaskInvokeContext = { ...invokeCtx, task: { taskId: generateUuid(), synthetic: true } };
+					const body = await this._invoker.callTool(name, args, synthetic);
+					if (isStartTaskResult(body)) {
+						throw new McpGatewayRpcError(MCP.INTERNAL_ERROR, `The tool ${name} asked for a task inside its task`);
+					}
+					return body;
+				});
 			}
+			case 'tasks/get':
+			case 'tasks/update':
+			case 'tasks/cancel':
+				return this._dispatchTaskMethod(ctx, method, params);
 			case 'prompts/list': {
 				this._checkCursor(params);
-				const prompts = await this._invoke(ctx, () => this._invoker.listPrompts!());
+				const listPrompts = this._invoker.listPrompts;
+				// Prompts are advertised (declared) but the invoker cannot list them: there are none.
+				const prompts = listPrompts ? await this._invoke(ctx, () => listPrompts.call(this._invoker)) : [];
 				return { prompts: [...prompts] } satisfies MCPLegacy.ListPromptsResult;
 			}
 			case 'prompts/get': {
@@ -285,7 +374,11 @@ export class McpGatewayDispatcher extends Disposable {
 				}
 				const name = params.name;
 				const args = isObject(params.arguments) ? params.arguments as Record<string, string> : undefined;
-				return this._withInputRounds(ctx, method, name, params, invokeCtx => this._invoker.getPrompt!(name, args, invokeCtx));
+				const getPrompt = this._invoker.getPrompt;
+				if (!getPrompt) {
+					throw new McpGatewayRpcError(MCP.INVALID_PARAMS, `Unknown prompt: ${name}`);
+				}
+				return this._withInputRounds(ctx, method, name, params, invokeCtx => getPrompt.call(this._invoker, name, args, invokeCtx));
 			}
 			case 'resources/list': {
 				this._checkCursor(params);
@@ -309,7 +402,12 @@ export class McpGatewayDispatcher extends Disposable {
 					throw new McpGatewayRpcError(MCP.INVALID_PARAMS, 'Missing completion ref or argument');
 				}
 				const completeParams = params as unknown as MCPLegacy.CompleteRequest['params'];
-				return this._invoke(ctx, () => this._invoker.complete!(completeParams, this._invokeContext(ctx, method, undefined, undefined)));
+				const complete = this._invoker.complete;
+				if (!complete) {
+					// Completions are advertised (declared) but the invoker cannot complete: no suggestions.
+					return { completion: { values: [], total: 0, hasMore: false } } satisfies MCPLegacy.CompleteResult;
+				}
+				return this._invoke(ctx, () => complete.call(this._invoker, completeParams, this._invokeContext(ctx, method, undefined, undefined)));
 			}
 			default:
 				throw new McpGatewayRpcError(MCP.METHOD_NOT_FOUND, `Method not found: ${method}`);
@@ -324,16 +422,89 @@ export class McpGatewayDispatcher extends Disposable {
 	}
 
 	private async _toolInputSchema(name: string): Promise<unknown> {
-		if (!this._toolSchemas) {
+		return (await this._toolDefinition(name))?.inputSchema;
+	}
+
+	/** The listed definition of a tool (header annotations, task support); undefined when the tools cannot be listed. */
+	private async _toolDefinition(name: string): Promise<MCPLegacy.Tool | undefined> {
+		if (!this._tools) {
 			try {
 				const tools = await this._invoker.listTools();
-				this._toolSchemas = new Map(tools.map(t => [t.name, t.inputSchema]));
+				this._tools = new Map(tools.map(t => [t.name, t]));
 			} catch (e) {
 				this._logger.warn(`[McpGateway][route ${this._routeId}] Could not list tools to verify headers: ${e}`);
 				return undefined;
 			}
 		}
-		return this._toolSchemas.get(name);
+		return this._tools.get(name);
+	}
+
+	/** `tasks/get`, `tasks/update` and `tasks/cancel`: gated on the extension in this request's `_meta.clientCapabilities`. */
+	private _dispatchTaskMethod(ctx: IMcpGatewayDispatchContext, method: string, params: Record<string, unknown>): object {
+		const tasks = this._tasks;
+		if (!tasks) {
+			throw new McpGatewayRpcError(MCP.METHOD_NOT_FOUND, `Method not found: ${method}`);
+		}
+		if (!clientDeclaresTasks(ctx.clientCapabilities)) {
+			throw missingTasksExtensionError();
+		}
+		const taskId = params.taskId;
+		if (typeof taskId !== 'string') {
+			throw new McpGatewayRpcError(MCP.INVALID_PARAMS, 'Missing taskId');
+		}
+		switch (method) {
+			case 'tasks/get':
+				return tasks.get(taskId);
+			case 'tasks/update': {
+				const responsesError = validateInputResponses(params.inputResponses);
+				if (responsesError) {
+					throw responsesError;
+				}
+				tasks.update(taskId, (params.inputResponses ?? {}) as MCP.InputResponses);
+				return {};
+			}
+			default:
+				tasks.cancel(taskId);
+				return {};
+		}
+	}
+
+	/**
+	 * One run of a task body: the tool again, inside its task, with the answers
+	 * collected so far. Its progress and log messages have no stream to go to
+	 * (the request that created the task is over) and are dropped. An input
+	 * request the creating client cannot answer fails the task with `-32021`.
+	 */
+	private async _runTaskBody(name: string, args: Record<string, unknown>, base: IMcpGatewayInvokeContext, run: IMcpGatewayTaskRunInput): Promise<MCPLegacy.CallToolResult | IMcpGatewayInputRequired> {
+		const context: IMcpGatewayTaskInvokeContext = {
+			protocolVersion: base.protocolVersion,
+			clientCapabilities: base.clientCapabilities,
+			clientInfo: base.clientInfo,
+			logLevel: base.logLevel,
+			chatSessionResource: base.chatSessionResource,
+			inputResponses: run.inputResponses,
+			requestState: run.requestState,
+			token: run.token,
+			task: { taskId: run.taskId, synthetic: false },
+		};
+		const result = await this._invoker.callTool(name, args, context);
+		if (isGatewayInputRequired(result)) {
+			this._checkInputRequests(base.clientCapabilities, result.inputRequests ?? {});
+		}
+		return result;
+	}
+
+	/** Every input request must be one the client can answer: else `-32603` (unknown kind) or `-32021`. */
+	private _checkInputRequests(clientCapabilities: MCP.ClientCapabilities, inputRequests: MCP.InputRequests): void {
+		for (const [key, request] of Object.entries(inputRequests)) {
+			const capability = requiredCapabilityForInputRequest(request.method, request.params);
+			if (!capability) {
+				throw new McpGatewayRpcError(MCP.INTERNAL_ERROR, `Upstream asked for an unsupported input request (${request.method}) in "${key}"`);
+			}
+			if (!hasClientCapability(clientCapabilities, capability)) {
+				throw new McpGatewayRpcError(MCP.MISSING_REQUIRED_CLIENT_CAPABILITY, `This request needs the client capability "${capability}", which the client did not declare`, { requiredCapabilities: requiredCapabilitiesFor(capability), capability, inputRequest: key });
+			}
+		}
 	}
 
 	private _invokeContext(ctx: IMcpGatewayDispatchContext, _method: string, inputResponses: MCP.InputResponses | undefined, requestState: string | undefined): IMcpGatewayInvokeContext {
@@ -369,6 +540,7 @@ export class McpGatewayDispatcher extends Disposable {
 				}
 				ctx.notify({ method: 'notifications/message', params });
 			},
+			closeSseStream: ctx.closeSseStream,
 			token: ctx.token,
 			chatSessionResource: ctx.chatSessionResource,
 		};
@@ -430,15 +602,7 @@ export class McpGatewayDispatcher extends Disposable {
 				return result;
 			}
 			const inputRequests = result.inputRequests ?? {};
-			for (const [key, request] of Object.entries(inputRequests)) {
-				const capability = requiredCapabilityForInputRequest(request.method, request.params);
-				if (!capability) {
-					throw new McpGatewayRpcError(MCP.INTERNAL_ERROR, `Upstream asked for an unsupported input request (${request.method}) in "${key}"`);
-				}
-				if (!hasClientCapability(ctx.clientCapabilities, capability)) {
-					throw new McpGatewayRpcError(MCP.MISSING_REQUIRED_CLIENT_CAPABILITY, `This request needs the client capability "${capability}", which the client did not declare`, { requiredCapabilities: requiredCapabilitiesFor(capability), capability, inputRequest: key });
-				}
-			}
+			this._checkInputRequests(ctx.clientCapabilities, inputRequests);
 
 			if (ctx.era === 'modern') {
 				const out: MCP.InputRequiredResult = { resultType: 'input_required' };

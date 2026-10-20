@@ -12,6 +12,7 @@ import { McpGatewayRpcError } from '../common/mcpGatewayProtocol.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
 import { McpGatewayResourceNotFoundError } from './mcpGatewayDispatcher.js';
+import { IMcpGatewayTaskCapableInvoker, IMcpGatewayTaskOptions, McpGatewayTaskSupport, startTaskResult, taskRunOf } from './mcpGatewayTasks.js';
 
 /**
  * The "everything server" of the official MCP conformance suite, as a
@@ -35,6 +36,9 @@ export const CONFORMANCE_CAPABILITIES: IMcpGatewayServerCapabilities = {
 };
 
 export const CONFORMANCE_CACHE_HINTS: IMcpGatewayCacheHints = { ttlMs: 60_000, cacheScope: 'public' };
+
+/** The fixture serves the Tasks extension (SEP-2663) with these settings. */
+export const CONFORMANCE_TASK_OPTIONS: IMcpGatewayTaskOptions = { ttlMs: 600_000, pollIntervalMs: 1000 };
 
 /** A 1x1 PNG. */
 const PNG_1X1 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
@@ -98,6 +102,17 @@ const TOOL = {
 	irCapabilities: 'test_input_required_result_capabilities',
 	jsonSchema2020: 'json_schema_2020_12_tool',
 	xMcpHeader: 'test_x_mcp_header',
+	reconnection: 'test_reconnection',
+	// The Tasks extension scenarios (SEP-2663).
+	greet: 'greet',
+	slowCompute: 'slow_compute',
+	failingJob: 'failing_job',
+	protocolErrorJob: 'protocol_error_job',
+	confirmDelete: 'confirm_delete',
+	multiInput: 'multi_input',
+	toolWithTask: 'test_tool_with_task',
+	// The gRPC interop fixture: the zig-sdk example client (`grpc_client`) calls `add(40, 2)`.
+	add: 'add',
 } as const;
 
 const PROMPT = {
@@ -214,6 +229,9 @@ function hasCapability(ctx: IMcpGatewayInvokeContext | undefined, key: 'elicitat
 	return ctx?.clientCapabilities?.[key] !== undefined;
 }
 
+/** How long `test_reconnection` works after closing its stream (the client reconnects meanwhile). */
+export const RECONNECTION_DELAY_MS = 100;
+
 async function delay(ms: number, token: CancellationToken | undefined): Promise<void> {
 	await timeout(ms, token ?? CancellationToken.None);
 }
@@ -223,7 +241,7 @@ async function delay(ms: number, token: CancellationToken | undefined): Promise<
  * prompt fire the list-changed events; {@link touchResource} fires a
  * resource update for subscribers.
  */
-export class McpGatewayConformanceInvoker extends Disposable implements IMcpGatewaySingleServerInvoker {
+export class McpGatewayConformanceInvoker extends Disposable implements IMcpGatewaySingleServerInvoker, IMcpGatewayTaskCapableInvoker {
 	private readonly _onDidChangeTools = this._register(new Emitter<void>());
 	readonly onDidChangeTools: Event<void> = this._onDidChangeTools.event;
 	private readonly _onDidChangeResources = this._register(new Emitter<void>());
@@ -236,6 +254,7 @@ export class McpGatewayConformanceInvoker extends Disposable implements IMcpGate
 	readonly capabilities = CONFORMANCE_CAPABILITIES;
 	readonly instructions = CONFORMANCE_INSTRUCTIONS;
 	readonly cacheHints = CONFORMANCE_CACHE_HINTS;
+	readonly tasks = CONFORMANCE_TASK_OPTIONS;
 
 	private readonly _tools = new Map<string, IToolEntry>();
 	private readonly _hiddenTools = new Set<string>([TOOL.hiddenTool]);
@@ -307,8 +326,12 @@ export class McpGatewayConformanceInvoker extends Disposable implements IMcpGate
 		return entry.handler(args, context);
 	}
 
-	private _addTool(name: string, description: string, handler: ToolHandler, inputSchema: MCPLegacy.Tool['inputSchema'] = EMPTY_SCHEMA): void {
-		this._tools.set(name, { tool: { name, description, inputSchema }, handler });
+	private _addTool(name: string, description: string, handler: ToolHandler, inputSchema: MCPLegacy.Tool['inputSchema'] = EMPTY_SCHEMA, taskSupport?: McpGatewayTaskSupport): void {
+		const tool: MCPLegacy.Tool = { name, description, inputSchema };
+		if (taskSupport) {
+			tool.execution = { taskSupport };
+		}
+		this._tools.set(name, { tool, handler });
 	}
 
 	private _registerTools(): void {
@@ -427,6 +450,13 @@ export class McpGatewayConformanceInvoker extends Disposable implements IMcpGate
 			return text('Prompt list changed');
 		});
 		this._addTool(TOOL.hiddenTool, 'Appears after test_trigger_tool_change', async () => text('hidden'));
+		this._addTool(TOOL.reconnection, 'Closes the SSE stream mid-call so the client reconnects (SEP-1699 polling)', async (_args, ctx) => {
+			// 2025-11-25 sessions: the response stream ends here; the result below is
+			// replayed when the client reconnects with Last-Event-ID. Elsewhere a no-op.
+			ctx?.closeSseStream?.();
+			await delay(RECONNECTION_DELAY_MS, ctx?.token);
+			return text('Reconnection test completed');
+		});
 
 		// ---- 2026-07-28 multi round-trip requests (SEP-2322) ----
 		this._addTool(TOOL.irElicitation, 'MRTR: asks for a name through elicitation', async (_args, ctx) => {
@@ -537,6 +567,105 @@ export class McpGatewayConformanceInvoker extends Disposable implements IMcpGate
 			},
 			required: ['region'],
 		});
+
+		// ---- gRPC interop (the zig-sdk `grpc_server` example's tool) ----
+		this._addTool(TOOL.add, 'Add two integers.', async (args, ctx) => {
+			if (typeof args.a !== 'number' || typeof args.b !== 'number' || !Number.isInteger(args.a) || !Number.isInteger(args.b)) {
+				throw new McpGatewayRpcError(MCP.INVALID_PARAMS, 'add needs the integers a and b');
+			}
+			ctx?.onProgress?.({ progress: 1, total: 2, message: 'adding' });
+			return text(String(args.a + args.b));
+		}, { type: 'object', properties: { a: { type: 'integer' }, b: { type: 'integer' } }, required: ['a', 'b'] });
+
+		this._registerTaskTools();
+	}
+
+	/**
+	 * The fixtures of the Tasks extension scenarios (SEP-2663), as in the zig
+	 * SDK's everything server. A task tool returns {@link startTaskResult}
+	 * outside a task; the gateway then runs it again inside the task (or, for
+	 * a client that did not opt in, at once) with {@link taskRunOf} set.
+	 */
+	private _registerTaskTools(): void {
+		this._addTool(TOOL.greet, 'Greets by name (never a task)', async args => text(`Hello, ${typeof args.name === 'string' ? args.name : 'world'}!`), {
+			type: 'object',
+			properties: { name: { type: 'string', description: 'Who to greet' } },
+		});
+		this._addTool(TOOL.slowCompute, 'Sleeps for some seconds inside a task (0 seconds: answers at once)', async (args, ctx) => {
+			const seconds = typeof args.seconds === 'number' && Number.isFinite(args.seconds) ? Math.max(0, args.seconds) : 0;
+			const label = typeof args.label === 'string' ? args.label : 'job';
+			if (!taskRunOf(ctx)) {
+				// The immediate-result shortcut: nothing to wait for, no task.
+				return seconds === 0 ? text(`computed ${label} after 0 s`) : startTaskResult();
+			}
+			// Cancellation (tasks/cancel) ends the sleep, and the task settles as cancelled.
+			await delay(seconds * 1000, ctx?.token);
+			return text(`computed ${label} after ${seconds} s`);
+		}, {
+			type: 'object',
+			properties: {
+				seconds: { type: 'number', description: 'How long to work' },
+				label: { type: 'string', description: 'A label for the result' },
+			},
+		}, 'optional');
+		this._addTool(TOOL.failingJob, 'A task that ends in a tool error', async (_args, ctx) => {
+			if (!taskRunOf(ctx)) {
+				return startTaskResult();
+			}
+			await delay(1000, ctx?.token);
+			return { isError: true, content: [{ type: 'text', text: 'The job failed as designed' }] };
+		}, EMPTY_SCHEMA, 'required');
+		this._addTool(TOOL.protocolErrorJob, 'A task that ends in a protocol error', async (_args, ctx) => {
+			if (!taskRunOf(ctx)) {
+				return startTaskResult();
+			}
+			throw new McpGatewayRpcError(MCP.INTERNAL_ERROR, 'The job hit an internal error as designed');
+		}, EMPTY_SCHEMA, 'optional');
+		this._addTool(TOOL.confirmDelete, 'A task that asks for confirmation', async (args, ctx) => {
+			if (!taskRunOf(ctx)) {
+				return startTaskResult();
+			}
+			const filename = typeof args.filename === 'string' ? args.filename : 'file.txt';
+			const answer = elicitResponse(ctx, 'confirm');
+			if (answer) {
+				return text(answer.action === 'accept' ? `Deleted ${filename}` : `Kept ${filename}`);
+			}
+			return inputRequired({ confirm: elicitForm(`Delete ${filename}?`, { type: 'object', properties: { confirm: { type: 'boolean', description: 'Confirm the deletion' } } }) });
+		}, {
+			type: 'object',
+			properties: { filename: { type: 'string', description: 'The file to delete' } },
+		}, 'optional');
+		this._addTool(TOOL.multiInput, 'A task that asks two questions at once', async (_args, ctx) => {
+			if (!taskRunOf(ctx)) {
+				return startTaskResult();
+			}
+			const first = elicitResponse(ctx, 'first');
+			const second = elicitResponse(ctx, 'second');
+			if (first && second) {
+				const nameOf = (answer: { readonly content?: Record<string, unknown> }) => typeof answer.content?.name === 'string' ? answer.content.name : 'unknown';
+				return text(`${nameOf(first)} and ${nameOf(second)}`);
+			}
+			const requests: MCP.InputRequests = {};
+			if (!first) {
+				requests.first = elicitForm('First name?', stringSchema('name'));
+			}
+			if (!second) {
+				requests.second = elicitForm('Second name?', stringSchema('name'));
+			}
+			return inputRequired(requests);
+		}, EMPTY_SCHEMA, 'optional');
+		this._addTool(TOOL.toolWithTask, 'Asks for a name (MRTR), then finishes in a task', async (_args, ctx) => {
+			const answer = elicitResponse(ctx, 'user_name');
+			if (!answer) {
+				// Round one is an ordinary input_required result: no task yet.
+				return inputRequired({ user_name: elicitForm('What is your name?', stringSchema('name')) });
+			}
+			if (!taskRunOf(ctx)) {
+				return startTaskResult();
+			}
+			const name = typeof answer.content?.name === 'string' ? answer.content.name : 'unknown';
+			return text(`Hello, ${name}! The task is done.`);
+		}, EMPTY_SCHEMA, 'required');
 	}
 
 	// ---- resources --------------------------------------------------------------

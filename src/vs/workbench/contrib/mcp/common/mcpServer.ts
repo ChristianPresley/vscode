@@ -1559,8 +1559,13 @@ export class McpTool implements IMcpTool {
 			}
 
 			const taskHint = this._definition.execution?.taskSupport;
-			const serverSupportsTasksForTools = h.legacyCapabilities?.tasks?.requests?.tools?.call !== undefined;
-			const shouldUseTask = serverSupportsTasksForTools && (taskHint === 'required' || taskHint === 'optional');
+			// 2025-11-25: the client asks for a task (`task` param) where the server and the tool allow it.
+			// 2026-07-28 (Tasks extension, SEP-2663): the server decides; the client opts in per request
+			// unless the tool forbids tasks (the 2026-07-28 tool schema has no `execution`, so most
+			// servers do not publish `taskSupport` and their task tools would otherwise get -32021).
+			const shouldUseTask = h.era === 'modern'
+				? h.supportsModernTasks && taskHint !== 'forbidden'
+				: h.legacyCapabilities?.tasks?.requests?.tools?.call !== undefined && (taskHint === 'required' || taskHint === 'optional');
 
 			try {
 				const result = await h.callTool({

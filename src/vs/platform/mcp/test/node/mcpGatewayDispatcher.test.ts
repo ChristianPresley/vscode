@@ -129,6 +129,8 @@ suite('MCP - GatewayDispatcher', () => {
 			prompts: { listChanged: true },
 			completions: {},
 			logging: {},
+			// The fixture serves the Tasks extension (see mcpGatewayTasks.test.ts); the legacy initialize below does not announce it.
+			extensions: { 'io.modelcontextprotocol/tasks': {} },
 		});
 		assert.strictEqual(result.instructions, CONFORMANCE_INSTRUCTIONS);
 		assert.strictEqual(result.ttlMs, CONFORMANCE_CACHE_HINTS.ttlMs);
@@ -150,6 +152,47 @@ suite('MCP - GatewayDispatcher', () => {
 				await assertRpcError(dispatcher.dispatch(context(era).ctx, method, { cursor: '' }), MCP.INVALID_PARAMS, error => assert.deepStrictEqual(error.data, { cursor: '' }));
 			}
 		}
+	});
+
+	test('one capability rule for both eras: the legacy initialize advertises what server/discover does, and the methods follow', async () => {
+		const minimal = createDispatcher(minimalInvoker(), {});
+		assert.deepStrictEqual(minimal.legacyInitializeCapabilities(), { tools: { listChanged: true }, resources: { subscribe: false, listChanged: true }, logging: {} });
+		for (const method of ['prompts/list', 'prompts/get', 'completion/complete']) {
+			assert.strictEqual(minimal.supportsMethod(method, 'legacy'), false, method);
+			await assertRpcError(minimal.dispatch(context('legacy').ctx, method, { name: 'x', ref: {}, argument: {} }), MCP.METHOD_NOT_FOUND);
+		}
+		const withMethods = createDispatcher(minimalInvoker({
+			listPrompts: async () => [{ name: 'p' }],
+			complete: async () => ({ completion: { values: ['a'] } }),
+			subscribeResource: async () => ({ dispose: () => { } }),
+		}), {});
+		assert.deepStrictEqual(withMethods.legacyInitializeCapabilities(), { tools: { listChanged: true }, resources: { subscribe: true, listChanged: true }, prompts: { listChanged: true }, logging: {}, completions: {} });
+		assert.deepStrictEqual(await withMethods.dispatch(context('legacy').ctx, 'prompts/list', {}), { prompts: [{ name: 'p' }] });
+		const quiet = createDispatcher(minimalInvoker(), { capabilities: { tools: { listChanged: false }, logging: false } });
+		assert.deepStrictEqual(quiet.legacyInitializeCapabilities(), { tools: { listChanged: false }, resources: { subscribe: false, listChanged: true } });
+	});
+
+	test('a declared capability whose method the invoker lacks is served empty, not refused', async () => {
+		const dispatcher = createDispatcher(minimalInvoker({ capabilities: { prompts: { listChanged: false }, completions: true } }), {});
+		assert.deepStrictEqual(dispatcher.legacyInitializeCapabilities().prompts, { listChanged: false });
+		for (const era of ['modern', 'legacy'] as const) {
+			const prompts = await dispatcher.dispatch(context(era).ctx, 'prompts/list', {}) as MCPLegacy.ListPromptsResult;
+			assert.deepStrictEqual(prompts.prompts, [], era);
+			const completion = await dispatcher.dispatch(context(era).ctx, 'completion/complete', { ref: { type: 'ref/prompt', name: 'p' }, argument: { name: 'a', value: '' } }) as MCPLegacy.CompleteResult;
+			assert.deepStrictEqual(completion.completion, { values: [], total: 0, hasMore: false }, era);
+			await assertRpcError(dispatcher.dispatch(context(era).ctx, 'prompts/get', { name: 'p' }), MCP.INVALID_PARAMS);
+		}
+	});
+
+	test('the polling hook of a legacy request reaches the invoker', async () => {
+		let hook: (() => void) | undefined;
+		const dispatcher = createDispatcher(minimalInvoker({ callTool: async (_name, _args, invokeCtx) => { hook = invokeCtx?.closeSseStream; return { content: [] }; } }), {});
+		let closed = 0;
+		await dispatcher.dispatch(context('legacy', { closeSseStream: () => closed++ }).ctx, 'tools/call', { name: 'echo', arguments: {} });
+		hook?.();
+		assert.strictEqual(closed, 1);
+		await dispatcher.dispatch(context('modern').ctx, 'tools/call', { name: 'echo', arguments: {} });
+		assert.strictEqual(hook, undefined, 'no hook without a closable stream');
 	});
 
 	test('capability gating: prompts and completion are -32601 when the upstream has neither', async () => {

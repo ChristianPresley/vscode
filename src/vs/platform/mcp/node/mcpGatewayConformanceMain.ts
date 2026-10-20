@@ -5,8 +5,10 @@
 
 // The MCP gateway as the official conformance suite's server under test: one
 // gateway route bound to the conformance fixture invoker, on a random port.
-// Start with: node out/vs/platform/mcp/node/mcpGatewayConformanceMain.js [--url-file <path>] [--log <path>] [--quiet]
-// Prints `READY:<url>` on stdout (and nothing else) once it listens.
+// Start with: node out/vs/platform/mcp/node/mcpGatewayConformanceMain.js [--url-file <path>] [--log <path>] [--quiet] [--grpc]
+// Prints `READY:<url>` on stdout (and nothing else) once it listens. With
+// `--grpc` the route is also served on the gateway's gRPC listener (both
+// bindings) and a second line `GRPC:<port>` follows `READY:<url>`.
 
 import { fileURLToPath } from 'url';
 
@@ -49,15 +51,21 @@ class ConformanceLoggerService extends AbstractLoggerService {
 	}
 }
 
+/** Serves the route over gRPC too (the gRPC interop checks); not part of the conformance suite's command line. */
+const GRPC_FLAG = '--grpc';
+
 async function main(): Promise<void> {
-	const parsed = parseConformanceMainArgs(process.argv.slice(2));
+	const argv = process.argv.slice(2);
+	const grpc = argv.includes(GRPC_FLAG);
+	const usage = `${CONFORMANCE_MAIN_USAGE} [${GRPC_FLAG}]`;
+	const parsed = parseConformanceMainArgs(argv.filter(arg => arg !== GRPC_FLAG));
 	if (!parsed.ok) {
-		process.stderr.write(`${parsed.error}\n${CONFORMANCE_MAIN_USAGE}\n`);
+		process.stderr.write(`${parsed.error}\n${usage}\n`);
 		process.exit(2);
 	}
 	const options = parsed.options;
 	if (options.help) {
-		process.stderr.write(`${CONFORMANCE_MAIN_USAGE}\n`);
+		process.stderr.write(`${usage}\n`);
 		process.exit(0);
 	}
 	const diagnostic = (message: string) => {
@@ -70,7 +78,7 @@ async function main(): Promise<void> {
 	const logStream = fs.createWriteStream(logFile, { flags: 'a' });
 	logStream.on('error', error => diagnostic(`Cannot write the log file ${logFile}: ${error.message}`));
 	const loggerService = new ConformanceLoggerService(logStream, LogLevel.Trace);
-	const service = new McpGatewayService(loggerService);
+	const service = new McpGatewayService(loggerService, { grpc });
 	const invoker = new McpGatewayConformanceInvoker();
 	const route = await service.createRoute('conformance', invoker, { serverInfo: CONFORMANCE_SERVER_INFO });
 	const url = route.address.toString(true);
@@ -80,6 +88,15 @@ async function main(): Promise<void> {
 	}
 	diagnostic(`Listening on ${url} (log: ${logFile})`);
 	process.stdout.write(`READY:${url}\n`);
+	if (grpc) {
+		const grpcPort = service.grpcPort;
+		if (grpcPort === undefined) {
+			process.stderr.write('[McpGatewayConformance] The gRPC listener did not start (see the log)\n');
+			process.exit(1);
+		}
+		diagnostic(`gRPC on ${route.grpcAddress?.toString(true)}`);
+		process.stdout.write(`GRPC:${grpcPort}\n`);
+	}
 
 	let shuttingDown = false;
 	const shutdown = (reason: string) => {

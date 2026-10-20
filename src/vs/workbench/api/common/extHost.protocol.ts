@@ -3721,7 +3721,15 @@ export interface ExtHostMcpShape {
 	$cancelRequest(id: number, requestId: JsonRpcId): void;
 	$waitForInitialCollectionProviders(): Promise<void>;
 	$onDidChangeMcpServerDefinitions(servers: McpServerDefinition.Serialized[]): void;
-	$onDidChangeGatewayServers(gatewayId: string, servers: { label: string; address: UriComponents }[]): void;
+	$onDidChangeGatewayServers(gatewayId: string, servers: IMcpGatewayServerDto[]): void;
+}
+
+/** One server of an MCP gateway: its HTTP endpoint and, when the gateway serves gRPC, its gRPC endpoint. */
+export interface IMcpGatewayServerDto {
+	label: string;
+	address: UriComponents;
+	/** `grpc://127.0.0.1:<port>/<routeId>`; calls send the route id as the `mcp-gateway-route` metadata. */
+	grpcAddress?: UriComponents;
 }
 
 export interface IMcpAuthenticationDetails {
@@ -3774,7 +3782,7 @@ export interface MainThreadMcpShape {
 	$getTokenFromServerMetadata(id: number, authDetails: IMcpAuthenticationDetails, options?: IMcpAuthenticationOptions): Promise<string | undefined>;
 	$getTokenForProviderId(id: number, providerId: string, scopes: string[], options?: IMcpAuthenticationOptions): Promise<string | undefined>;
 	$logMcpAuthSetup(data: IAuthMetadataSource): void;
-	$startMcpGateway(chatSessionResource?: UriComponents): Promise<{ servers: { label: string; address: UriComponents }[]; gatewayId: string } | undefined>;
+	$startMcpGateway(chatSessionResource?: UriComponents): Promise<{ servers: IMcpGatewayServerDto[]; gatewayId: string } | undefined>;
 	$disposeMcpGateway(gatewayId: string): void;
 }
 

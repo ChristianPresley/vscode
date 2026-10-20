@@ -6,7 +6,7 @@
 import assert from 'assert';
 import { IJsonRpcRequest } from '../../../../base/common/jsonRpcProtocol.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { applyModernEnvelope, classifyEra, errorResponse, GATEWAY_SERVER_INFO, hasClientCapability, honorSubscriptionFilter, httpStatusForRpcError, isAllowedOrigin, isCacheableMethod, isInputRequiredResult, isLoopbackHost, McpGatewayRpcError, requiredCapabilityForInputRequest, validateInputResponses, validateModernRequestMeta, validateStandardHeaders } from '../../common/mcpGatewayProtocol.js';
+import { applyModernEnvelope, classifyEra, clientInfoFromMeta, errorResponse, GATEWAY_SERVER_INFO, hasClientCapability, honorSubscriptionFilter, httpStatusForRpcError, isAllowedOrigin, isCacheableMethod, isInputRequiredResult, isLoopbackHost, LEGACY_TRANSPORT_ERROR, legacyVersionSupportsPriming, McpGatewayRpcError, requiredCapabilityForInputRequest, validateInputResponses, validateLegacyProtocolVersionHeader, validateModernRequestMeta, validateStandardHeaders, validateSubscriptionFilter } from '../../common/mcpGatewayProtocol.js';
 import { META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_LOG_LEVEL, META_PROTOCOL_VERSION, META_SERVER_INFO } from '../../common/mcpProtocolVersions.js';
 import { MCP } from '../../common/modelContextProtocol.js';
 
@@ -134,6 +134,46 @@ suite('MCP - GatewayProtocol', () => {
 		assert.strictEqual(hasClientCapability({ sampling: {} }, 'sampling'), true);
 		assert.strictEqual(hasClientCapability({}, 'roots'), false);
 		assert.strictEqual(hasClientCapability(undefined, 'roots'), false);
+	});
+
+	test('validateSubscriptionFilter: booleans for the list flags, an array of strings for resourceSubscriptions', () => {
+		for (const ok of [{}, { toolsListChanged: true }, { toolsListChanged: false, promptsListChanged: true, resourcesListChanged: true }, { resourceSubscriptions: [] }, { resourceSubscriptions: ['a://b'] }, { unknownKey: 'ignored' }]) {
+			assert.strictEqual(validateSubscriptionFilter(ok), undefined, JSON.stringify(ok));
+		}
+		for (const bad of [undefined, null, 'all', [], ['toolsListChanged'], { toolsListChanged: 'yes' }, { promptsListChanged: 1 }, { resourcesListChanged: null }, { resourceSubscriptions: 'x' }, { resourceSubscriptions: [1] }, { resourceSubscriptions: ['a', null] }]) {
+			const error = validateSubscriptionFilter(bad);
+			assert.ok(error instanceof McpGatewayRpcError, JSON.stringify(bad));
+			assert.strictEqual(error.code, MCP.INVALID_PARAMS);
+		}
+	});
+
+	test('honorSubscriptionFilter is defensive about malformed filters', () => {
+		const caps: MCP.ServerCapabilities = { tools: { listChanged: true }, prompts: { listChanged: true }, resources: { subscribe: true, listChanged: true } };
+		assert.deepStrictEqual(honorSubscriptionFilter({ resourceSubscriptions: 'x' } as unknown as MCP.SubscriptionFilter, caps), {});
+		assert.deepStrictEqual(honorSubscriptionFilter({ resourceSubscriptions: ['a://b', 1, null] } as unknown as MCP.SubscriptionFilter, caps), { resourceSubscriptions: ['a://b'] });
+		assert.deepStrictEqual(honorSubscriptionFilter({ toolsListChanged: 'yes', promptsListChanged: 1 } as unknown as MCP.SubscriptionFilter, caps), {});
+		assert.deepStrictEqual(honorSubscriptionFilter(null as unknown as MCP.SubscriptionFilter, caps), {});
+	});
+
+	test('validateLegacyProtocolVersionHeader: absent or a legacy revision passes, anything else is -32000', () => {
+		assert.strictEqual(validateLegacyProtocolVersionHeader({}), undefined);
+		for (const version of ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', ' 2025-11-25 ']) {
+			assert.strictEqual(validateLegacyProtocolVersionHeader({ 'mcp-protocol-version': version }), undefined, version);
+		}
+		for (const version of ['', 'garbage', '2099-01-01', '2026-07-28']) {
+			assert.strictEqual(validateLegacyProtocolVersionHeader({ 'mcp-protocol-version': version })?.code, LEGACY_TRANSPORT_ERROR, version);
+		}
+	});
+
+	test('legacyVersionSupportsPriming: only from 2025-11-25 on', () => {
+		assert.deepStrictEqual(['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07', '2026-07-28', '9999-99-99', undefined].map(legacyVersionSupportsPriming), [true, false, false, false, false, false, false, false]);
+	});
+
+	test('clientInfoFromMeta reads a well-formed _meta client info', () => {
+		assert.deepStrictEqual(clientInfoFromMeta({ params: { _meta: { [META_CLIENT_INFO]: { name: 'c', version: '1' } } } }), { name: 'c', version: '1' });
+		for (const body of [undefined, {}, { params: {} }, { params: { _meta: { [META_CLIENT_INFO]: { name: 'c' } } } }, { params: { _meta: { [META_CLIENT_INFO]: 'c' } } }]) {
+			assert.strictEqual(clientInfoFromMeta(body), undefined, JSON.stringify(body));
+		}
 	});
 
 	test('honorSubscriptionFilter keeps only what the server can produce', () => {

@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { DeferredPromise } from '../../../base/common/async.js';
+import { DeferredPromise, RunOnceScheduler } from '../../../base/common/async.js';
 import { CancellationToken, CancellationTokenSource } from '../../../base/common/cancellation.js';
 import { CancellationError } from '../../../base/common/errors.js';
 import { Event } from '../../../base/common/event.js';
@@ -11,11 +11,15 @@ import { IJsonRpcErrorResponse, IJsonRpcNotification, IJsonRpcRequest, IJsonRpcS
 import { Disposable, DisposableMap, IDisposable } from '../../../base/common/lifecycle.js';
 import { ILogger } from '../../log/common/log.js';
 import { IMcpGatewaySingleServerInvoker } from '../common/mcpGateway.js';
-import { McpGatewayRpcError } from '../common/mcpGatewayProtocol.js';
+import { legacyVersionSupportsPriming, McpGatewayRpcError } from '../common/mcpGatewayProtocol.js';
 import { LEGACY_MCP_PROTOCOL_VERSIONS, META_PROGRESS_TOKEN } from '../common/mcpProtocolVersions.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
 import { IMcpGatewayDispatchContext, IMcpGatewayNotification, McpGatewayDispatcher } from './mcpGatewayDispatcher.js';
+import { McpGatewayEventLog, McpGatewayStreamKind } from './mcpGatewayEventLog.js';
+
+/** A legacy session with no message in flight and no open stream for this long is disposed. */
+export const LEGACY_SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
 /** Where the messages produced while serving a request go: the client's response stream. */
 export interface IMcpGatewayMessageSink {
@@ -25,6 +29,13 @@ export interface IMcpGatewayMessageSink {
 	 * client's result; rejects when `token` (the originating request's) cancels.
 	 */
 	sendRequest(request: IMcpGatewayNotification, token?: CancellationToken): Promise<unknown>;
+	/**
+	 * Legacy sessions at 2025-11-25 (SEP-1699 polling): ends the HTTP response
+	 * now, with a `retry` hint, but not the stream: what the request produces
+	 * afterwards is logged for the client's `Last-Event-ID` reconnection.
+	 * Returns whether the response was closed.
+	 */
+	closeForPolling?(): boolean;
 }
 
 /** An open server→client SSE stream of a legacy session (opened with HTTP GET). */
@@ -44,6 +55,24 @@ export interface IMcpGatewayPendingRequest {
 /** Hands out ids and results for the server→client requests a legacy session has in flight. */
 export interface IMcpGatewayRequestBroker {
 	createRequest(token?: CancellationToken): IMcpGatewayPendingRequest;
+}
+
+/** What an HTTP response needs to carry an SSE stream of a legacy session. */
+export interface IMcpGatewayLegacyStreamOptions {
+	readonly broker: IMcpGatewayRequestBroker;
+	/** The session's streams and replay log: every event of the response goes through it. */
+	readonly log: McpGatewayEventLog;
+	/** What the response is when it starts a stream: a POST's response stream or a GET stream. */
+	readonly kind: McpGatewayStreamKind;
+	/** Whether the session's revision allows priming events (and so closing the stream for polling). */
+	readonly priming: () => boolean;
+	/** The cancellation token of the request(s) the response answers (POST responses). */
+	readonly token?: CancellationToken;
+}
+
+/** The JSON-RPC form of a notification. */
+export function notificationMessage(notification: IMcpGatewayNotification): IJsonRpcNotification {
+	return notification.params === undefined ? { jsonrpc: '2.0', method: notification.method } : { jsonrpc: '2.0', method: notification.method, params: notification.params };
 }
 
 const LOGGING_LEVELS: ReadonlySet<string> = new Set(['debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency']);
@@ -71,16 +100,24 @@ function errorResponseFor(id: JsonRpcId, error: McpGatewayRpcError): IJsonRpcErr
 /**
  * One 2025-11-25 (and earlier) Streamable HTTP session: the `initialize`
  * handshake, the per-session logging level and resource subscriptions, the
- * server→client requests the dispatcher's input rounds need and the
- * list-changed broadcasts on the session's streams. Every other method goes
- * through the {@link McpGatewayDispatcher}.
+ * server→client requests the dispatcher's input rounds need, the session's
+ * SSE streams with their replay log, and the list-changed notifications,
+ * each sent on one stream only (the most recent open GET stream). Every
+ * other method goes through the {@link McpGatewayDispatcher}. A session that
+ * has been idle (no message in flight, no open stream) for
+ * {@link LEGACY_SESSION_IDLE_TIMEOUT_MS} disposes itself.
  */
 export class McpGatewaySession extends Disposable implements IMcpGatewayRequestBroker {
-	private readonly _streams = new Set<IMcpGatewaySessionStream>();
+	/** The open GET streams, oldest first. */
+	private readonly _streams: IMcpGatewaySessionStream[] = [];
 	private readonly _streamListeners = this._register(new DisposableMap<IMcpGatewaySessionStream>());
 	private readonly _pending = new Map<JsonRpcId, { readonly deferred: DeferredPromise<unknown>; readonly listener: IDisposable }>();
 	private readonly _inflight = new Map<JsonRpcId, CancellationTokenSource>();
 	private readonly _resourceSubscriptions = this._register(new DisposableMap<string>());
+	private readonly _idleTimer: RunOnceScheduler;
+	/** Open responses that keep the session from expiring, each with the listener that releases it. */
+	private readonly _holds = this._register(new DisposableMap<object>());
+	private _activeMessages = 0;
 	private _nextServerRequestId = 1;
 	private _initialized = false;
 	private _protocolVersion: string | undefined;
@@ -88,9 +125,12 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 	private _clientInfo: MCP.Implementation | undefined;
 	private _logLevel: MCP.LoggingLevel | undefined;
 
+	/** The session's SSE streams and the events kept for `Last-Event-ID` replay. */
+	readonly eventLog = new McpGatewayEventLog();
+
 	/** The session's own streams (HTTP GET): where messages go that have no response stream of their own. */
 	readonly streamSink: IMcpGatewayMessageSink = {
-		notify: notification => this._broadcast(notification),
+		notify: notification => this._sendUnrelated(notification),
 		sendRequest: (request, token) => {
 			const stream = this._openStream();
 			if (!stream) {
@@ -106,20 +146,26 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 		private readonly _dispatcher: McpGatewayDispatcher,
 		private readonly _invoker: IMcpGatewaySingleServerInvoker,
 		private readonly _onDidDispose: () => void,
+		idleTimeoutMs: number = LEGACY_SESSION_IDLE_TIMEOUT_MS,
 	) {
 		super();
-		this._register(_invoker.onDidChangeTools(() => this._broadcastListChanged('notifications/tools/list_changed')));
-		this._register(_invoker.onDidChangeResources(() => this._broadcastListChanged('notifications/resources/list_changed')));
+		this._idleTimer = this._register(new RunOnceScheduler(() => {
+			this._logger.info(`[McpGateway][session ${this.id}] Expiring the session after ${Math.round(idleTimeoutMs / 1000)}s without requests or open streams`);
+			this.dispose();
+		}, idleTimeoutMs));
+		this._register(_invoker.onDidChangeTools(() => this._sendListChanged('notifications/tools/list_changed')));
+		this._register(_invoker.onDidChangeResources(() => this._sendListChanged('notifications/resources/list_changed')));
 		if (_invoker.onDidChangePrompts) {
-			this._register(_invoker.onDidChangePrompts(() => this._broadcastListChanged('notifications/prompts/list_changed')));
+			this._register(_invoker.onDidChangePrompts(() => this._sendListChanged('notifications/prompts/list_changed')));
 		}
 		if (_invoker.onDidUpdateResource) {
 			this._register(_invoker.onDidUpdateResource(({ uri }) => {
 				if (this._resourceSubscriptions.has(uri)) {
-					this._broadcast({ method: 'notifications/resources/updated', params: { uri } });
+					this._sendUnrelated({ method: 'notifications/resources/updated', params: { uri } });
 				}
 			}));
 		}
+		this._updateIdle();
 	}
 
 	get isInitialized(): boolean {
@@ -131,6 +177,11 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 		return this._protocolVersion;
 	}
 
+	/** Whether the session's streams get SEP-1699 priming events (2025-11-25 and later). */
+	get supportsPriming(): boolean {
+		return legacyVersionSupportsPriming(this._protocolVersion);
+	}
+
 	get logLevel(): MCP.LoggingLevel | undefined {
 		return this._logLevel;
 	}
@@ -140,21 +191,43 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 	}
 
 	get streamCount(): number {
-		return this._streams.size;
+		return this._streams.length;
 	}
 
 	get pendingRequestCount(): number {
 		return this._pending.size;
 	}
 
-	/** Adds an open GET stream; it is forgotten when it closes. */
+	/** What a response of this session needs to carry one of its SSE streams. */
+	streamOptions(kind: McpGatewayStreamKind, token?: CancellationToken): IMcpGatewayLegacyStreamOptions {
+		return { broker: this, log: this.eventLog, kind, priming: () => this.supportsPriming, token };
+	}
+
+	/** Adds an open GET stream; it is forgotten when it closes. The most recent open one carries the messages that belong to no request. */
 	attachStream(stream: IMcpGatewaySessionStream): void {
-		this._streams.add(stream);
-		this._logger.info(`[McpGateway][session ${this.id}] Stream attached (total: ${this._streams.size})`);
+		this._streams.push(stream);
+		this._logger.info(`[McpGateway][session ${this.id}] Stream attached (total: ${this._streams.length})`);
+		this.holdOpen(stream.onDidClose);
 		this._streamListeners.set(stream, stream.onDidClose(() => {
-			this._streams.delete(stream);
+			const index = this._streams.indexOf(stream);
+			if (index !== -1) {
+				this._streams.splice(index, 1);
+			}
 			this._streamListeners.deleteAndDispose(stream);
-			this._logger.info(`[McpGateway][session ${this.id}] Stream detached (total: ${this._streams.size})`);
+			this._logger.info(`[McpGateway][session ${this.id}] Stream detached (total: ${this._streams.length})`);
+		}));
+	}
+
+	/** Keeps the session from expiring until `onDidClose` fires (an open response of the session). */
+	holdOpen(onDidClose: Event<void>): void {
+		if (this._store.isDisposed) {
+			return;
+		}
+		const hold = {};
+		this._idleTimer.cancel();
+		this._holds.set(hold, Event.once(onDidClose)(() => {
+			this._holds.deleteAndDispose(hold);
+			this._updateIdle();
 		}));
 	}
 
@@ -168,11 +241,18 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 	async handleIncoming(message: JsonRpcMessage | JsonRpcMessage[], sink: IMcpGatewayMessageSink = this.streamSink, headers: Readonly<Record<string, string>> = {}, token: CancellationToken = CancellationToken.None): Promise<JsonRpcResponse[]> {
 		const messages: unknown[] = Array.isArray(message) ? message : [message];
 		const responses: JsonRpcResponse[] = [];
-		for (const single of messages) {
-			const response = await this._handleMessage(single, sink, headers, token);
-			if (response) {
-				responses.push(response);
+		this._activeMessages++;
+		this._idleTimer.cancel();
+		try {
+			for (const single of messages) {
+				const response = await this._handleMessage(single, sink, headers, token);
+				if (response) {
+					responses.push(response);
+				}
 			}
+		} finally {
+			this._activeMessages--;
+			this._updateIdle();
 		}
 		return responses;
 	}
@@ -192,7 +272,7 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 		return { id, result };
 	}
 
-	/** Cancels an in-flight client request (`notifications/cancelled`). */
+	/** Cancels an in-flight client request of this session (`notifications/cancelled`). */
 	cancelRequest(requestId: JsonRpcId): boolean {
 		const cts = this._inflight.get(requestId);
 		if (!cts) {
@@ -206,7 +286,7 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 		if (this._store.isDisposed) {
 			return;
 		}
-		this._logger.info(`[McpGateway][session ${this.id}] Disposing session (streams: ${this._streams.size}, pending: ${this._pending.size})`);
+		this._logger.info(`[McpGateway][session ${this.id}] Disposing session (streams: ${this._streams.length}, pending: ${this._pending.size})`);
 		for (const id of [...this._pending.keys()]) {
 			this._failPending(id, new CancellationError());
 		}
@@ -216,39 +296,60 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 		for (const stream of [...this._streams]) {
 			stream.end();
 		}
-		this._streams.clear();
+		this._streams.length = 0;
+		this.eventLog.endAll();
 		this._onDidDispose();
 		super.dispose();
 	}
 
+	private _updateIdle(): void {
+		if (this._store.isDisposed) {
+			return;
+		}
+		if (this._activeMessages > 0 || this._holds.size > 0) {
+			this._idleTimer.cancel();
+		} else {
+			// (Re)starts the clock: the session has just become idle.
+			this._idleTimer.schedule();
+		}
+	}
+
+	/** The most recent open GET stream. */
 	private _openStream(): IMcpGatewaySessionStream | undefined {
-		for (const stream of this._streams) {
-			if (stream.isOpen) {
-				return stream;
+		for (let i = this._streams.length - 1; i >= 0; i--) {
+			if (this._streams[i].isOpen) {
+				return this._streams[i];
 			}
 		}
 		return undefined;
 	}
 
-	private _broadcast(notification: IMcpGatewayNotification): void {
-		let delivered = 0;
-		for (const stream of [...this._streams]) {
-			if (stream.isOpen) {
-				stream.notify(notification);
-				delivered++;
-			}
+	/**
+	 * A message that belongs to no request (a list change, a resource update):
+	 * 2025-11-25 sends each message on one stream only, so it goes on the most
+	 * recent open GET stream. Without one it is kept in the replay log of the
+	 * session's latest GET stream, for a client that resumes it.
+	 */
+	private _sendUnrelated(notification: IMcpGatewayNotification): void {
+		const stream = this._openStream();
+		if (stream) {
+			stream.notify(notification);
+			return;
 		}
-		if (delivered === 0) {
-			this._logger.debug(`[McpGateway][session ${this.id}] No stream for ${notification.method}, dropping it`);
+		const latest = this.eventLog.latestStandalone;
+		if (latest !== undefined && this.eventLog.write(latest, notificationMessage(notification)) !== undefined) {
+			this._logger.debug(`[McpGateway][session ${this.id}] No open stream for ${notification.method}: kept for replay on stream ${latest}`);
+			return;
 		}
+		this._logger.debug(`[McpGateway][session ${this.id}] No stream for ${notification.method}, dropping it`);
 	}
 
-	private _broadcastListChanged(method: string): void {
+	private _sendListChanged(method: string): void {
 		if (!this._initialized) {
 			return;
 		}
 		this._logger.info(`[McpGateway][session ${this.id}] ${method}`);
-		this._broadcast({ method });
+		this._sendUnrelated({ method });
 	}
 
 	private _failPending(id: JsonRpcId, error: Error): void {
@@ -306,6 +407,7 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 				this._logger.info(`[McpGateway][session ${this.id}] Session initialized`);
 				break;
 			case 'notifications/cancelled': {
+				// Only this session's requests: another session may well use the same id.
 				const requestId = isObject(notification.params) ? notification.params.requestId : undefined;
 				if (typeof requestId === 'string' || typeof requestId === 'number') {
 					this.cancelRequest(requestId);
@@ -375,6 +477,7 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 		}
 		const meta = isObject(params._meta) ? params._meta : undefined;
 		const progressTokenRaw = meta?.[META_PROGRESS_TOKEN];
+		const closeForPolling = sink.closeForPolling;
 		const context: IMcpGatewayDispatchContext = {
 			era: 'legacy',
 			protocolVersion: this._protocolVersion ?? MCPLegacy.LATEST_PROTOCOL_VERSION,
@@ -387,6 +490,11 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 			token,
 			notify: notification => sink.notify(notification),
 			sendServerRequest: serverRequest => sink.sendRequest(serverRequest, token),
+			closeSseStream: closeForPolling && this.supportsPriming ? () => {
+				if (closeForPolling.call(sink)) {
+					this._logger.debug(`[McpGateway][session ${this.id}] Closed the stream of ${request.method} (id=${String(request.id)}) for polling`);
+				}
+			} : undefined,
 		};
 		return this._dispatcher.dispatch(context, request.method, params);
 	}
@@ -444,4 +552,9 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 export function isInitializeMessage(message: unknown): boolean {
 	const first = Array.isArray(message) ? message[0] : message;
 	return isRequest(first) && first.method === 'initialize';
+}
+
+/** Whether a POST body carries at least one request (it must then be answered with JSON or an event stream, never 202). */
+export function containsRequest(message: unknown): boolean {
+	return Array.isArray(message) ? message.some(isRequest) : isRequest(message);
 }

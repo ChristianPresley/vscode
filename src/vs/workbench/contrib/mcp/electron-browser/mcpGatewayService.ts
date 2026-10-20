@@ -108,5 +108,7 @@ export class WorkbenchMcpGatewayService implements IWorkbenchMcpGatewayService {
 }
 
 function reviveServers(servers: readonly IMcpGatewayServerInfo[]): IMcpGatewayResultServer[] {
-	return servers.map(s => ({ label: s.label, address: URI.revive(s.address) }));
+	return servers.map(s => s.grpcAddress
+		? { label: s.label, address: URI.revive(s.address), grpcAddress: URI.revive(s.grpcAddress) }
+		: { label: s.label, address: URI.revive(s.address) });
 }

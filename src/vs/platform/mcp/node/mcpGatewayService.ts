@@ -9,11 +9,13 @@ import { Emitter, Event } from '../../../base/common/event.js';
 import { Disposable, DisposableStore, IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
 import { URI } from '../../../base/common/uri.js';
 import { generateUuid } from '../../../base/common/uuid.js';
+import { SyncDescriptor } from '../../instantiation/common/descriptors.js';
 import { ILogger, ILoggerService } from '../../log/common/log.js';
 import { IMcpGatewayInfo, IMcpGatewayServerCapabilities, IMcpGatewayServerDescriptor, IMcpGatewayServerInfo, IMcpGatewayService, IMcpGatewaySingleServerInvoker, IMcpGatewayToolInvoker } from '../common/mcpGateway.js';
 import { errorResponse, isAllowedOrigin, isLoopbackHost } from '../common/mcpGatewayProtocol.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { IMcpGatewayDispatcherOptions } from './mcpGatewayDispatcher.js';
+import { McpGatewayGrpcListener } from './mcpGatewayGrpc.js';
 import { McpGatewayRoute } from './mcpGatewayRoute.js';
 import { McpGatewaySealedState } from './mcpGatewaySealedState.js';
 
@@ -23,12 +25,21 @@ export interface IMcpGatewayServiceOptions {
 	readonly allowedHosts?: readonly string[];
 	/** `Origin` header values to accept in addition to loopback origins. */
 	readonly allowedOrigins?: readonly string[];
+	/**
+	 * Also serves every route over gRPC (the JSON-RPC tunnel and the typed
+	 * binding) on a loopback listener next to the HTTP port; the servers then
+	 * advertise a `grpcAddress` (`grpc://127.0.0.1:<port>/<routeId>`, see
+	 * {@link McpGatewayGrpcListener}).
+	 */
+	readonly grpc?: boolean;
 }
 
 /** A route created with {@link McpGatewayService.createRoute}; disposing it removes the route. */
 export interface IMcpGatewayRouteHandle extends IDisposable {
 	readonly routeId: string;
 	readonly address: URI;
+	/** The gRPC address of the route, when the gateway serves gRPC. */
+	readonly grpcAddress?: URI;
 }
 
 let processSealedState: McpGatewaySealedState | undefined;
@@ -69,6 +80,8 @@ export class McpGatewayService extends Disposable implements IMcpGatewayService 
 	private readonly _sealedState = getProcessSealedState();
 	private readonly _allowedHosts: ReadonlySet<string>;
 	private readonly _allowedOrigins: ReadonlySet<string>;
+	private readonly _grpc: boolean;
+	private _grpcListener: McpGatewayGrpcListener | undefined;
 
 	constructor(
 		@ILoggerService loggerService: ILoggerService,
@@ -78,12 +91,18 @@ export class McpGatewayService extends Disposable implements IMcpGatewayService 
 		this._logger = this._register(loggerService.createLogger('mcpGateway', { name: 'MCP Gateway', logLevel: 'always' }));
 		this._allowedHosts = new Set((options.allowedHosts ?? []).map(host => host.trim().toLowerCase()));
 		this._allowedOrigins = new Set((options.allowedOrigins ?? []).map(origin => origin.trim().toLowerCase()));
+		this._grpc = options.grpc === true;
 		this._logger.info('[McpGatewayService] Initialized');
 	}
 
 	/** The port the HTTP server listens on, when it runs. */
 	get port(): number | undefined {
 		return this._port;
+	}
+
+	/** The port of the gRPC listener, when the gateway serves gRPC and runs. */
+	get grpcPort(): number | undefined {
+		return this._grpcListener?.port;
 	}
 
 	/** A route by id (diagnostics and tests). */
@@ -161,11 +180,16 @@ export class McpGatewayService extends Disposable implements IMcpGatewayService 
 		const routeId = generateUuid();
 		const route = new McpGatewayRoute(routeId, this._logger, invoker, this._sealedState, label, dispatcherOptions);
 		this._routes.set(routeId, route);
+		const store = new DisposableStore();
+		this._routeDisposables.set(routeId, store);
+		this._serveOverGrpc(route, invoker, store);
 		const address = this._addressOf(routeId);
-		this._logger.info(`[McpGatewayService] Created route ${routeId} for '${label}' at ${address}`);
+		const grpcAddress = this._grpcAddressOf(routeId);
+		this._logger.info(`[McpGatewayService] Created route ${routeId} for '${label}' at ${address}${grpcAddress ? ` and ${grpcAddress}` : ''}`);
 		return {
 			routeId,
 			address,
+			...(grpcAddress ? { grpcAddress } : {}),
 			dispose: () => {
 				this._disposeRoute(routeId);
 				if (this._routes.size === 0) {
@@ -251,13 +275,37 @@ export class McpGatewayService extends Disposable implements IMcpGatewayService 
 		const route = new McpGatewayRoute(routeId, this._logger, singleServerInvoker, this._sealedState, label);
 		this._routes.set(routeId, route);
 		this._routeDisposables.set(routeId, store);
+		this._serveOverGrpc(route, singleServerInvoker, store);
 		routeIds.add(routeId);
 		serverRouteMap.set(serverId, routeId);
 
-		const address = this._addressOf(routeId);
-		this._logger.info(`[McpGatewayService] Created route ${routeId} for server '${label}' (${serverId}) at ${address}`);
+		const info = this._serverInfoOf(label, routeId);
+		this._logger.info(`[McpGatewayService] Created route ${routeId} for server '${label}' (${serverId}) at ${info.address}${info.grpcAddress ? ` and ${info.grpcAddress}` : ''}`);
 
-		return { label, address };
+		return info;
+	}
+
+	/** Serves the route on the gRPC listener (when there is one) until `store` is disposed. */
+	private _serveOverGrpc(route: McpGatewayRoute, invoker: IMcpGatewaySingleServerInvoker, store: DisposableStore): void {
+		if (this._grpcListener) {
+			store.add(this._grpcListener.addRoute(route.routeId, route.dispatcher, invoker));
+		}
+	}
+
+	private _serverInfoOf(label: string, routeId: string): IMcpGatewayServerInfo {
+		const address = this._addressOf(routeId);
+		const grpcAddress = this._grpcAddressOf(routeId);
+		return grpcAddress ? { label, address, grpcAddress } : { label, address };
+	}
+
+	/**
+	 * `grpc://127.0.0.1:<port>/<routeId>`: the authority is the channel's
+	 * target and the path names the route, which a call sends as the
+	 * `mcp-gateway-route` metadata.
+	 */
+	private _grpcAddressOf(routeId: string): URI | undefined {
+		const port = this._grpcListener?.port;
+		return port === undefined ? undefined : URI.from({ scheme: 'grpc', authority: `127.0.0.1:${port}`, path: `/${routeId}` });
 	}
 
 	/**
@@ -317,10 +365,7 @@ export class McpGatewayService extends Disposable implements IMcpGatewayService 
 		for (const [_serverId, routeId] of serverRouteMap) {
 			const route = this._routes.get(routeId);
 			if (route) {
-				servers.push({
-					label: route.label,
-					address: this._addressOf(routeId),
-				});
+				servers.push(this._serverInfoOf(route.label, routeId));
 			}
 		}
 		return servers;
@@ -376,13 +421,13 @@ export class McpGatewayService extends Disposable implements IMcpGatewayService 
 	}
 
 	private async _ensureServer(): Promise<void> {
-		if (this._server?.listening) {
-			return;
-		}
-
-		// If server is already starting, wait for it
+		// If server is already starting, wait for it (the HTTP port listens before the gRPC listener does)
 		if (this._serverStartPromise) {
 			return this._serverStartPromise;
+		}
+
+		if (this._server?.listening) {
+			return;
 		}
 
 		this._serverStartPromise = this._startServer();
@@ -438,7 +483,30 @@ export class McpGatewayService extends Disposable implements IMcpGatewayService 
 		// Use dynamic port assignment (port 0)
 		server.listen(0, '127.0.0.1');
 
-		return deferredPromise.p;
+		await deferredPromise.p;
+		if (this._grpc) {
+			await this._startGrpcListener();
+		}
+	}
+
+	/** The gRPC listener next to the HTTP port; the gateway keeps serving HTTP when it cannot start. */
+	private async _startGrpcListener(): Promise<void> {
+		const listener = new McpGatewayGrpcListener(this._logger);
+		listener.registerTunnelService();
+		listener.registerTypedService();
+		try {
+			const port = await listener.listen();
+			if (this._store.isDisposed || !this._server) {
+				// Stopped while the listener started.
+				listener.dispose();
+				return;
+			}
+			this._grpcListener = listener;
+			this._logger.info(`[McpGatewayService] gRPC listener started on ${listener.addresses.join(', ')} (port ${port})`);
+		} catch (error) {
+			this._logger.error(`[McpGatewayService] Could not start the gRPC listener: ${error}`);
+			listener.dispose();
+		}
 	}
 
 	private _stopServer(): void {
@@ -453,6 +521,9 @@ export class McpGatewayService extends Disposable implements IMcpGatewayService 
 		for (const route of this._routes.values()) {
 			route.closeAllConnections();
 		}
+		// gRPC: graceful listen results, then GOAWAY to every connection.
+		this._grpcListener?.dispose();
+		this._grpcListener = undefined;
 		server.close(err => {
 			if (err) {
 				this._logger.error(`[McpGatewayService] Error closing server: ${err}`);
@@ -532,6 +603,23 @@ export class McpGatewayService extends Disposable implements IMcpGatewayService 
 		this._gatewayDisposables.clear();
 		super.dispose();
 	}
+}
+
+/** {@link McpGatewayService} with its options as the static argument that DI passes first. */
+class ConfiguredMcpGatewayService extends McpGatewayService {
+	constructor(options: IMcpGatewayServiceOptions, @ILoggerService loggerService: ILoggerService) {
+		super(loggerService, options);
+	}
+}
+
+/**
+ * How DI registrations pass gateway options (the constructor's own options
+ * argument follows an injected service, so it can only be given with `new`):
+ * `services.set(IMcpGatewayService, mcpGatewayServiceDescriptor({ allowedHosts: [...] }))`.
+ * `new SyncDescriptor(McpGatewayService)` keeps the default, loopback-only gateway.
+ */
+export function mcpGatewayServiceDescriptor(options: IMcpGatewayServiceOptions): SyncDescriptor<IMcpGatewayService> {
+	return new SyncDescriptor(ConfiguredMcpGatewayService, [options]);
 }
 
 function hostnameOf(hostHeader: string): string {

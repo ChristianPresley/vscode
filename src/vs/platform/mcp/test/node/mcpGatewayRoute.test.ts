@@ -4,18 +4,23 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { DeferredPromise } from '../../../../base/common/async.js';
-import { Event } from '../../../../base/common/event.js';
+import { DeferredPromise, timeout } from '../../../../base/common/async.js';
+import { Emitter, Event } from '../../../../base/common/event.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { NullLoggerService } from '../../../log/common/log.js';
-import { IMcpGatewaySingleServerInvoker } from '../../common/mcpGateway.js';
+import { SyncDescriptor } from '../../../instantiation/common/descriptors.js';
+import { InstantiationService } from '../../../instantiation/common/instantiationService.js';
+import { ServiceCollection } from '../../../instantiation/common/serviceCollection.js';
+import { ILoggerService, NullLoggerService } from '../../../log/common/log.js';
+import { IMcpGatewayInvokeContext, IMcpGatewayServerDescriptor, IMcpGatewayService, IMcpGatewaySingleServerInvoker, IMcpGatewayToolInvoker } from '../../common/mcpGateway.js';
+import { LEGACY_TRANSPORT_ERROR } from '../../common/mcpGatewayProtocol.js';
 import { MCP_PROTOCOL_VERSION_HEADER } from '../../common/mcpHttpHeaders.js';
-import { LATEST_MCP_PROTOCOL_VERSION, META_SERVER_INFO, META_SUBSCRIPTION_ID } from '../../common/mcpProtocolVersions.js';
+import { LATEST_MCP_PROTOCOL_VERSION, META_CLIENT_INFO, META_SERVER_INFO, META_SUBSCRIPTION_ID } from '../../common/mcpProtocolVersions.js';
 import { MCP } from '../../common/modelContextProtocol.js';
+import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { CONFORMANCE_HIDDEN_TOOL, CONFORMANCE_SERVER_INFO, McpGatewayConformanceInvoker } from '../../node/mcpGatewayConformanceInvoker.js';
 import { LEGACY_NOT_INITIALIZED, LEGACY_SESSION_NOT_FOUND, LEGACY_SSE_RETRY_MS, MAX_BODY_BYTES, McpGatewayRoute } from '../../node/mcpGatewayRoute.js';
-import { IMcpGatewayServiceOptions, McpGatewayService } from '../../node/mcpGatewayService.js';
-import { httpRequest, jsonOf, LEGACY_HEADERS, legacyHeaders, modernRequest, openHttp } from './mcpGatewayTestUtils.js';
+import { IMcpGatewayServiceOptions, McpGatewayService, mcpGatewayServiceDescriptor } from '../../node/mcpGatewayService.js';
+import { httpRequest, jsonOf, LEGACY_HEADERS, legacyHeaders, modernRequest, openHttp, rawHttp, sendHttp, TEST_CLIENT_INFO } from './mcpGatewayTestUtils.js';
 
 interface IJsonRpcBody {
 	readonly id?: unknown;
@@ -30,7 +35,21 @@ async function whenResponsesClosed(route: McpGatewayRoute, condition: () => bool
 	}
 }
 
-const INITIALIZE = (capabilities: Record<string, unknown> = {}) => JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities, clientInfo: { name: 'route-test', version: '1.0.0' } } });
+const INITIALIZE = (capabilities: Record<string, unknown> = {}, protocolVersion = '2025-11-25') => JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion, capabilities, clientInfo: { name: 'route-test', version: '1.0.0' } } });
+
+const OTHER_CLIENT_INFO: MCP.Implementation = { name: 'another-client', version: '2.0.0' };
+
+/** A 2026-07-28 `notifications/cancelled` POST from the client that `clientInfo` names (`null`: a client that sends no `_meta`). */
+function modernCancel(requestId: string | number, clientInfo: MCP.Implementation | null = TEST_CLIENT_INFO): { body: string; headers: Record<string, string> } {
+	const params: Record<string, unknown> = { requestId };
+	if (clientInfo) {
+		params._meta = { [META_CLIENT_INFO]: clientInfo };
+	}
+	return {
+		body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params }),
+		headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', [MCP_PROTOCOL_VERSION_HEADER]: LATEST_MCP_PROTOCOL_VERSION },
+	};
+}
 
 suite('MCP - GatewayRoute (HTTP)', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
@@ -55,14 +74,51 @@ suite('MCP - GatewayRoute (HTTP)', () => {
 		return { status: result.status, body: result.text ? jsonOf(result) as IJsonRpcBody : {}, headers: result.headers };
 	}
 
-	async function initializeSession(url: string, capabilities: Record<string, unknown> = {}): Promise<string> {
-		const init = await httpRequest(url, { headers: LEGACY_HEADERS, body: INITIALIZE(capabilities) });
+	async function initializeSession(url: string, capabilities: Record<string, unknown> = {}, protocolVersion = '2025-11-25'): Promise<string> {
+		const init = await httpRequest(url, { headers: LEGACY_HEADERS, body: INITIALIZE(capabilities, protocolVersion) });
 		assert.strictEqual(init.status, 200, init.text);
 		const sessionId = init.headers['mcp-session-id'];
 		assert.ok(typeof sessionId === 'string' && /^[\x21-\x7e]+$/.test(sessionId), 'visible ASCII session id');
-		const initialized = await httpRequest(url, { headers: legacyHeaders(sessionId), body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) });
+		const initialized = await httpRequest(url, { headers: legacyHeaders(sessionId, protocolVersion), body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) });
 		assert.strictEqual(initialized.status, 202);
 		return sessionId;
+	}
+
+	function getHeaders(sessionId: string, extra: Record<string, string> = {}): Record<string, string> {
+		return { Accept: 'text/event-stream', 'Mcp-Session-Id': sessionId, [MCP_PROTOCOL_VERSION_HEADER]: '2025-11-25', ...extra };
+	}
+
+	/** An invoker whose `wait` tool runs until the test releases it or the request is cancelled. */
+	function blockingInvoker(overrides: Partial<IMcpGatewaySingleServerInvoker> = {}) {
+		const calls: Array<{ readonly context: IMcpGatewayInvokeContext | undefined; readonly release: DeferredPromise<void> }> = [];
+		const onDidCall = store.add(new Emitter<void>());
+		const invoker: IMcpGatewaySingleServerInvoker = {
+			onDidChangeTools: Event.None,
+			onDidChangeResources: Event.None,
+			listTools: async () => [{ name: 'wait', description: 'Waits until released or cancelled', inputSchema: { type: 'object' } }],
+			callTool: async (_name, _args, context) => {
+				const release = new DeferredPromise<void>();
+				calls.push({ context, release });
+				onDidCall.fire();
+				const listener = context?.token.onCancellationRequested(() => release.complete());
+				try {
+					await release.p;
+				} finally {
+					listener?.dispose();
+				}
+				return { content: [{ type: 'text', text: context?.token.isCancellationRequested ? 'cancelled' : 'released' }] };
+			},
+			listResources: async () => [],
+			readResource: async () => ({ contents: [] }),
+			listResourceTemplates: async () => [],
+			...overrides,
+		};
+		const waitForCalls = async (count: number) => {
+			while (calls.length < count) {
+				await Event.toPromise(onDidCall.event);
+			}
+		};
+		return { invoker, calls, waitForCalls };
 	}
 
 	test('the Host and Origin checks run before the route lookup (403)', async () => {
@@ -84,6 +140,36 @@ suite('MCP - GatewayRoute (HTTP)', () => {
 		const tools = modernRequest('tools/list');
 		assert.strictEqual((await httpRequest(url, { headers: { ...tools.headers, Host: 'gateway.test:8080', Origin: 'https://app.example.com' }, body: tools.body })).status, 200);
 		assert.strictEqual((await httpRequest(url, { headers: { ...tools.headers, Origin: 'https://other.example.com' }, body: tools.body })).status, 403);
+	});
+
+	test('options reach a service registered through DI; the plain descriptor stays loopback-only', async () => {
+		const loggerService = store.add(new NullLoggerService());
+		const tools = modernRequest('tools/list');
+		const hostAccepted = async (descriptor: SyncDescriptor<IMcpGatewayService>) => {
+			const instantiation = new InstantiationService(new ServiceCollection([ILoggerService, loggerService], [IMcpGatewayService, descriptor]), true);
+			try {
+				const service = instantiation.invokeFunction(accessor => accessor.get(IMcpGatewayService));
+				assert.ok(service instanceof McpGatewayService);
+				const handle = await service.createRoute('di', store.add(new McpGatewayConformanceInvoker()));
+				try {
+					return (await httpRequest(handle.address.toString(true), { headers: { ...tools.headers, Host: 'gateway.test' }, body: tools.body })).status;
+				} finally {
+					handle.dispose();
+				}
+			} finally {
+				instantiation.dispose();
+			}
+		};
+		assert.strictEqual(await hostAccepted(mcpGatewayServiceDescriptor({ allowedHosts: ['gateway.test'] })), 200);
+		assert.strictEqual(await hostAccepted(new SyncDescriptor(McpGatewayService)), 403);
+	});
+
+	test('a malformed request target is 400 and the server keeps serving', async () => {
+		const { url, service } = await createGateway();
+		const response = await rawHttp(service.port!, `GET http://[zz HTTP/1.1\r\nHost: 127.0.0.1:${service.port}\r\nConnection: close\r\n\r\n`);
+		assert.ok(response.startsWith('HTTP/1.1 400'), response);
+		const tools = await post(url, modernRequest('tools/list'));
+		assert.strictEqual(tools.status, 200, 'still alive');
 	});
 
 	test('an unknown route is 404 with a JSON-RPC -32601 body', async () => {
@@ -143,8 +229,43 @@ suite('MCP - GatewayRoute (HTTP)', () => {
 		const headers = modernRequest('tools/list').headers;
 		assert.strictEqual((await post(url, { headers, body: JSON.stringify([JSON.parse(modernRequest('tools/list').body)]) })).status, 400, 'no batches');
 		assert.strictEqual((await post(url, { headers, body: JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }) })).status, 400, 'no responses');
-		const notification = await httpRequest(url, { headers, body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'nothing' } }) });
+		const notification = await httpRequest(url, modernCancel('nothing'));
 		assert.deepStrictEqual([notification.status, notification.text], [202, '']);
+	});
+
+	test('an unexpected failure while preparing a 2026-07-28 request is 500 with -32603, not 202', async () => {
+		const brokenSchema = { type: 'object' } as MCPLegacy.Tool['inputSchema'];
+		Object.defineProperty(brokenSchema, 'properties', { enumerable: true, get: () => { throw new Error('broken schema'); } });
+		const { invoker } = blockingInvoker({ listTools: async () => [{ name: 'wait', description: 'A tool with a schema that cannot be read', inputSchema: brokenSchema }] });
+		const { url, route } = await createGateway(invoker);
+		const result = await post(url, modernRequest('tools/call', { name: 'wait', arguments: {} }, 7));
+		assert.deepStrictEqual([result.status, result.body.id, result.body.error?.code], [500, 7, MCP.INTERNAL_ERROR]);
+		assert.strictEqual(result.body.error?.message, 'Internal server error', 'no internal details leak');
+		await whenResponsesClosed(route, () => route.openResponses === 0);
+	});
+
+	test('a client that goes away while its request is validated does not run the tool', async () => {
+		const listing = new DeferredPromise<void>();
+		const listed = new DeferredPromise<void>();
+		const { invoker, calls } = blockingInvoker({
+			listTools: async () => {
+				listed.complete();
+				await listing.p;
+				return [{ name: 'wait', description: 'Waits', inputSchema: { type: 'object' } }];
+			},
+		});
+		const { url, route } = await createGateway(invoker);
+		const call = modernRequest('tools/call', { name: 'wait', arguments: {} }, 1);
+		const pending = await sendHttp(url, { method: 'POST', headers: call.headers, body: call.body });
+		await listed.p;
+		pending.abort();
+		await whenResponsesClosed(route, () => route.openResponses === 0);
+		listing.complete();
+		// Let the validation finish, then make sure the gateway did not dispatch the call.
+		await timeout(20);
+		assert.strictEqual((await post(url, modernRequest('tools/list', {}, 2))).status, 200);
+		assert.strictEqual(calls.length, 0, 'the tool never ran');
+		assert.strictEqual(await pending.response, undefined);
 	});
 
 	test('2026-07-28 answers are JSON unless notifications are produced, then SSE; never a session id', async () => {
@@ -193,7 +314,7 @@ suite('MCP - GatewayRoute (HTTP)', () => {
 		const changed = await stream.message(1);
 		assert.deepStrictEqual(changed, { jsonrpc: '2.0', method: 'notifications/tools/list_changed', params: { _meta: { [META_SUBSCRIPTION_ID]: 'listen-1' } } });
 
-		const cancel = await httpRequest(url, { headers: modernRequest('tools/list').headers, body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'listen-1' } }) });
+		const cancel = await httpRequest(url, modernCancel('listen-1'));
 		assert.strictEqual(cancel.status, 202);
 		await stream.ended;
 		const final = stream.messages[stream.messages.length - 1] as IJsonRpcBody;
@@ -215,6 +336,22 @@ suite('MCP - GatewayRoute (HTTP)', () => {
 		assert.strictEqual(route.openListenStreams, 1);
 		stream.close();
 		await whenResponsesClosed(route, () => route.openListenStreams === 0 && route.openResponses === 0);
+	});
+
+	test('subscriptions/listen: a malformed filter is 400 with -32602, not an internal error', async () => {
+		const { url, route } = await createGateway();
+		for (const notifications of [{ resourceSubscriptions: 'x' }, { resourceSubscriptions: [1] }, { toolsListChanged: 'yes' }, { promptsListChanged: 1 }, { resourcesListChanged: null }, 'all', ['toolsListChanged']]) {
+			const result = await post(url, modernRequest('subscriptions/listen', { notifications }, 'bad'));
+			assert.deepStrictEqual([result.status, result.body.id, result.body.error?.code], [400, 'bad', MCP.INVALID_PARAMS], JSON.stringify(notifications));
+			assert.ok(!/TypeError|is not a function|undefined/.test(result.body.error?.message ?? ''), result.body.error?.message);
+		}
+		assert.strictEqual(route.openListenStreams, 0);
+		// Unknown keys are ignored.
+		const listen = modernRequest('subscriptions/listen', { notifications: { toolsListChanged: true, somethingElse: 'x' } }, 'ok');
+		const stream = await openHttp(url, { method: 'POST', headers: listen.headers, body: listen.body });
+		assert.deepStrictEqual(((await stream.message(0)).params as { notifications: unknown }).notifications, { toolsListChanged: true });
+		stream.close();
+		await whenResponsesClosed(route, () => route.openListenStreams === 0);
 	});
 
 	test('closing a 2026-07-28 response stream cancels the request', async () => {
@@ -245,6 +382,49 @@ suite('MCP - GatewayRoute (HTTP)', () => {
 		stream.close();
 		await cancelled.p;
 		await whenResponsesClosed(route, () => route.openResponses === 0);
+	});
+
+	test('notifications/cancelled reaches only the requests and listen streams of the client that sent it', async () => {
+		const { invoker, calls, waitForCalls } = blockingInvoker();
+		const { url, route } = await createGateway(invoker);
+		const callA = modernRequest('tools/call', { name: 'wait', arguments: {} }, 1);
+		const callB = modernRequest('tools/call', { name: 'wait', arguments: {}, _meta: { [META_CLIENT_INFO]: OTHER_CLIENT_INFO } }, 1);
+		const a = await sendHttp(url, { method: 'POST', headers: callA.headers, body: callA.body });
+		await waitForCalls(1);
+		const b = await sendHttp(url, { method: 'POST', headers: callB.headers, body: callB.body });
+		await waitForCalls(2);
+
+		// A cancellation without client info does not match requests that named their client.
+		assert.strictEqual((await httpRequest(url, modernCancel(1, null))).status, 202);
+		assert.deepStrictEqual(calls.map(c => c.context?.token.isCancellationRequested), [false, false]);
+
+		assert.strictEqual((await httpRequest(url, modernCancel(1, TEST_CLIENT_INFO))).status, 202);
+		const responseA = (await a.response)!;
+		await responseA.ended;
+		assert.deepStrictEqual([responseA.status, responseA.contentType.startsWith('text/event-stream'), responseA.messages], [200, true, []], 'a cancelled request gets an empty event stream: no response, and no 202');
+		assert.deepStrictEqual(calls.map(c => c.context?.token.isCancellationRequested), [true, false], 'the other client\'s request with the same id runs on');
+
+		calls[1].release.complete();
+		const responseB = (await b.response)!;
+		await responseB.ended;
+		assert.strictEqual(responseB.status, 200);
+		assert.deepStrictEqual((JSON.parse(responseB.text) as IJsonRpcBody).result?.content, [{ type: 'text', text: 'released' }]);
+
+		// Listen streams too: two clients, one listen request id.
+		const listenA = modernRequest('subscriptions/listen', { notifications: { toolsListChanged: true } }, 'L');
+		const listenB = modernRequest('subscriptions/listen', { notifications: { toolsListChanged: true }, _meta: { [META_CLIENT_INFO]: OTHER_CLIENT_INFO } }, 'L');
+		const streamA = await openHttp(url, { method: 'POST', headers: listenA.headers, body: listenA.body });
+		const streamB = await openHttp(url, { method: 'POST', headers: listenB.headers, body: listenB.body });
+		await streamA.message(0);
+		await streamB.message(0);
+		assert.strictEqual(route.openListenStreams, 2);
+		assert.strictEqual((await httpRequest(url, modernCancel('L', OTHER_CLIENT_INFO))).status, 202);
+		await streamB.ended;
+		assert.strictEqual((streamB.messages.at(-1) as IJsonRpcBody).id, 'L');
+		assert.strictEqual(route.openListenStreams, 1);
+		assert.strictEqual(streamA.isDone, false, 'the first client\'s stream stays open');
+		streamA.close();
+		await whenResponsesClosed(route, () => route.openListenStreams === 0 && route.openResponses === 0);
 	});
 
 	test('2025-11-25 session lifecycle: initialize, session header, GET stream, DELETE', async () => {
@@ -286,6 +466,45 @@ suite('MCP - GatewayRoute (HTTP)', () => {
 		assert.strictEqual((await httpRequest(url, { method: 'GET', headers: { 'Mcp-Session-Id': sessionId } })).status, 404);
 	});
 
+	test('2025-11-25: an invalid or unsupported MCP-Protocol-Version on a session request is 400; absent or supported is accepted', async () => {
+		const { url, route } = await createGateway();
+		const sessionId = await initializeSession(url);
+		const list = (id: number) => JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/list' });
+		for (const [index, version] of ['2099-01-01', 'garbage', ''].entries()) {
+			const refused = await httpRequest(url, { headers: legacyHeaders(sessionId, version), body: list(index) });
+			assert.deepStrictEqual([refused.status, (jsonOf(refused) as IJsonRpcBody).error?.code], [400, LEGACY_TRANSPORT_ERROR], JSON.stringify(version));
+			assert.strictEqual((await httpRequest(url, { method: 'GET', headers: getHeaders(sessionId, { [MCP_PROTOCOL_VERSION_HEADER]: version }) })).status, 400, `GET ${version}`);
+			assert.strictEqual((await httpRequest(url, { method: 'DELETE', headers: { 'Mcp-Session-Id': sessionId, [MCP_PROTOCOL_VERSION_HEADER]: version } })).status, 400, `DELETE ${version}`);
+		}
+		assert.strictEqual(route.sessionCount, 1, 'a refused DELETE keeps the session');
+		assert.strictEqual((await httpRequest(url, { headers: { ...LEGACY_HEADERS, 'Mcp-Session-Id': sessionId }, body: list(10) })).status, 200, 'absent: the negotiated version applies');
+		assert.strictEqual((await httpRequest(url, { headers: legacyHeaders(sessionId, '2025-06-18'), body: list(11) })).status, 200, 'another supported revision');
+		// initialize itself is not checked: the version is being negotiated.
+		const init = await httpRequest(url, { headers: { ...LEGACY_HEADERS, [MCP_PROTOCOL_VERSION_HEADER]: '2099-01-01' }, body: INITIALIZE() });
+		assert.strictEqual(init.status, 200);
+		assert.strictEqual((await httpRequest(url, { method: 'DELETE', headers: { 'Mcp-Session-Id': sessionId } })).status, 204);
+	});
+
+	test('sessions before 2025-11-25 get no priming events (a comment instead); their events still carry ids', async () => {
+		const { url, route } = await createGateway();
+		const sessionId = await initializeSession(url, { sampling: {} }, '2025-06-18');
+		const get = await openHttp(url, { method: 'GET', headers: getHeaders(sessionId, { [MCP_PROTOCOL_VERSION_HEADER]: '2025-06-18' }) });
+		assert.strictEqual(get.status, 200);
+		await post(url, { headers: legacyHeaders(sessionId, '2025-06-18'), body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'test_trigger_tool_change', arguments: {} } }) });
+		await get.messageWhere(m => m.method === 'notifications/tools/list_changed');
+		assert.ok(get.text.startsWith(': connected\n\n'), JSON.stringify(get.text.substring(0, 40)));
+		assert.ok(get.events.every(e => e.data !== '' && e.retry === undefined && e.id !== undefined), 'no priming event');
+
+		const call = await openHttp(url, { method: 'POST', headers: legacyHeaders(sessionId, '2025-06-18'), body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'test_sampling', arguments: { prompt: 'Hi' } } }) });
+		const request = await call.message(0);
+		assert.strictEqual(request.method, 'sampling/createMessage');
+		assert.ok(call.events[0].data !== '' && call.events[0].id !== undefined, 'the first event is the request, not a priming event');
+		await httpRequest(url, { headers: legacyHeaders(sessionId, '2025-06-18'), body: JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { role: 'assistant', content: { type: 'text', text: 'Hello' }, model: 'm', stopReason: 'endTurn' } }) });
+		await call.ended;
+		get.close();
+		await whenResponsesClosed(route, () => route.getSession(sessionId)?.streamCount === 0);
+	});
+
 	test('2025-11-25 sampling round: the request goes out on the POST stream, the answer comes back on another POST', async () => {
 		const { url, route } = await createGateway();
 		const sessionId = await initializeSession(url, { sampling: {} });
@@ -317,6 +536,85 @@ suite('MCP - GatewayRoute (HTTP)', () => {
 		assert.strictEqual(route.getSession(sessionId)?.pendingRequestCount, 0, 'the pending request was cancelled');
 	});
 
+	test('2025-11-25: a request cancelled with notifications/cancelled gets an empty event stream, not 202', async () => {
+		const { invoker, calls, waitForCalls } = blockingInvoker();
+		const { url } = await createGateway(invoker);
+		const sessionId = await initializeSession(url);
+		const pending = await sendHttp(url, { method: 'POST', headers: legacyHeaders(sessionId), body: JSON.stringify({ jsonrpc: '2.0', id: 'slow', method: 'tools/call', params: { name: 'wait', arguments: {} } }) });
+		await waitForCalls(1);
+		const cancel = await httpRequest(url, { headers: legacyHeaders(sessionId), body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'slow' } }) });
+		assert.strictEqual(cancel.status, 202, 'a POST with only a notification is 202');
+		const response = (await pending.response)!;
+		await response.ended;
+		assert.deepStrictEqual([response.status, response.contentType.startsWith('text/event-stream'), response.messages], [200, true, []]);
+		assert.strictEqual(calls[0].context?.token.isCancellationRequested, true);
+	});
+
+	test('2025-11-25 SEP-1699 polling: test_reconnection closes the POST stream and the result is replayed on GET with Last-Event-ID', async () => {
+		const { url, route } = await createGateway();
+		const sessionId = await initializeSession(url);
+		const call = await openHttp(url, { method: 'POST', headers: legacyHeaders(sessionId), body: JSON.stringify({ jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'test_reconnection', arguments: {} } }) });
+		assert.ok(call.contentType.startsWith('text/event-stream'));
+		await call.ended;
+		const priming = call.events[0];
+		assert.ok(priming.id, 'the priming event comes first, with an id');
+		assert.deepStrictEqual([priming.retry, priming.data], [LEGACY_SSE_RETRY_MS, '']);
+		assert.deepStrictEqual(call.messages, [], 'the stream closed before the result');
+		assert.ok(call.text.endsWith(`retry: ${LEGACY_SSE_RETRY_MS}\n\n`), 'a retry hint before the close');
+
+		const resumed = await openHttp(url, { method: 'GET', headers: getHeaders(sessionId, { 'Last-Event-ID': priming.id! }) });
+		assert.strictEqual(resumed.status, 200);
+		const response = await resumed.messageWhere(m => m.id === 10);
+		assert.deepStrictEqual((response.result as MCPLegacy.CallToolResult).content, [{ type: 'text', text: 'Reconnection test completed' }]);
+		await resumed.ended;
+		assert.ok(resumed.events.every(e => e.id !== undefined && e.data !== ''), 'replayed events carry their ids; no priming on a resumed stream');
+		assert.strictEqual(route.getSession(sessionId)?.streamCount, 0, 'a resumed request stream is not one of the session\'s GET streams');
+
+		// The request is over: resuming again replays its response and ends at once.
+		const again = await openHttp(url, { method: 'GET', headers: getHeaders(sessionId, { 'Last-Event-ID': priming.id! }) });
+		await again.ended;
+		assert.deepStrictEqual(again.messages.map(m => (m as IJsonRpcBody).id), [10]);
+		// Events are never replayed on another session's streams.
+		const other = await initializeSession(url);
+		const foreign = await openHttp(url, { method: 'GET', headers: getHeaders(other, { 'Last-Event-ID': priming.id! }) });
+		const fresh = await foreign.event(0);
+		assert.strictEqual(fresh.data, '', 'an id of another session starts a fresh stream (a priming event)');
+		foreign.close();
+		await whenResponsesClosed(route, () => route.openResponses === 0);
+	});
+
+	test('a GET stream resumed with Last-Event-ID gets what it missed and carries on; an open stream cannot be resumed twice', async () => {
+		const { url, route } = await createGateway();
+		const sessionId = await initializeSession(url);
+		const first = await openHttp(url, { method: 'GET', headers: getHeaders(sessionId) });
+		const priming = await first.event(0);
+		const conflict = await httpRequest(url, { method: 'GET', headers: getHeaders(sessionId, { 'Last-Event-ID': priming.id! }) });
+		assert.deepStrictEqual([conflict.status, (jsonOf(conflict) as IJsonRpcBody).error?.code], [409, LEGACY_TRANSPORT_ERROR]);
+		first.close();
+		await whenResponsesClosed(route, () => route.getSession(sessionId)?.streamCount === 0);
+
+		const trigger = (id: number) => post(url, { headers: legacyHeaders(sessionId), body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'test_trigger_tool_change', arguments: {} } }) });
+		await trigger(2);
+		const resumed = await openHttp(url, { method: 'GET', headers: getHeaders(sessionId, { 'Last-Event-ID': priming.id! }) });
+		const missed = await resumed.message(0);
+		assert.strictEqual(missed.method, 'notifications/tools/list_changed', 'the change made while no stream was open');
+		assert.strictEqual(route.getSession(sessionId)?.streamCount, 1);
+		await trigger(3);
+		await resumed.message(1);
+		assert.deepStrictEqual(resumed.messages.map(m => (m as { method: string }).method), ['notifications/tools/list_changed', 'notifications/tools/list_changed']);
+
+		const unknown = await openHttp(url, { method: 'GET', headers: getHeaders(sessionId, { 'Last-Event-ID': 'not-an-id' }) });
+		assert.strictEqual((await unknown.event(0)).data, '', 'an unknown id starts a fresh stream');
+		assert.strictEqual(route.getSession(sessionId)?.streamCount, 2);
+		// One stream only: the most recent open GET stream gets the next change.
+		await trigger(4);
+		await unknown.messageWhere(m => m.method === 'notifications/tools/list_changed');
+		assert.strictEqual(resumed.messages.length, 2, 'the older stream did not get it too');
+		resumed.close();
+		unknown.close();
+		await whenResponsesClosed(route, () => route.openResponses === 0);
+	});
+
 	test('stopping the service ends listen streams with their result and closes sessions', async () => {
 		const { url, service, route } = await createGateway();
 		const sessionId = await initializeSession(url);
@@ -325,22 +623,105 @@ suite('MCP - GatewayRoute (HTTP)', () => {
 		const listen = modernRequest('subscriptions/listen', { notifications: { toolsListChanged: true } }, 'l');
 		const stream = await openHttp(url, { method: 'POST', headers: listen.headers, body: listen.body });
 		await stream.message(0);
-		route.closeAllConnections();
+		// The real shutdown path: the service stops its server, and the routes end their long-lived streams first.
+		service.dispose();
 		await stream.ended;
 		await get.ended;
 		const final = stream.messages[stream.messages.length - 1] as IJsonRpcBody;
 		assert.strictEqual(final.id, 'l');
 		assert.strictEqual(final.result?.resultType, 'complete');
 		assert.strictEqual(route.sessionCount, 0);
-		assert.ok(service.port !== undefined);
+		assert.strictEqual(service.port, undefined, 'the server is stopped');
 	});
 
-	test('the hidden tool appears after the trigger (list changes reach the upstream state)', async () => {
-		const { url, invoker } = await createGateway();
+	test('the hidden tool appears after the trigger tool is called (list changes reach the upstream state)', async () => {
+		const { url } = await createGateway();
 		const before = await post(url, modernRequest('tools/list', {}, 1));
 		assert.ok(!(before.body.result?.tools as Array<{ name: string }>).some(t => t.name === CONFORMANCE_HIDDEN_TOOL));
-		(invoker as McpGatewayConformanceInvoker).setToolHidden(CONFORMANCE_HIDDEN_TOOL, false);
-		const after = await post(url, modernRequest('tools/list', {}, 2));
+		const trigger = await post(url, modernRequest('tools/call', { name: 'test_trigger_tool_change', arguments: {} }, 2));
+		assert.strictEqual(trigger.status, 200);
+		const after = await post(url, modernRequest('tools/list', {}, 3));
 		assert.ok((after.body.result?.tools as Array<{ name: string }>).some(t => t.name === CONFORMANCE_HIDDEN_TOOL));
+		const hidden = await post(url, modernRequest('tools/call', { name: CONFORMANCE_HIDDEN_TOOL, arguments: {} }, 4));
+		assert.deepStrictEqual(hidden.body.result?.content, [{ type: 'text', text: 'hidden' }]);
+	});
+
+	test('createGateway: one route per server of an IPC-style invoker, with its optional methods absent', async () => {
+		const onDidUpdateResource = store.add(new Emitter<{ readonly serverId: string; readonly uri: string }>());
+		const onDidChangeServers = store.add(new Emitter<readonly IMcpGatewayServerDescriptor[]>());
+		const capabilitiesRead = new DeferredPromise<void>();
+		let capabilityCalls = 0;
+		const invoker: IMcpGatewayToolInvoker = {
+			onDidChangeServers: onDidChangeServers.event,
+			onDidChangeTools: Event.None,
+			onDidChangeResources: Event.None,
+			onDidUpdateResource: onDidUpdateResource.event,
+			listServers: () => [{ id: 'a', label: 'Server A' }, { id: 'b', label: 'Server B' }, { id: 'c', label: 'Server C' }],
+			getServerCapabilities: async serverId => {
+				if (++capabilityCalls === 3) {
+					capabilitiesRead.complete();
+				}
+				switch (serverId) {
+					case 'a': return { tools: { listChanged: true }, prompts: { listChanged: false }, resources: { subscribe: true, listChanged: false }, completions: true, logging: false };
+					case 'b': return { tools: { listChanged: false }, resources: { subscribe: true } };
+					default: return undefined;
+				}
+			},
+			listToolsForServer: async serverId => [{ name: `tool_${serverId}`, description: 'A tool', inputSchema: { type: 'object' } }],
+			callToolForServer: async (serverId, name) => ({ content: [{ type: 'text', text: `${serverId}:${name}` }] }),
+			listResourcesForServer: async () => [],
+			readResourceForServer: async (serverId, uri) => ({ contents: [{ uri, text: serverId }] }),
+			listResourceTemplatesForServer: async () => [],
+		};
+		const service = store.add(new McpGatewayService(store.add(new NullLoggerService())));
+		const info = await service.createGateway('client-1', invoker);
+		assert.deepStrictEqual(info.servers.map(s => s.label), ['Server A', 'Server B', 'Server C']);
+		const [a, b, c] = info.servers.map(s => s.address.toString(true));
+		await capabilitiesRead.p;
+		await timeout(0);
+
+		// Server A declares its capabilities: they are advertised as declared, and what the invoker cannot serve is empty.
+		const discoverA = await post(a, modernRequest('server/discover', {}, 1));
+		assert.deepStrictEqual(discoverA.body.result?.capabilities, { tools: { listChanged: true }, resources: { subscribe: true, listChanged: false }, prompts: { listChanged: false }, completions: {} });
+		assert.deepStrictEqual((await post(a, modernRequest('prompts/list', {}, 2))).body.result?.prompts, []);
+		const completion = await post(a, modernRequest('completion/complete', { ref: { type: 'ref/prompt', name: 'p' }, argument: { name: 'x', value: '' } }, 3));
+		assert.deepStrictEqual(completion.body.result?.completion, { values: [], total: 0, hasMore: false });
+		const getPrompt = await post(a, modernRequest('prompts/get', { name: 'p' }, 4));
+		assert.deepStrictEqual([getPrompt.status, getPrompt.body.error?.code], [400, MCP.INVALID_PARAMS]);
+		// The legacy initialize advertises the same capabilities.
+		const init = await httpRequest(a, { headers: LEGACY_HEADERS, body: INITIALIZE() });
+		assert.deepStrictEqual((jsonOf(init) as IJsonRpcBody).result?.capabilities, { tools: { listChanged: true }, resources: { subscribe: true, listChanged: false }, prompts: { listChanged: false }, completions: {} });
+
+		// Servers B (declared without prompts) and C (nothing declared, derived from the methods) have no prompts or completions.
+		for (const url of [b, c]) {
+			const prompts = await post(url, modernRequest('prompts/list', {}, 5));
+			assert.deepStrictEqual([prompts.status, prompts.body.error?.code], [404, MCP.METHOD_NOT_FOUND], url);
+			const complete = await post(url, modernRequest('completion/complete', { ref: { type: 'ref/prompt', name: 'p' }, argument: { name: 'x', value: '' } }, 6));
+			assert.strictEqual(complete.status, 404, url);
+		}
+		const discoverC = await post(c, modernRequest('server/discover', {}, 7));
+		assert.deepStrictEqual(discoverC.body.result?.capabilities, { tools: { listChanged: true }, resources: { subscribe: false, listChanged: true }, logging: {} });
+		assert.deepStrictEqual((await post(b, modernRequest('tools/call', { name: 'tool_b', arguments: {} }, 8))).body.result?.content, [{ type: 'text', text: 'b:tool_b' }]);
+
+		// A resource update reaches only the routes of its server.
+		const listen = (url: string) => {
+			const request = modernRequest('subscriptions/listen', { notifications: { resourceSubscriptions: ['test://x'] } }, 'r');
+			return openHttp(url, { method: 'POST', headers: request.headers, body: request.body });
+		};
+		const listenA = await listen(a);
+		const listenB = await listen(b);
+		await listenA.message(0);
+		await listenB.message(0);
+		onDidUpdateResource.fire({ serverId: 'b', uri: 'test://x' });
+		onDidUpdateResource.fire({ serverId: 'a', uri: 'test://x' });
+		await listenB.messageWhere(m => m.method === 'notifications/resources/updated');
+		await listenA.messageWhere(m => m.method === 'notifications/resources/updated');
+		assert.strictEqual(listenA.messages.filter(m => (m as { method?: string }).method === 'notifications/resources/updated').length, 1);
+		assert.strictEqual(listenB.messages.filter(m => (m as { method?: string }).method === 'notifications/resources/updated').length, 1);
+
+		await service.disposeGateway(info.gatewayId);
+		await listenA.ended;
+		await listenB.ended;
+		assert.strictEqual(service.port, undefined, 'the last gateway stops the server');
 	});
 });

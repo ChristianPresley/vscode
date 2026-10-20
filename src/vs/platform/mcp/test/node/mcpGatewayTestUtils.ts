@@ -207,6 +207,48 @@ export async function openHttp(url: string, options: IHttpRequestOptions = {}): 
 	});
 }
 
+export interface IPendingHttp {
+	/** Settles with the response once its headers are in; undefined when the request failed or was aborted first. */
+	readonly response: Promise<HttpConnection | undefined>;
+	/** Drops the connection (the client goes away), also before the response arrived. */
+	abort(): void;
+}
+
+/** Sends a request without waiting for its response. */
+export async function sendHttp(url: string, options: IHttpRequestOptions = {}): Promise<IPendingHttp> {
+	const { request } = await import('http');
+	const target = new URL(url);
+	const headers: Record<string, string | number> = { ...options.headers };
+	if (options.body !== undefined) {
+		headers['Content-Length'] = Buffer.byteLength(options.body);
+	}
+	const req = request({ hostname: target.hostname, port: target.port, path: target.pathname + target.search, method: options.method ?? 'POST', headers, agent: false });
+	const response = new Promise<HttpConnection | undefined>(resolve => {
+		req.on('response', res => resolve(new HttpConnection(req, res)));
+		req.on('error', () => resolve(undefined));
+		req.on('close', () => resolve(undefined));
+	});
+	if (options.body !== undefined) {
+		req.write(options.body);
+	}
+	req.end();
+	return { response, abort: () => req.destroy() };
+}
+
+/** Sends raw bytes on a fresh connection and resolves with everything the server answered until it closed the connection. */
+export async function rawHttp(port: number, text: string): Promise<string> {
+	const { connect } = await import('net');
+	return new Promise<string>((resolve, reject) => {
+		const socket = connect(port, '127.0.0.1');
+		let data = '';
+		socket.setEncoding('utf8');
+		socket.on('data', (chunk: string) => { data += chunk; });
+		socket.on('end', () => resolve(data));
+		socket.on('error', reject);
+		socket.write(text);
+	});
+}
+
 export const TEST_CLIENT_INFO: MCP.Implementation = { name: 'gateway-test-client', version: '1.0.0' };
 
 /** The `_meta` of a 2026-07-28 request. */

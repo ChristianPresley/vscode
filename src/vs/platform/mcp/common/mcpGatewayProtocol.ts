@@ -5,7 +5,7 @@
 
 import { IJsonRpcError, IJsonRpcRequest, JsonRpcId } from '../../../base/common/jsonRpcProtocol.js';
 import { MCP_PROTOCOL_VERSION_HEADER, verifyMirroredHeaders } from './mcpHttpHeaders.js';
-import { eraForProtocolVersion, META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_LOG_LEVEL, META_PROGRESS_TOKEN, META_PROTOCOL_VERSION, META_SERVER_INFO, McpProtocolEra, MODERN_MCP_PROTOCOL_VERSIONS } from './mcpProtocolVersions.js';
+import { eraForProtocolVersion, LEGACY_MCP_PROTOCOL_VERSIONS, META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_LOG_LEVEL, META_PROGRESS_TOKEN, META_PROTOCOL_VERSION, META_SERVER_INFO, McpProtocolEra, MODERN_MCP_PROTOCOL_VERSIONS } from './mcpProtocolVersions.js';
 import { MCP } from './modelContextProtocol.js';
 
 /**
@@ -254,25 +254,98 @@ export function hasClientCapability(capabilities: MCP.ClientCapabilities | undef
 	}
 }
 
+const SUBSCRIPTION_FILTER_FLAGS = ['toolsListChanged', 'promptsListChanged', 'resourcesListChanged'] as const;
+
+/**
+ * Checks the shape of a `subscriptions/listen` filter: an object whose list
+ * flags, when present, are booleans and whose `resourceSubscriptions`, when
+ * present, is an array of strings. Unknown keys are ignored. Returns the
+ * `-32602` error to answer, or undefined when the filter is well-formed.
+ */
+export function validateSubscriptionFilter(value: unknown): McpGatewayRpcError | undefined {
+	if (!isObject(value)) {
+		return new McpGatewayRpcError(MCP.INVALID_PARAMS, 'subscriptions/listen needs a notifications filter object');
+	}
+	for (const flag of SUBSCRIPTION_FILTER_FLAGS) {
+		if (value[flag] !== undefined && typeof value[flag] !== 'boolean') {
+			return new McpGatewayRpcError(MCP.INVALID_PARAMS, `notifications.${flag} must be a boolean`);
+		}
+	}
+	const uris = value.resourceSubscriptions;
+	if (uris !== undefined && (!Array.isArray(uris) || !uris.every(uri => typeof uri === 'string'))) {
+		return new McpGatewayRpcError(MCP.INVALID_PARAMS, 'notifications.resourceSubscriptions must be an array of strings');
+	}
+	return undefined;
+}
+
 /**
  * The filter a server honours for a `subscriptions/listen` request: every
  * requested kind the server can actually produce (per its capabilities).
+ * Defensive about the shape: a flag counts only when it is `true`, and only
+ * the string entries of an actual `resourceSubscriptions` array are kept.
  */
 export function honorSubscriptionFilter(requested: MCP.SubscriptionFilter, serverCapabilities: MCP.ServerCapabilities): MCP.SubscriptionFilter {
 	const honoured: MCP.SubscriptionFilter = {};
-	if (requested.toolsListChanged && serverCapabilities.tools?.listChanged) {
+	if (!isObject(requested)) {
+		return honoured;
+	}
+	if (requested.toolsListChanged === true && serverCapabilities.tools?.listChanged) {
 		honoured.toolsListChanged = true;
 	}
-	if (requested.promptsListChanged && serverCapabilities.prompts?.listChanged) {
+	if (requested.promptsListChanged === true && serverCapabilities.prompts?.listChanged) {
 		honoured.promptsListChanged = true;
 	}
-	if (requested.resourcesListChanged && serverCapabilities.resources?.listChanged) {
+	if (requested.resourcesListChanged === true && serverCapabilities.resources?.listChanged) {
 		honoured.resourcesListChanged = true;
 	}
-	if (requested.resourceSubscriptions && requested.resourceSubscriptions.length > 0 && serverCapabilities.resources?.subscribe) {
-		honoured.resourceSubscriptions = requested.resourceSubscriptions.filter(uri => typeof uri === 'string');
+	const requestedUris: unknown = requested.resourceSubscriptions;
+	const uris = Array.isArray(requestedUris) ? requestedUris.filter((uri): uri is string => typeof uri === 'string') : [];
+	if (uris.length > 0 && serverCapabilities.resources?.subscribe) {
+		honoured.resourceSubscriptions = uris;
 	}
 	return honoured;
+}
+
+/** The 2025-11-25 transports' generic error code for a refused HTTP request (`Bad Request: …`, `Conflict: …`). */
+export const LEGACY_TRANSPORT_ERROR = -32000;
+
+/**
+ * The 2025-11-25 rule for the `MCP-Protocol-Version` header of a session's
+ * requests after `initialize` (POST, GET and DELETE): an absent header is
+ * allowed (the version negotiated by `initialize` applies), a revision of the
+ * `initialize` era is accepted (as the TypeScript SDK does, a supported value
+ * other than the negotiated one is not refused), and anything else, an
+ * invalid or unsupported value, MUST be answered with 400 Bad Request.
+ */
+export function validateLegacyProtocolVersionHeader(headers: Readonly<Record<string, string>>): McpGatewayRpcError | undefined {
+	const raw = headers[MCP_PROTOCOL_VERSION_HEADER.toLowerCase()];
+	if (raw === undefined) {
+		return undefined;
+	}
+	const version = raw.trim();
+	if (LEGACY_MCP_PROTOCOL_VERSIONS.includes(version)) {
+		return undefined;
+	}
+	return new McpGatewayRpcError(LEGACY_TRANSPORT_ERROR, `Bad Request: Unsupported protocol version: ${JSON.stringify(raw)} (supported versions: ${LEGACY_MCP_PROTOCOL_VERSIONS.join(', ')})`);
+}
+
+/** The first legacy revision whose clients accept SSE events with empty `data` (SEP-1699 priming events). */
+export const FIRST_PRIMING_PROTOCOL_VERSION = '2025-11-25';
+
+/**
+ * Whether a legacy session may get SSE priming events (an `id`, a `retry` and
+ * empty `data`): only from 2025-11-25 on. Older clients try to parse the empty
+ * data as JSON, so their streams get a comment instead and are not closed for
+ * polling. Revisions are dates, so they compare as strings.
+ */
+export function legacyVersionSupportsPriming(protocolVersion: string | undefined): boolean {
+	return protocolVersion !== undefined && LEGACY_MCP_PROTOCOL_VERSIONS.includes(protocolVersion) && protocolVersion >= FIRST_PRIMING_PROTOCOL_VERSION;
+}
+
+/** The `_meta` client info of a message (request or notification), when it is well-formed. */
+export function clientInfoFromMeta(body: unknown): MCP.Implementation | undefined {
+	const info = readMeta(body)?.[META_CLIENT_INFO];
+	return isObject(info) && typeof info.name === 'string' && typeof info.version === 'string' ? info as unknown as MCP.Implementation : undefined;
 }
 
 const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);

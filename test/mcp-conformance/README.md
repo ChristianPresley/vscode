@@ -15,7 +15,7 @@ The suite has two legs, and both are measured at each specification revision the
 | `run.test.ts` | Tests of the harness with the suite stubbed out (`node --test run.test.ts`). |
 | `expected-failures-client-<revision>.yml` | The known failing checks of the scored client scenarios of a revision. Today these are the authorization scenarios, because the client has no OAuth support yet (milestone M5 empties both lists). |
 | `expected-failures-server-<revision>.yml` | The same for the server leg. Both lists are empty. |
-| `expected-failures-unscored.yml` | The known failures of the scenarios the requirement sets run without scoring (`not_scored`): the six authorization-extension client scenarios, as whole scenarios. A commented section takes the failing `tasks-*` checks of the server leg. |
+| `expected-failures-unscored.yml` | The known failures of the scenarios the requirement sets run without scoring (`not_scored`): the six authorization-extension client scenarios, as whole scenarios, and the `wire-schema-valid` check of the eight `tasks-*` server scenarios that create a task (the suite validates a CreateTaskResult against CallToolResult, which requires `content`). |
 | `requirement-matrix.md` | One row per scenario of both requirement sets, legs and revisions, with its status: `driven`, `gap` or `n-a`. |
 | `requirements-2026-07-28.json` | A skeleton of the normative sentences of the 2026-07-28 specification, with the ids of the zig-sdk extraction. |
 | `requirement-tests.json` | Maps those requirements to the tests and conformance scenarios that cover them. |

@@ -35,7 +35,14 @@ import { ExtensionHostKind, extensionHostKindToString } from '../../services/ext
 import { IExtensionService } from '../../services/extensions/common/extensions.js';
 import { IExtHostContext, extHostNamedCustomer } from '../../services/extensions/common/extHostCustomers.js';
 import { Proxied } from '../../services/extensions/common/proxyIdentifier.js';
-import { ExtHostContext, ExtHostMcpShape, IMcpAuthenticationDetails, IMcpAuthenticationOptions, IAuthMetadataSource, MainContext, MainThreadMcpShape } from '../common/extHost.protocol.js';
+import { ExtHostContext, ExtHostMcpShape, IMcpAuthenticationDetails, IMcpAuthenticationOptions, IAuthMetadataSource, IMcpGatewayServerDto, MainContext, MainThreadMcpShape } from '../common/extHost.protocol.js';
+
+/** A gateway server for the extension host; `grpcAddress` only when the gateway serves gRPC. */
+function gatewayServerDto(server: IMcpGatewayResultServer): IMcpGatewayServerDto {
+	return server.grpcAddress
+		? { label: server.label, address: server.address, grpcAddress: server.grpcAddress }
+		: { label: server.label, address: server.address };
+}
 
 @extHostNamedCustomer(MainContext.MainThreadMcp)
 export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
@@ -566,7 +573,7 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		this._telemetryService.publicLog2<IAuthMetadataSource, McpAuthSetupClassification>('mcp/authSetup', data);
 	}
 
-	async $startMcpGateway(chatSessionResource?: UriComponents): Promise<{ servers: { label: string; address: URI }[]; gatewayId: string } | undefined> {
+	async $startMcpGateway(chatSessionResource?: UriComponents): Promise<{ servers: IMcpGatewayServerDto[]; gatewayId: string } | undefined> {
 		const result = await this._mcpGatewayService.createGateway(
 			this._extHostContext.extensionHostKind === ExtensionHostKind.Remote,
 			chatSessionResource ? URI.revive(chatSessionResource) : undefined,

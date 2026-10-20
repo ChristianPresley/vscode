@@ -26,7 +26,7 @@ import { StorageScope } from '../../../platform/storage/common/storage.js';
 import { extensionPrefixedIdentifier, IMcpMessageEnvelope, IMcpRequestAbort, McpCollectionDefinition, McpConnectionState, McpServerDefinition, McpServerEnvironmentVariableExpansion, McpServerLaunch, McpServerStaticMetadata, McpServerStaticToolAvailability, McpServerTransportHTTP, McpServerTransportType, UserInteractionRequiredError } from '../../contrib/mcp/common/mcpTypes.js';
 import { MCPLegacy } from '../../contrib/mcp/common/modelContextProtocolLegacy.js';
 import { checkProposedApiEnabled, isProposedApiEnabled } from '../../services/extensions/common/extensions.js';
-import { ExtHostMcpShape, IMcpAuthenticationDetails, IAuthMetadataSource, IStartMcpOptions, MainContext, MainThreadMcpShape, IAuthResourceMetadataSource, IAuthServerMetadataSource } from './extHost.protocol.js';
+import { ExtHostMcpShape, IMcpAuthenticationDetails, IAuthMetadataSource, IStartMcpOptions, MainContext, MainThreadMcpShape, IAuthResourceMetadataSource, IAuthServerMetadataSource, IMcpGatewayServerDto } from './extHost.protocol.js';
 import { IExtHostInitDataService } from './extHostInitDataService.js';
 import { IExtHostRpcService } from './extHostRpcService.js';
 import * as Convert from './extHostTypeConverters.js';
@@ -294,10 +294,7 @@ export class ExtHostMcpService extends Disposable implements IExtHostMpcService 
 		}
 
 		const gatewayId = result.gatewayId;
-		const servers: vscode.McpGatewayServer[] = result.servers.map(s => ({
-			label: s.label,
-			address: URI.revive(s.address),
-		}));
+		const servers: vscode.McpGatewayServer[] = result.servers.map(reviveGatewayServer);
 		const onDidChangeServers = new Emitter<readonly vscode.McpGatewayServer[]>();
 
 		this._activeGateways.set(gatewayId, { servers, onDidChangeServers });
@@ -314,16 +311,13 @@ export class ExtHostMcpService extends Disposable implements IExtHostMpcService 
 	}
 
 	/** Called by main thread to notify that a gateway's server set has changed. */
-	$onDidChangeGatewayServers(gatewayId: string, newServers: { label: string; address: UriComponents }[]): void {
+	$onDidChangeGatewayServers(gatewayId: string, newServers: IMcpGatewayServerDto[]): void {
 		const gateway = this._activeGateways.get(gatewayId);
 		if (!gateway) {
 			return;
 		}
 
-		const servers: vscode.McpGatewayServer[] = newServers.map(s => ({
-			label: s.label,
-			address: URI.revive(s.address),
-		}));
+		const servers: vscode.McpGatewayServer[] = newServers.map(reviveGatewayServer);
 		gateway.servers.length = 0;
 		gateway.servers.push(...servers);
 		gateway.onDidChangeServers.fire(servers);
@@ -341,6 +335,13 @@ function stringifyError(err: unknown): string {
 		cause = cause instanceof Error ? cause.cause : undefined;
 	}
 	return msg;
+}
+
+/** A gateway server for the API; `grpcAddress` only when the gateway serves gRPC. */
+function reviveGatewayServer(server: IMcpGatewayServerDto): vscode.McpGatewayServer {
+	return server.grpcAddress
+		? { label: server.label, address: URI.revive(server.address), grpcAddress: URI.revive(server.grpcAddress) }
+		: { label: server.label, address: URI.revive(server.address) };
 }
 
 const enum HttpMode {

@@ -4,20 +4,22 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { timeout } from '../../../../base/common/async.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { CancellationError } from '../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { IJsonRpcErrorResponse, IJsonRpcSuccessResponse, JsonRpcId } from '../../../../base/common/jsonRpcProtocol.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
+import { runWithFakedTimers } from '../../../../base/test/common/timeTravelScheduler.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { IMcpGatewaySingleServerInvoker } from '../../common/mcpGateway.js';
+import { IMcpGatewayInvokeContext, IMcpGatewaySingleServerInvoker } from '../../common/mcpGateway.js';
 import { MCP } from '../../common/modelContextProtocol.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { CONFORMANCE_HIDDEN_TOOL, CONFORMANCE_INSTRUCTIONS, CONFORMANCE_SERVER_INFO, McpGatewayConformanceInvoker } from '../../node/mcpGatewayConformanceInvoker.js';
 import { IMcpGatewayNotification, McpGatewayDispatcher } from '../../node/mcpGatewayDispatcher.js';
 import { McpGatewaySealedState } from '../../node/mcpGatewaySealedState.js';
-import { IMcpGatewayRequestBroker, IMcpGatewaySessionStream, isInitializeMessage, McpGatewaySession } from '../../node/mcpGatewaySession.js';
+import { containsRequest, IMcpGatewayRequestBroker, IMcpGatewaySessionStream, isInitializeMessage, LEGACY_SESSION_IDLE_TIMEOUT_MS, McpGatewaySession } from '../../node/mcpGatewaySession.js';
 
 /** A session stream that records what it carries; server requests get their ids from the session. */
 class TestStream extends Disposable implements IMcpGatewaySessionStream {
@@ -79,9 +81,41 @@ suite('MCP - GatewaySession', () => {
 		return { session, invoker: upstream, disposedCount: () => disposed };
 	}
 
-	async function initialize(session: McpGatewaySession, capabilities: MCP.ClientCapabilities = { sampling: {}, elicitation: {}, roots: {} }): Promise<void> {
-		await session.handleIncoming({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities, clientInfo: { name: 'test-client', version: '1.0.0' } } });
+	async function initialize(session: McpGatewaySession, capabilities: MCP.ClientCapabilities = { sampling: {}, elicitation: {}, roots: {} }, protocolVersion = '2025-11-25'): Promise<void> {
+		await session.handleIncoming({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion, capabilities, clientInfo: { name: 'test-client', version: '1.0.0' } } });
 		await session.handleIncoming({ jsonrpc: '2.0', method: 'notifications/initialized' });
+	}
+
+	/** An invoker whose `wait` tool records its invoke context and runs until it is cancelled. */
+	function waitingInvoker() {
+		const started = store.add(new Emitter<IMcpGatewayInvokeContext | undefined>());
+		const contexts: Array<IMcpGatewayInvokeContext | undefined> = [];
+		const invoker: IMcpGatewaySingleServerInvoker = {
+			onDidChangeTools: Event.None,
+			onDidChangeResources: Event.None,
+			listTools: async () => [{ name: 'wait', description: 'Waits for cancellation', inputSchema: { type: 'object' } }],
+			callTool: async (_name, _args, context) => {
+				contexts.push(context);
+				started.fire(context);
+				await new Promise<void>(resolve => {
+					if (!context || context.token.isCancellationRequested) {
+						resolve();
+						return;
+					}
+					const listener = context.token.onCancellationRequested(() => {
+						listener.dispose();
+						resolve();
+					});
+				});
+				return { content: [{ type: 'text', text: 'finished' }] };
+			},
+			listResources: async () => [],
+			readResource: async () => ({ contents: [] }),
+			listResourceTemplates: async () => [],
+		};
+		const dispatcher = store.add(new McpGatewayDispatcher('route-1', logger, invoker, new McpGatewaySealedState()));
+		const session = (id: string) => store.add(new McpGatewaySession(id, logger, dispatcher, invoker, () => { }));
+		return { session, started: started.event, contexts };
 	}
 
 	function resultOf(responses: unknown[]): Record<string, unknown> {
@@ -173,6 +207,95 @@ suite('MCP - GatewaySession', () => {
 		stream.end();
 		assert.strictEqual(session.streamCount, 0);
 	});
+
+	test('a message that belongs to no request goes on one stream only: the most recent open GET stream', async () => {
+		const { session, invoker } = setup();
+		const conformance = invoker as McpGatewayConformanceInvoker;
+		await initialize(session);
+		const older = store.add(new TestStream(session));
+		const newer = store.add(new TestStream(session));
+		session.attachStream(older);
+		session.attachStream(newer);
+		conformance.setToolHidden(CONFORMANCE_HIDDEN_TOOL, false);
+		assert.deepStrictEqual([older.methods, newer.methods], [[], ['notifications/tools/list_changed']]);
+		newer.end();
+		conformance.setPromptHidden('test_hidden_prompt', false);
+		assert.deepStrictEqual([older.methods, newer.methods], [['notifications/prompts/list_changed'], ['notifications/tools/list_changed']], 'the older stream takes over once the newer one closed');
+		await session.handleIncoming({ jsonrpc: '2.0', id: 1, method: 'resources/subscribe', params: { uri: 'test://watched-resource' } });
+		conformance.touchResource('test://watched-resource');
+		assert.deepStrictEqual(older.methods, ['notifications/prompts/list_changed', 'notifications/resources/updated']);
+		assert.strictEqual(newer.notifications.length, 1);
+		older.end();
+	});
+
+	test('cancellation is scoped to the session: another session\'s request with the same id runs on', async () => {
+		const { session, started } = waitingInvoker();
+		const a = session('a');
+		const b = session('b');
+		await initialize(a);
+		await initialize(b);
+		const startedA = Event.toPromise(started);
+		const callA = a.handleIncoming({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'wait', arguments: {} } }, store.add(new TestStream(a)));
+		await startedA;
+		const startedB = Event.toPromise(started);
+		const callB = b.handleIncoming({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'wait', arguments: {} } }, store.add(new TestStream(b)));
+		const contextB = await startedB;
+		await b.handleIncoming({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 7 } });
+		assert.deepStrictEqual(await callB, [], 'session b\'s request was cancelled');
+		assert.strictEqual(contextB?.token.isCancellationRequested, true);
+		assert.strictEqual(a.cancelRequest(7), true, 'session a\'s request with the same id was still in flight');
+		assert.deepStrictEqual(await callA, []);
+	});
+
+	test('the polling hook (closeSseStream) is offered from 2025-11-25 on, when the sink can close for polling', async () => {
+		const run = async (version: string, closeForPolling: boolean) => {
+			const { session, started } = waitingInvoker();
+			const s = session('s');
+			await initialize(s, {}, version);
+			let closed = 0;
+			const sink = store.add(new TestStream(s));
+			const target = closeForPolling ? Object.assign(sink, { closeForPolling: () => { closed++; return true; } }) : sink;
+			const cts = new CancellationTokenSource();
+			const callStarted = Event.toPromise(started);
+			const call = s.handleIncoming({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'wait', arguments: {} } }, target, {}, cts.token);
+			const hook = (await callStarted)?.closeSseStream;
+			hook?.();
+			cts.cancel();
+			await call;
+			cts.dispose();
+			return { offered: typeof hook === 'function', closed, priming: s.supportsPriming };
+		};
+		assert.deepStrictEqual(await run('2025-11-25', true), { offered: true, closed: 1, priming: true });
+		assert.deepStrictEqual(await run('2025-06-18', true), { offered: false, closed: 0, priming: false });
+		assert.deepStrictEqual(await run('2025-03-26', true), { offered: false, closed: 0, priming: false });
+		assert.deepStrictEqual(await run('2025-11-25', false), { offered: false, closed: 0, priming: true }, 'a sink that cannot close for polling offers no hook');
+	});
+
+	test('an idle session expires; messages in flight and open responses keep it alive', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
+		const { session, disposedCount } = setup();
+		await initialize(session);
+		await timeout(LEGACY_SESSION_IDLE_TIMEOUT_MS - 1000);
+		assert.strictEqual(disposedCount(), 0);
+		// A request restarts the clock.
+		await session.handleIncoming({ jsonrpc: '2.0', id: 1, method: 'ping' });
+		await timeout(LEGACY_SESSION_IDLE_TIMEOUT_MS - 1000);
+		assert.strictEqual(disposedCount(), 0);
+		const stream = store.add(new TestStream(session));
+		session.attachStream(stream);
+		await timeout(LEGACY_SESSION_IDLE_TIMEOUT_MS * 2);
+		assert.strictEqual(disposedCount(), 0, 'an open stream keeps the session');
+		const otherResponse = new Emitter<void>();
+		session.holdOpen(otherResponse.event);
+		stream.end();
+		await timeout(LEGACY_SESSION_IDLE_TIMEOUT_MS * 2);
+		assert.strictEqual(disposedCount(), 0, 'another open response (a resumed request stream) keeps it too');
+		otherResponse.fire();
+		otherResponse.dispose();
+		await timeout(LEGACY_SESSION_IDLE_TIMEOUT_MS - 1000);
+		assert.strictEqual(disposedCount(), 0);
+		await timeout(2000);
+		assert.strictEqual(disposedCount(), 1, 'disposed once idle for the whole timeout');
+	}));
 
 	test('logging/setLevel is stored and filters the log notifications of later calls', async () => {
 		const { session } = setup();
@@ -288,5 +411,12 @@ suite('MCP - GatewaySession', () => {
 		assert.strictEqual(isInitializeMessage([{ jsonrpc: '2.0', id: 1, method: 'initialize' }]), true);
 		assert.strictEqual(isInitializeMessage({ jsonrpc: '2.0', method: 'initialize' }), false);
 		assert.strictEqual(isInitializeMessage({ jsonrpc: '2.0', id: 1, method: 'tools/list' }), false);
+	});
+
+	test('containsRequest tells request POSTs from notification and response POSTs', () => {
+		assert.strictEqual(containsRequest({ jsonrpc: '2.0', id: 1, method: 'tools/list' }), true);
+		assert.strictEqual(containsRequest([{ jsonrpc: '2.0', method: 'notifications/initialized' }, { jsonrpc: '2.0', id: 'x', method: 'ping' }]), true);
+		assert.strictEqual(containsRequest({ jsonrpc: '2.0', method: 'notifications/initialized' }), false);
+		assert.strictEqual(containsRequest([{ jsonrpc: '2.0', id: 1, result: {} }]), false);
 	});
 });

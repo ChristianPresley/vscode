@@ -32,7 +32,8 @@ interface TaskEntry extends IDisposable {
 
 /**
  * Manages in-memory task state for server-side MCP tasks (sampling and elicitation).
- * Also tracks client-side tasks to survive handler reconnections.
+ * Also tracks client-side tasks to survive handler reconnections: the
+ * 2025-11-25 `McpTask` and the 2026-07-28 `McpModernTask` (Tasks extension).
  * Lifecycle is tied to the McpServer instance.
  */
 export class McpTaskManager extends Disposable {

@@ -74,6 +74,13 @@ export interface IMcpGatewayInvokeContext {
 	readonly progressToken?: MCP.ProgressToken;
 	readonly onProgress?: (progress: IMcpGatewayProgress) => void;
 	readonly onLog?: (level: MCP.LoggingLevel, data: unknown, logger?: string) => void;
+	/**
+	 * 2025-11-25 sessions (SEP-1699 polling): ends the request's SSE response
+	 * stream now, with a `retry` hint, while the request keeps running; what it
+	 * produces afterwards (its result included) is replayed when the client
+	 * reconnects with `Last-Event-ID`. Absent when the connection cannot resume.
+	 */
+	readonly closeSseStream?: () => void;
 	readonly token: CancellationToken;
 	readonly chatSessionResource?: string;
 }

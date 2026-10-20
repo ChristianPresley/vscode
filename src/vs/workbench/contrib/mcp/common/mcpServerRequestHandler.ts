@@ -19,7 +19,9 @@ import { collectHeaderAnnotations, McpHeaderAnnotation } from '../../../../platf
 import { eraForProtocolVersion, LATEST_MCP_PROTOCOL_VERSION, McpProtocolEra, META_SERVER_INFO, negotiateProtocolVersion, SUPPORTED_MCP_PROTOCOL_VERSIONS } from '../../../../platform/mcp/common/mcpProtocolVersions.js';
 import { MCP } from '../../../../platform/mcp/common/modelContextProtocol.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
+import { McpTasks } from '../../../../platform/mcp/common/modelContextProtocolTasks.js';
 import { buildClientCapabilities, buildEnvelope, buildRequestMeta, getResultType, IMcpRequestMetaBase, mapLogLevelToMcp, MAX_MRTR_ROUNDS, McpProtocolEvent, parseInputRequiredResult, PROBE_TIMEOUT_MS, validateElicitFormContent } from './mcpProtocolMeta.js';
+import { McpModernTask } from './mcpModernTask.js';
 import { IMcpMessageTransport } from './mcpRegistryTypes.js';
 import { IMcpListenHost, McpSubscriptionManager } from './mcpSubscriptions.js';
 import { IMcpTaskInternal, McpTaskManager } from './mcpTaskManager.js';
@@ -78,6 +80,8 @@ interface ISendOptions {
 	/** Result types the caller handles itself (besides `complete`). */
 	readonly acceptResultTypes?: readonly string[];
 }
+	/** Declare the Tasks extension (`io.modelcontextprotocol/tasks`) in this request's client capabilities (modern only). */
+	readonly tasks?: boolean;
 
 type ProbeOutcome =
 	| { readonly kind: 'modern'; readonly version: string; readonly result: MCP.DiscoverResult }
@@ -602,7 +606,7 @@ export class McpServerRequestHandler extends Disposable {
 		}
 		const version = options.version ?? this._negotiated?.protocolVersion ?? LATEST_MCP_PROTOCOL_VERSION;
 		const modern = eraForProtocolVersion(version) !== 'legacy';
-		const outParams = modern ? this._stampMeta(params ?? {}, version) : params;
+		const outParams = modern ? this._stampMeta(params ?? {}, version, options.tasks) : params;
 		const result = await this._sendRequestWithVersion<R>(version, method, outParams, token, options.deadlineMs, options.kind).result;
 		if (modern) {
 			this._noteServerInfo(result);
@@ -704,13 +708,18 @@ export class McpServerRequestHandler extends Disposable {
 		}
 	}
 
-	private _stampMeta(params: object, version: string): Record<string, unknown> {
+	private _stampMeta(params: object, version: string, tasks = false): Record<string, unknown> {
 		const record = params as Record<string, unknown>;
 		const callerMeta = typeof record._meta === 'object' && record._meta !== null ? record._meta as Record<string, unknown> : undefined;
-		return { ...record, _meta: buildRequestMeta(this._metaBase(version), callerMeta) };
+		return { ...record, _meta: buildRequestMeta(this._metaBase(version, tasks), callerMeta) };
 	}
 
-	private _metaBase(version: string): IMcpRequestMetaBase {
+	/**
+	 * The per-request `_meta` base. The Tasks extension is declared per request
+	 * (SEP-2575 per-request opt-in): on `tasks/*` and on the `tools/call`
+	 * requests that opted in, never on the others.
+	 */
+	private _metaBase(version: string, tasks = false): IMcpRequestMetaBase {
 		return {
 			protocolVersion: version,
 			clientInfo: this._clientInfo,
@@ -719,6 +728,7 @@ export class McpServerRequestHandler extends Disposable {
 				samplingTools: true,
 				elicitation: !!this._elicitationRequestHandler,
 			}),
+				tasks,
 			logLevel: this._logLevel,
 		};
 	}
@@ -985,14 +995,14 @@ export class McpServerRequestHandler extends Disposable {
 	 * Sends a request that may come back as `input_required`, answering the
 	 * server's input requests and re-sending until the result is complete.
 	 */
-	private async _sendWithInputs<R extends object>(method: 'tools/call' | 'prompts/get' | 'resources/read', params: object, token: CancellationToken, context?: IMcpToolCallContext, onStatusMessage?: (message: string) => void, acceptResultTypes?: readonly string[]): Promise<R> {
+	private async _sendWithInputs<R extends object>(method: 'tools/call' | 'prompts/get' | 'resources/read', params: object, token: CancellationToken, context?: IMcpToolCallContext, onStatusMessage?: (message: string) => void, acceptResultTypes?: readonly string[], tasks = false): Promise<R> {
 		const { inputResponses: _ignoredResponses, requestState: _ignoredState, ...base } = params as Record<string, unknown>;
 		let current: Record<string, unknown> = { ...base };
 		let rounds = 0;
 		const inputKinds: string[] = [];
 		const seenUrls = new Set<string>();
 		for (; ;) {
-			const result = await this._request<R | MCP.InputRequiredResult>(method, current, token, { acceptResultTypes: ['input_required', ...(acceptResultTypes ?? [])] });
+			const result = await this._request<R | MCP.InputRequiredResult>(method, current, token, { acceptResultTypes: ['input_required', ...(acceptResultTypes ?? [])], tasks });
 			const resultType = getResultType(result);
 			if (resultType !== 'input_required') {
 				if (rounds > 0) {
@@ -1070,6 +1080,23 @@ export class McpServerRequestHandler extends Disposable {
 		if (this.era !== 'modern') {
 			return undefined;
 		}
+	/**
+	 * Answers the input requests of a task waiting in `input_required` (the
+	 * Tasks extension) with the same handlers and checks as a multi
+	 * round-trip request; the caller sends the answers with `tasks/update`.
+	 */
+	async answerInputRequests(inputRequests: MCP.InputRequests, token: CancellationToken, context: IMcpToolCallContext | undefined, seenUrls: Set<string>): Promise<MCP.InputResponses> {
+		const parsed = parseInputRequiredResult({ resultType: 'input_required', inputRequests });
+		if (parsed instanceof McpClientError) {
+			throw parsed;
+		}
+		const inputResponses: MCP.InputResponses = {};
+		for (const [key, request] of Object.entries(parsed.inputRequests)) {
+			inputResponses[key] = await this._answerInputRequest(request, token, context, seenUrls);
+		}
+		return inputResponses;
+	}
+
 		const result = await this._request<MCP.DiscoverResult>('server/discover', {}, token ?? CancellationToken.None);
 		this._discoverResult = result;
 		this._discoverHint = cacheHintOf(result);
@@ -1222,7 +1249,12 @@ export class McpServerRequestHandler extends Disposable {
 	}
 
 	/**
-	 * Call a specific tool. Answers `input_required` rounds; supports legacy tasks automatically if `task` is set on the request.
+	 * Call a specific tool. Answers `input_required` rounds. A `task` on the
+	 * request opts into tasks: legacy servers get it as the 2025-11-25 task
+	 * augmentation; modern servers that advertise the Tasks extension
+	 * (`io.modelcontextprotocol/tasks`) see the extension in this request's
+	 * client capabilities instead (the `task` param is not sent) and may
+	 * answer with a `CreateTaskResult`, which is then polled to its result.
 	 */
 	async callTool(params: MCPLegacy.CallToolRequest['params'] & MCPLegacy.Request['params'], token: CancellationToken = CancellationToken.None, onStatusMessage?: (message: string) => void, context?: IMcpToolCallContext): Promise<MCPLegacy.CallToolResult> {
 		const response = await this._sendWithInputs<MCPLegacy.CallToolResult | MCPLegacy.CreateTaskResult>('tools/call', params, token, context, onStatusMessage);
@@ -1234,6 +1266,22 @@ export class McpServerRequestHandler extends Disposable {
 			return task.result.finally(() => {
 				this._taskManager.abandonClientTask(task.id);
 			});
+		if (this._negotiated?.era === 'modern') {
+			const { task, ...modernParams } = params;
+			const tasks = task !== undefined && this.supportsModernTasks;
+			const modernResponse = await this._sendWithInputs<MCPLegacy.CallToolResult | McpTasks.CreateTaskResult>('tools/call', modernParams, token, context, onStatusMessage, tasks ? [McpTasks.RESULT_TYPE_TASK] : undefined, tasks);
+			if (!McpTasks.isCreateTaskResult(modernResponse as MCP.Result)) {
+				return modernResponse as MCPLegacy.CallToolResult;
+			}
+			const created = modernResponse as McpTasks.CreateTaskResult;
+			const modernTask = new McpModernTask(created, token, onStatusMessage, context);
+			this._taskManager.adoptClientTask(modernTask);
+			modernTask.setHandler(this);
+			return modernTask.result.finally(() => {
+				this._taskManager.abandonClientTask(modernTask.id);
+			});
+		}
+
 		}
 
 		return response as MCPLegacy.CallToolResult;
@@ -1297,6 +1345,30 @@ class CacheHintCollector {
 	private _scope: 'public' | 'private' | undefined;
 	private _sawHint = false;
 	private readonly _receivedAt = Date.now();
+	/** Whether the server speaks 2026-07-28 and advertises the Tasks extension (`io.modelcontextprotocol/tasks`). */
+	get supportsModernTasks(): boolean {
+		if (this._negotiated?.era !== 'modern') {
+			return false;
+		}
+		const extensions: unknown = this.capabilities.extensions;
+		return typeof extensions === 'object' && extensions !== null && Object.prototype.hasOwnProperty.call(extensions, McpTasks.EXTENSION_ID);
+	}
+
+	/** `tasks/get` of the Tasks extension (modern servers): the task, with the inlined result or error once it settled. */
+	getModernTask(params: { taskId: string }, token?: CancellationToken): Promise<McpTasks.GetTaskResult> {
+		return this._request<McpTasks.GetTaskResult>('tasks/get', params, token ?? CancellationToken.None, { tasks: true });
+	}
+
+	/** `tasks/update` of the Tasks extension: delivers the answers to a task's input requests. */
+	updateTask(params: { taskId: string; inputResponses?: MCP.InputResponses }, token?: CancellationToken): Promise<McpTasks.UpdateTaskResult> {
+		return this._request<McpTasks.UpdateTaskResult>('tasks/update', params, token ?? CancellationToken.None, { tasks: true });
+	}
+
+	/** `tasks/cancel` of the Tasks extension: an empty acknowledgement, also for a task that already settled. */
+	cancelModernTask(params: { taskId: string }, token?: CancellationToken): Promise<McpTasks.CancelTaskResult> {
+		return this._request<McpTasks.CancelTaskResult>('tasks/cancel', params, token ?? CancellationToken.None, { tasks: true });
+	}
+
 
 	add(result: unknown): void {
 		const hint = cacheHintOf(result);
