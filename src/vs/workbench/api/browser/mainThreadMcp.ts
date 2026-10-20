@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { JsonRpcId, JsonRpcMessage } from '../../../base/common/jsonRpcProtocol.js';
 import { mapFindFirst } from '../../../base/common/arraysFind.js';
 import { disposableTimeout, RunOnceScheduler } from '../../../base/common/async.js';
 import { CancellationError } from '../../../base/common/errors.js';
@@ -23,9 +24,8 @@ import { ITelemetryService } from '../../../platform/telemetry/common/telemetry.
 import { ISecretStorageService } from '../../../platform/secrets/common/secrets.js';
 import { IWorkbenchMcpGatewayService } from '../../contrib/mcp/common/mcpGatewayService.js';
 import { IMcpMessageTransport, IMcpRegistry } from '../../contrib/mcp/common/mcpRegistryTypes.js';
-import { extensionPrefixedIdentifier, McpCollectionDefinition, McpCollectionProvenance, McpCollectionSortOrder, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, McpServerTrust, mcpOAuthClientSecretStorageKey, UserInteractionRequiredError } from '../../contrib/mcp/common/mcpTypes.js';
+import { IMcpMessageEnvelope, IMcpRequestAbort, extensionPrefixedIdentifier, McpCollectionDefinition, McpCollectionProvenance, McpCollectionSortOrder, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, McpServerTrust, mcpOAuthClientSecretStorageKey, UserInteractionRequiredError } from '../../contrib/mcp/common/mcpTypes.js';
 import { IMcpEnterpriseManagedAuthIdpConfig, mcpEnterpriseManagedAuthIdpSection } from '../../contrib/mcp/common/mcpConfiguration.js';
-import { MCPLegacy } from '../../contrib/mcp/common/modelContextProtocolLegacy.js';
 import { IAuthenticationMcpAccessService } from '../../services/authentication/browser/authenticationMcpAccessService.js';
 import { IAuthenticationMcpService } from '../../services/authentication/browser/authenticationMcpService.js';
 import { IAuthenticationMcpUsageService } from '../../services/authentication/browser/authenticationMcpUsageService.js';
@@ -120,7 +120,8 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 				const launch = new ExtHostMcpServerLaunch(
 					_extHostContext.extensionHostKind,
 					() => proxy.$stopMcp(id),
-					msg => proxy.$sendMessage(id, JSON.stringify(msg)),
+					(msg, envelope) => proxy.$sendMessage(id, JSON.stringify(msg), envelope),
+					requestId => proxy.$cancelRequest(id, requestId),
 				);
 				this._servers.set(id, launch);
 				this._serverDefinitions.set(id, serverDefiniton);
@@ -269,6 +270,10 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 
 	$onDidReceiveMessage(id: number, message: string): void {
 		this._servers.get(id)?.pushMessage(message);
+	}
+
+	$onDidAbortRequest(id: number, abort: IMcpRequestAbort): void {
+		this._servers.get(id)?.pushAbort(abort);
 	}
 
 	async $getTokenForProviderId(id: number, providerId: string, scopes: string[], options: IMcpAuthenticationOptions = {}): Promise<string | undefined> {
@@ -635,15 +640,22 @@ class ExtHostMcpServerLaunch extends Disposable implements IMcpMessageTransport 
 	private readonly _onDidLog = this._register(new Emitter<{ level: LogLevel; message: string }>());
 	public readonly onDidLog = this._onDidLog.event;
 
-	private readonly _onDidReceiveMessage = this._register(new Emitter<MCPLegacy.JSONRPCMessage>());
+	private readonly _onDidReceiveMessage = this._register(new Emitter<JsonRpcMessage>());
 	public readonly onDidReceiveMessage = this._onDidReceiveMessage.event;
+
+	private readonly _onDidAbortRequest = this._register(new Emitter<IMcpRequestAbort>());
+	public readonly onDidAbortRequest = this._onDidAbortRequest.event;
 
 	pushLog(level: LogLevel, message: string): void {
 		this._onDidLog.fire({ message, level });
 	}
 
+	pushAbort(abort: IMcpRequestAbort): void {
+		this._onDidAbortRequest.fire(abort);
+	}
+
 	pushMessage(message: string): void {
-		let parsed: MCPLegacy.JSONRPCMessage | undefined;
+		let parsed: JsonRpcMessage | JsonRpcMessage[] | undefined;
 		try {
 			parsed = JSON.parse(message);
 		} catch (e) {
@@ -662,7 +674,8 @@ class ExtHostMcpServerLaunch extends Disposable implements IMcpMessageTransport 
 	constructor(
 		extHostKind: ExtensionHostKind,
 		public readonly stop: () => void,
-		public readonly send: (message: MCPLegacy.JSONRPCMessage) => void,
+		public readonly send: (message: JsonRpcMessage, envelope?: IMcpMessageEnvelope) => void,
+		public readonly cancelRequest: (requestId: JsonRpcId) => void,
 	) {
 		super();
 

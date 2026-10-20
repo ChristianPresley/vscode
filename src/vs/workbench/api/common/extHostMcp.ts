@@ -8,6 +8,7 @@ import { DeferredPromise, raceCancellationError, Sequencer, timeout } from '../.
 import { CancellationToken, CancellationTokenSource } from '../../../base/common/cancellation.js';
 import { CancellationError } from '../../../base/common/errors.js';
 import { Emitter, Event } from '../../../base/common/event.js';
+import { JsonRpcId } from '../../../base/common/jsonRpcProtocol.js';
 import { Disposable, DisposableMap, DisposableStore, IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
 import { AUTH_SCOPE_SEPARATOR, fetchAuthorizationServerMetadata, fetchResourceMetadata, getDefaultMetadataForUrl, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, parseWWWAuthenticateHeader, scopesMatch } from '../../../base/common/oauth.js';
 import { SSEParser } from '../../../base/common/sseParser.js';
@@ -18,9 +19,11 @@ import { ConfigurationTarget } from '../../../platform/configuration/common/conf
 import { ExtensionIdentifier, IExtensionDescription } from '../../../platform/extensions/common/extensions.js';
 import { createDecorator } from '../../../platform/instantiation/common/instantiation.js';
 import { canLog, ILogService, LogLevel } from '../../../platform/log/common/log.js';
+import { MCP_PROTOCOL_VERSION_HEADER } from '../../../platform/mcp/common/mcpHttpHeaders.js';
+import { eraForProtocolVersion, isRecognizedModernError } from '../../../platform/mcp/common/mcpProtocolVersions.js';
 import product from '../../../platform/product/common/product.js';
 import { StorageScope } from '../../../platform/storage/common/storage.js';
-import { extensionPrefixedIdentifier, McpCollectionDefinition, McpConnectionState, McpServerDefinition, McpServerEnvironmentVariableExpansion, McpServerLaunch, McpServerStaticMetadata, McpServerStaticToolAvailability, McpServerTransportHTTP, McpServerTransportType, UserInteractionRequiredError } from '../../contrib/mcp/common/mcpTypes.js';
+import { extensionPrefixedIdentifier, IMcpMessageEnvelope, IMcpRequestAbort, McpCollectionDefinition, McpConnectionState, McpServerDefinition, McpServerEnvironmentVariableExpansion, McpServerLaunch, McpServerStaticMetadata, McpServerStaticToolAvailability, McpServerTransportHTTP, McpServerTransportType, UserInteractionRequiredError } from '../../contrib/mcp/common/mcpTypes.js';
 import { MCPLegacy } from '../../contrib/mcp/common/modelContextProtocolLegacy.js';
 import { checkProposedApiEnabled, isProposedApiEnabled } from '../../services/extensions/common/extensions.js';
 import { ExtHostMcpShape, IMcpAuthenticationDetails, IAuthMetadataSource, IStartMcpOptions, MainContext, MainThreadMcpShape, IAuthResourceMetadataSource, IAuthServerMetadataSource } from './extHost.protocol.js';
@@ -67,10 +70,17 @@ const serverDataValidation = vObj({
 // declare const _serverDataValidationTest: vscode.McpStdioServerDefinition | vscode.McpHttpServerDefinition;
 // const _serverDataValidationProd: ValidatorType<typeof serverDataValidation> = _serverDataValidationTest;
 
+/** A transport handle living in the extension host (HTTP today, gRPC later). */
+export interface IMcpExtHostHandle extends IDisposable {
+	send(message: string, envelope?: IMcpMessageEnvelope): Promise<void>;
+	cancelRequest(requestId: JsonRpcId): void;
+	close(): Promise<void>;
+}
+
 export class ExtHostMcpService extends Disposable implements IExtHostMpcService {
 	protected _proxy: MainThreadMcpShape;
 	private readonly _initialProviderPromises = new Set<Promise<void>>();
-	protected readonly _sseEventSources = this._register(new DisposableMap<number, McpHTTPHandle>());
+	protected readonly _sseEventSources = this._register(new DisposableMap<number, IMcpExtHostHandle>());
 	private readonly _unresolvedMcpServers = new Map</* collectionId */ string, {
 		provider: vscode.McpServerDefinitionProvider;
 		servers: vscode.McpServerDefinition[];
@@ -151,8 +161,12 @@ export class ExtHostMcpService extends Disposable implements IExtHostMpcService 
 		this._sseEventSources.deleteAndDispose(id);
 	}
 
-	$sendMessage(id: number, message: string): void {
-		this._sseEventSources.get(id)?.send(message);
+	$sendMessage(id: number, message: string, envelope?: IMcpMessageEnvelope): void {
+		this._sseEventSources.get(id)?.send(message, envelope);
+	}
+
+	$cancelRequest(id: number, requestId: JsonRpcId): void {
+		this._sseEventSources.get(id)?.cancelRequest(requestId);
 	}
 
 	async $waitForInitialCollectionProviders(): Promise<void> {
@@ -330,15 +344,48 @@ function stringifyError(err: unknown): string {
 }
 
 const enum HttpMode {
+	/** No request answered yet: a modern request probes, a legacy request behaves as before. */
 	Unknown,
+	/** 2026-07-28 Streamable HTTP: POST only, no session, every request is its own stream. */
+	Modern,
+	/** Legacy (2025-11-25) Streamable HTTP with an optional session id and a GET backchannel. */
 	Http,
+	/** Legacy HTTP+SSE: one long-lived GET stream and a POST endpoint. */
 	SSE,
 }
 
 type HttpModeT =
 	| { value: HttpMode.Unknown }
+	| { value: HttpMode.Modern }
 	| { value: HttpMode.Http; sessionId: string | undefined }
 	| { value: HttpMode.SSE; endpoint: string };
+
+/** How often a legacy POST stream that closed before its response is resumed with `Last-Event-ID`. */
+const MAX_LOST_STREAM_RETRIES = 3;
+/** The reconnection delay when the server sent no `retry` field. */
+const DEFAULT_SSE_RETRY_MS = 1000;
+
+function requestKey(id: JsonRpcId): string {
+	return `${typeof id}:${id}`;
+}
+
+function tryParseJson(text: string): unknown {
+	try {
+		return JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+}
+
+/** True when `data` (one JSON-RPC message or a batch) carries the response to `requestId`. */
+function isResponseFor(data: string, requestId: JsonRpcId): boolean {
+	const parsed = tryParseJson(data);
+	const messages = Array.isArray(parsed) ? parsed : [parsed];
+	return messages.some(message =>
+		typeof message === 'object' && message !== null
+		&& (message as { id?: unknown }).id === requestId
+		&& (Object.prototype.hasOwnProperty.call(message, 'result') || Object.prototype.hasOwnProperty.call(message, 'error')));
+}
 
 const MAX_FOLLOW_REDIRECTS = 5;
 const REDIRECT_STATUS_CODES = [301, 302, 303, 307, 308];
@@ -366,18 +413,27 @@ function isSameSocketEndpoint(url: string, configuredUrl: string): boolean {
 }
 
 /**
- * Implementation of both MCP HTTP Streaming as well as legacy SSE.
+ * Implementation of the 2026-07-28 Streamable HTTP transport, the legacy
+ * (2025-11-25) Streamable HTTP transport and legacy HTTP+SSE.
  *
- * The first request will POST to the endpoint, assuming HTTP streaming. If the
- * server is legacy SSE, it should return some 4xx status in that case,
- * and we'll automatically fall back to SSE and res
+ * The protocol engine tells the handle which revision a message belongs to
+ * through its {@link IMcpMessageEnvelope}. A modern request probes the server
+ * first: a 2xx or a recognized modern error means the server speaks the new
+ * revision; any other 4xx means it is a legacy server, the request is aborted
+ * with `legacy-probe` and the engine retries with the legacy handshake.
+ * Messages without an envelope are legacy traffic and go on the wire exactly
+ * as they always did (first POST decides between Streamable HTTP and SSE).
  */
-export class McpHTTPHandle extends Disposable {
+export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 	private readonly _requestSequencer = new Sequencer();
 	private readonly _postEndpoint = new DeferredPromise<{ url: string; transport: McpServerTransportHTTP }>();
 	private _mode: HttpModeT = { value: HttpMode.Unknown };
 	private readonly _cts = new CancellationTokenSource();
 	private readonly _abortCtrl = new AbortController();
+	/** Per-request abort controllers, keyed by {@link requestKey}. */
+	private readonly _requestAborts = new Map<string, AbortController>();
+	/** The protocol version of the last enveloped message; legacy GET/DELETE requests reuse it. */
+	private _protocolVersion: string | undefined;
 	private _authMetadata?: AuthMetadata;
 	private _didSendClose = false;
 
@@ -392,20 +448,70 @@ export class McpHTTPHandle extends Disposable {
 
 		this._register(toDisposable(() => {
 			this._abortCtrl.abort();
+			for (const controller of this._requestAborts.values()) {
+				controller.abort();
+			}
+			this._requestAborts.clear();
 			this._cts.dispose(true);
 		}));
 		this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Running });
 	}
 
-	async send(message: string) {
+	async send(message: string, envelope?: IMcpMessageEnvelope) {
+		if (envelope) {
+			this._protocolVersion = envelope.protocolVersion;
+		}
+		const era = envelope ? (eraForProtocolVersion(envelope.protocolVersion) ?? 'modern') : 'legacy';
 		try {
-			if (this._mode.value === HttpMode.Unknown) {
-				await this._requestSequencer.queue(() => this._send(message));
+			if (era === 'modern' && envelope) {
+				await this._sendModern(message, envelope);
+			} else if (this._mode.value === HttpMode.Unknown) {
+				await this._requestSequencer.queue(() => this._send(message, envelope));
 			} else {
-				await this._send(message);
+				await this._send(message, envelope);
 			}
 		} catch (err) {
+			if (envelope?.requestId !== undefined && this._wasCancelledLocally(envelope.requestId)) {
+				return;
+			}
+			if (envelope?.requestId !== undefined) {
+				this._abortRequest(envelope, { reason: 'transport-error', message: stringifyError(err) });
+			}
 			this._handleSendError(err);
+		}
+	}
+
+	cancelRequest(requestId: JsonRpcId): void {
+		const controller = this._requestAborts.get(requestKey(requestId));
+		if (controller) {
+			this._requestAborts.delete(requestKey(requestId));
+			controller.abort();
+		}
+	}
+
+	private _trackRequest(envelope: IMcpMessageEnvelope): AbortController | undefined {
+		if (envelope.requestId === undefined) {
+			return undefined;
+		}
+		const controller = new AbortController();
+		this._requestAborts.set(requestKey(envelope.requestId), controller);
+		return controller;
+	}
+
+	private _untrackRequest(envelope: IMcpMessageEnvelope): void {
+		if (envelope.requestId !== undefined) {
+			this._requestAborts.delete(requestKey(envelope.requestId));
+		}
+	}
+
+	private _wasCancelledLocally(requestId: JsonRpcId): boolean {
+		return !this._requestAborts.has(requestKey(requestId));
+	}
+
+	private _abortRequest(envelope: IMcpMessageEnvelope, abort: Omit<IMcpRequestAbort, 'requestId'>): void {
+		this._untrackRequest(envelope);
+		if (envelope.requestId !== undefined && !this._store.isDisposed) {
+			this._proxy.$onDidAbortRequest(this._id, { requestId: envelope.requestId, ...abort });
 		}
 	}
 
@@ -431,9 +537,14 @@ export class McpHTTPHandle extends Disposable {
 		this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Stopped });
 	}
 
+	private _versionHeader(): Record<string, string> {
+		return this._protocolVersion ? { [MCP_PROTOCOL_VERSION_HEADER]: this._protocolVersion } : {};
+	}
+
 	private async _closeSession(sessionId: string) {
 		const headers: Record<string, string> = {
 			...Object.fromEntries(this._launch.headers),
+			...this._versionHeader(),
 			'Mcp-Session-Id': sessionId,
 		};
 
@@ -455,26 +566,97 @@ export class McpHTTPHandle extends Disposable {
 		);
 	}
 
-	private _send(message: string) {
+	private _send(message: string, envelope?: IMcpMessageEnvelope) {
 		if (this._mode.value === HttpMode.SSE) {
-			return this._sendLegacySSE(this._mode.endpoint, message);
+			return this._sendLegacySSE(this._mode.endpoint, message, envelope);
 		} else {
-			return this._sendStreamableHttp(message, this._mode.value === HttpMode.Http ? this._mode.sessionId : undefined);
+			return this._sendStreamableHttp(message, this._mode.value === HttpMode.Http ? this._mode.sessionId : undefined, envelope);
 		}
 	}
 
 	/**
-	 * Sends a streamable-HTTP request.
+	 * Sends a 2026-07-28 request: POST only, no session, the response (JSON or
+	 * an SSE stream) belongs to this request alone.
+	 */
+	private async _sendModern(message: string, envelope: IMcpMessageEnvelope): Promise<void> {
+		if (this._mode.value === HttpMode.SSE) {
+			this._abortRequest(envelope, { reason: 'unexpressible', message: 'The server uses the legacy HTTP+SSE transport' });
+			return;
+		}
+
+		const controller = this._trackRequest(envelope);
+		const asBytes = new TextEncoder().encode(message) as Uint8Array<ArrayBuffer>;
+		const transportHeaders: Record<string, string> = {
+			'Content-Type': 'application/json',
+			Accept: 'text/event-stream, application/json',
+			[MCP_PROTOCOL_VERSION_HEADER]: envelope.protocolVersion,
+			...envelope.headers,
+		};
+		const headers: Record<string, string> = {
+			...Object.fromEntries(this._launch.headers),
+			...transportHeaders,
+		};
+		await this._addAuthHeader(headers);
+
+		const res = await this._fetchWithAuthRetry(
+			this._launch.uri.toString(true),
+			{
+				method: 'POST',
+				headers,
+				body: asBytes,
+			},
+			headers,
+			transportHeaders,
+			controller?.signal,
+		);
+
+		if (res.status >= 200 && res.status < 300) {
+			if (this._mode.value === HttpMode.Unknown) {
+				this._mode = { value: HttpMode.Modern };
+			}
+			await this._handleSuccessfulStreamableHttp(res, message, envelope, controller?.signal);
+			this._untrackRequest(envelope);
+			return;
+		}
+
+		const errText = await this._getErrText(res);
+		if (res.status === 400 || res.status === 404 || res.status === 405) {
+			const body = tryParseJson(errText);
+			if (body !== undefined && isRecognizedModernError(res.status, body)) {
+				// A modern server rejecting this request (unsupported version, header
+				// mismatch, missing capability, unknown method): deliver the JSON-RPC error.
+				if (this._mode.value === HttpMode.Unknown) {
+					this._mode = { value: HttpMode.Modern };
+				}
+				this._untrackRequest(envelope);
+				this._proxy.$onDidReceiveMessage(this._id, errText);
+				return;
+			}
+			if (this._mode.value === HttpMode.Unknown) {
+				this._log(LogLevel.Info, `${res.status} status for a ${envelope.protocolVersion} request to ${this._launch.uri}; the server does not speak this revision`);
+				this._abortRequest(envelope, { reason: 'legacy-probe', httpStatus: res.status, message: errText });
+				return;
+			}
+		}
+
+		this._abortRequest(envelope, { reason: 'http-status', httpStatus: res.status, message: `${res.status} status sending message to ${this._launch.uri}: ${errText}` });
+	}
+
+	/**
+	 * Sends a legacy streamable-HTTP request.
 	 * 1. Posts to the endpoint
 	 * 2. Updates internal state as needed. Falls back to SSE if appropriate.
 	 * 3. If the response body is empty, JSON, or a JSON stream, handle it appropriately.
 	 */
-	private async _sendStreamableHttp(message: string, sessionId: string | undefined) {
+	private async _sendStreamableHttp(message: string, sessionId: string | undefined, envelope?: IMcpMessageEnvelope) {
 		const asBytes = new TextEncoder().encode(message) as Uint8Array<ArrayBuffer>;
-		const transportHeaders = {
+		const transportHeaders: Record<string, string> = {
 			'Content-Type': 'application/json',
 			Accept: 'text/event-stream, application/json',
 		};
+		if (envelope) {
+			transportHeaders[MCP_PROTOCOL_VERSION_HEADER] = envelope.protocolVersion;
+		}
 		const headers: Record<string, string> = {
 			...Object.fromEntries(this._launch.headers),
 			...transportHeaders,
@@ -510,7 +692,7 @@ export class McpHTTPHandle extends Disposable {
 			&& !isAuthStatusCode(res.status)
 		) {
 			this._log(LogLevel.Info, `${res.status} status sending message to ${this._launch.uri}, will attempt to fall back to legacy SSE`);
-			this._sseFallbackWithMessage(message);
+			this._sseFallbackWithMessage(message, envelope);
 			return;
 		}
 
@@ -535,43 +717,76 @@ export class McpHTTPHandle extends Disposable {
 			this._attachStreamableBackchannel();
 		}
 
-		await this._handleSuccessfulStreamableHttp(res, message);
+		await this._handleSuccessfulStreamableHttp(res, message, envelope);
 	}
 
-	private async _sseFallbackWithMessage(message: string) {
+	private async _sseFallbackWithMessage(message: string, envelope?: IMcpMessageEnvelope) {
 		try {
 			const endpoint = await this._attachSSE();
 			if (endpoint) {
 				this._mode = { value: HttpMode.SSE, endpoint };
-				await this._sendLegacySSE(endpoint, message);
+				await this._sendLegacySSE(endpoint, message, envelope);
 			}
 		} catch (err) {
 			this._handleSendError(err);
 		}
 	}
 
-	private async _handleSuccessfulStreamableHttp(res: CommonResponse, message: string) {
+	/**
+	 * Handles a 2xx response to a POST: nothing (202), a JSON body, or an SSE
+	 * stream whose events are forwarded until it ends. With an envelope the
+	 * stream is watched for the response to the request: a modern stream that
+	 * ends without it aborts the request; a legacy stream that ends without it
+	 * is resumed with `Last-Event-ID` when the server supports resumption.
+	 */
+	private async _handleSuccessfulStreamableHttp(res: CommonResponse, message: string, envelope?: IMcpMessageEnvelope, signal?: AbortSignal) {
 		if (res.status === 202) {
 			return; // no body
 		}
 
 		const contentType = res.headers.get('Content-Type')?.toLowerCase() || '';
 		if (contentType.startsWith('text/event-stream')) {
+			const watched = envelope?.requestId !== undefined && envelope.kind !== 'notification' ? envelope : undefined;
+			let sawResponse = false;
+			let lastEventId: string | undefined;
+			let retryMs: number | undefined;
 			const parser = new SSEParser(event => {
+				if (event.id) {
+					lastEventId = event.id;
+				}
+				if (event.retry) {
+					retryMs = event.retry;
+				}
 				if (event.type === 'message') {
+					if (watched && !sawResponse && isResponseFor(event.data, watched.requestId!)) {
+						sawResponse = true;
+					}
 					this._proxy.$onDidReceiveMessage(this._id, event.data);
-				} else if (event.type === 'endpoint') {
+				} else if (event.type === 'endpoint' && this._mode.value !== HttpMode.Modern) {
 					// An SSE server that didn't correctly return a 4xx status when we POSTed
 					this._log(LogLevel.Warning, `Received SSE endpoint from a POST to ${this._launch.uri}, will fall back to legacy SSE`);
-					this._sseFallbackWithMessage(message);
+					this._sseFallbackWithMessage(message, envelope);
 					throw new CancellationError(); // just to end the SSE stream
 				}
 			});
 
+			let streamFailed = false;
 			try {
-				await this._doSSE(parser, res);
+				await this._doSSE(parser, res, signal);
 			} catch (err) {
+				streamFailed = true;
 				this._log(LogLevel.Warning, `Error reading SSE stream: ${stringifyError(err)}`);
+			}
+
+			if (!watched || sawResponse || this._store.isDisposed || signal?.aborted) {
+				return;
+			}
+			if (this._mode.value === HttpMode.Modern) {
+				this._abortRequest(watched, { reason: streamFailed ? 'transport-error' : 'stream-closed', message: `The response stream for ${watched.method} ended before the response arrived` });
+			} else if (lastEventId !== undefined && !streamFailed) {
+				void this._resumeClosedStream(watched, lastEventId, retryMs ?? DEFAULT_SSE_RETRY_MS);
+			} else {
+				this._abortRequest(watched, { reason: streamFailed ? 'transport-error' : 'stream-closed', message: `The response stream for ${watched.method} ended before the response arrived` });
 			}
 		} else if (contentType.startsWith('application/json')) {
 			this._proxy.$onDidReceiveMessage(this._id, await res.text());
@@ -582,6 +797,69 @@ export class McpHTTPHandle extends Disposable {
 			} else {
 				this._log(LogLevel.Warning, `Unexpected ${res.status} response for request: ${responseBody}`);
 			}
+		}
+	}
+
+	/**
+	 * Legacy Streamable HTTP: a POST stream that closed before delivering the
+	 * response is resumed with a GET carrying `Last-Event-ID`, after the delay
+	 * the server advertised in its `retry` field.
+	 */
+	private async _resumeClosedStream(envelope: IMcpMessageEnvelope, lastEventId: string, retryMs: number): Promise<void> {
+		let sawResponse = false;
+		for (let attempt = 0; attempt < MAX_LOST_STREAM_RETRIES && !this._store.isDisposed && !sawResponse; attempt++) {
+			try {
+				await timeout(retryMs, this._cts.token);
+			} catch {
+				return;
+			}
+			const transportHeaders: Record<string, string> = { 'Accept': 'text/event-stream', 'Last-Event-ID': lastEventId, ...this._versionHeader() };
+			const headers: Record<string, string> = {
+				...Object.fromEntries(this._launch.headers),
+				...transportHeaders,
+			};
+			if (this._mode.value === HttpMode.Http && this._mode.sessionId !== undefined) {
+				headers['Mcp-Session-Id'] = this._mode.sessionId;
+			}
+			let res: CommonResponse;
+			try {
+				await this._addAuthHeader(headers);
+				res = await this._fetchWithAuthRetry(this._launch.uri.toString(true), { method: 'GET', headers }, headers, transportHeaders);
+			} catch (err) {
+				this._log(LogLevel.Info, `Error resuming the response stream of ${envelope.method}: ${stringifyError(err)}`);
+				continue;
+			}
+			if (res.status >= 300) {
+				this._log(LogLevel.Info, `${res.status} status resuming the response stream of ${envelope.method}: ${await this._getErrText(res)}`);
+				break;
+			}
+			const parser = new SSEParser(event => {
+				if (event.id) {
+					lastEventId = event.id;
+				}
+				if (event.retry) {
+					retryMs = event.retry;
+				}
+				if (event.type === 'message' && event.data) {
+					this._proxy.$onDidReceiveMessage(this._id, event.data);
+					if (isResponseFor(event.data, envelope.requestId!)) {
+						sawResponse = true;
+						throw new CancellationError(); // the resumed stream served its purpose
+					}
+				}
+			});
+			try {
+				await this._doSSE(parser, res);
+			} catch (err) {
+				if (!sawResponse) {
+					this._log(LogLevel.Info, `Error reading the resumed response stream of ${envelope.method}: ${stringifyError(err)}`);
+				}
+			}
+		}
+		if (!sawResponse) {
+			this._abortRequest(envelope, { reason: 'stream-closed', message: `The response stream for ${envelope.method} ended before the response arrived and could not be resumed` });
+		} else {
+			this._untrackRequest(envelope);
 		}
 	}
 
@@ -603,7 +881,7 @@ export class McpHTTPHandle extends Disposable {
 
 			let res: CommonResponse;
 			try {
-				const transportHeaders: Record<string, string> = { 'Accept': 'text/event-stream' };
+				const transportHeaders: Record<string, string> = { 'Accept': 'text/event-stream', ...this._versionHeader() };
 				if (lastEventId) {
 					transportHeaders['Last-Event-ID'] = lastEventId;
 				}
@@ -668,7 +946,7 @@ export class McpHTTPHandle extends Disposable {
 	 */
 	private async _attachSSE(): Promise<string | undefined> {
 		const postEndpoint = new DeferredPromise<string>();
-		const transportHeaders = { 'Accept': 'text/event-stream' };
+		const transportHeaders: Record<string, string> = { 'Accept': 'text/event-stream', ...this._versionHeader() };
 		const headers: Record<string, string> = {
 			...Object.fromEntries(this._launch.headers),
 			...transportHeaders,
@@ -715,9 +993,12 @@ export class McpHTTPHandle extends Disposable {
 	 * Sends a legacy SSE message to the server. The response is always empty and
 	 * is otherwise received in {@link _attachSSE}'s loop.
 	 */
-	private async _sendLegacySSE(url: string, message: string) {
+	private async _sendLegacySSE(url: string, message: string, envelope?: IMcpMessageEnvelope) {
 		const asBytes = new TextEncoder().encode(message) as Uint8Array<ArrayBuffer>;
-		const transportHeaders = { 'Content-Type': 'application/json' };
+		const transportHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+		if (envelope) {
+			transportHeaders[MCP_PROTOCOL_VERSION_HEADER] = envelope.protocolVersion;
+		}
 		const headers: Record<string, string> = {
 			...Object.fromEntries(this._launch.headers),
 			...transportHeaders,
@@ -735,28 +1016,34 @@ export class McpHTTPHandle extends Disposable {
 	}
 
 	/** Generic handle to pipe a response into an SSE parser. */
-	private async _doSSE(parser: SSEParser, res: CommonResponse) {
+	private async _doSSE(parser: SSEParser, res: CommonResponse, signal?: AbortSignal) {
 		if (!res.body) {
 			return;
 		}
 
 		const reader = res.body.getReader();
-		let chunk: ReadableStreamReadResult<Uint8Array>;
-		do {
-			try {
-				chunk = await raceCancellationError(reader.read(), this._cts.token);
-			} catch (err) {
-				if (this._store.isDisposed) {
-					return;
+		const onAbort = () => { reader.cancel().catch(() => { }); };
+		signal?.addEventListener('abort', onAbort, { once: true });
+		try {
+			let chunk: ReadableStreamReadResult<Uint8Array>;
+			do {
+				try {
+					chunk = await raceCancellationError(reader.read(), this._cts.token);
+				} catch (err) {
+					if (this._store.isDisposed || signal?.aborted) {
+						return;
+					}
+					await reader.cancel();
+					throw err;
 				}
-				await reader.cancel();
-				throw err;
-			}
 
-			if (chunk.value) {
-				parser.feed(chunk.value);
-			}
-		} while (!chunk.done);
+				if (chunk.value) {
+					parser.feed(chunk.value);
+				}
+			} while (!chunk.done);
+		} finally {
+			signal?.removeEventListener('abort', onAbort);
+		}
 	}
 
 	private async _addAuthHeader(headers: Record<string, string>, options?: { forceNewRegistration?: boolean; errorOnUserInteraction?: boolean }) {
@@ -837,8 +1124,8 @@ export class McpHTTPHandle extends Disposable {
 	 * it will populate the auth metadata and retry once.
 	 * If we already have auth metadata, check if the scopes changed and update them.
 	 */
-	private async _fetchWithAuthRetry(mcpUrl: string, init: MinimalRequestInit, headers: Record<string, string>, transportHeaders?: Readonly<Record<string, string>>): Promise<CommonResponse> {
-		const doFetch = () => this._fetch(mcpUrl, init, { transportHeaders });
+	private async _fetchWithAuthRetry(mcpUrl: string, init: MinimalRequestInit, headers: Record<string, string>, transportHeaders?: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<CommonResponse> {
+		const doFetch = () => this._fetch(mcpUrl, init, { transportHeaders, signal });
 
 		let res = await doFetch();
 		if (isAuthStatusCode(res.status)) {
@@ -884,7 +1171,8 @@ export class McpHTTPHandle extends Disposable {
 		return res;
 	}
 
-	private async _fetch(url: string, init: MinimalRequestInit, options: { isAuthMetadata?: boolean; transportHeaders?: Readonly<Record<string, string>> } = {}): Promise<CommonResponse> {
+	private async _fetch(url: string, init: MinimalRequestInit, options: { isAuthMetadata?: boolean; transportHeaders?: Readonly<Record<string, string>>; signal?: AbortSignal } = {}): Promise<CommonResponse> {
+		const signal = options.signal ? AbortSignal.any([this._abortCtrl.signal, options.signal]) : this._abortCtrl.signal;
 		const destination = new URL(url);
 		const configuredUrl = this._launch.uri.toString(true);
 		const isHttp = HTTP_PROTOCOLS.has(destination.protocol);
@@ -934,7 +1222,7 @@ export class McpHTTPHandle extends Disposable {
 			}
 			response = await this._fetchInternal(currentUrl, {
 				...init,
-				signal: this._abortCtrl.signal,
+				signal,
 				redirect: 'manual'
 			});
 

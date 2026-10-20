@@ -9,6 +9,7 @@ import { isCancellationError } from '../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { DisposableStore } from '../../../../base/common/lifecycle.js';
 import { observableValue } from '../../../../base/common/observable.js';
+import { JsonRpcId } from '../../../../base/common/jsonRpcProtocol.js';
 import { URI } from '../../../../base/common/uri.js';
 import { mock } from '../../../../base/test/common/mock.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
@@ -26,7 +27,7 @@ import { StorageScope } from '../../../../platform/storage/common/storage.js';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
 import { IWorkbenchMcpGatewayService } from '../../../contrib/mcp/common/mcpGatewayService.js';
 import { IMcpHostDelegate, IMcpRegistry } from '../../../contrib/mcp/common/mcpRegistryTypes.js';
-import { McpCollectionDefinition, McpCollectionSortOrder, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, McpServerTrust, mcpOAuthClientSecretStorageKey } from '../../../contrib/mcp/common/mcpTypes.js';
+import { IMcpMessageEnvelope, IMcpRequestAbort, McpCollectionDefinition, McpCollectionSortOrder, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, McpServerTrust, mcpOAuthClientSecretStorageKey } from '../../../contrib/mcp/common/mcpTypes.js';
 import { mcpEnterpriseManagedAuthIdpSection } from '../../../contrib/mcp/common/mcpConfiguration.js';
 import { IAuthenticationMcpAccessService } from '../../../services/authentication/browser/authenticationMcpAccessService.js';
 import { IAuthenticationMcpService } from '../../../services/authentication/browser/authenticationMcpService.js';
@@ -229,6 +230,62 @@ suite('MainThreadMcp - launch', () => {
 			requests: [{ url }],
 			expanded: { isUri: true, url: 'https://expanded.example/mcp', headers: [['Authorization', 'Bearer expanded']] },
 		});
+	});
+});
+
+suite('MainThreadMcp - transport seam', () => {
+
+	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('forwards envelopes and cancellations to the extension host and surfaces aborts', () => {
+		const sent: { id: number; message: string; envelope: IMcpMessageEnvelope | undefined }[] = [];
+		const cancelled: { id: number; requestId: JsonRpcId }[] = [];
+		const proxy: Partial<ExtHostMcpShape> = {
+			$startMcp() { },
+			$stopMcp() { },
+			$sendMessage(id, message, envelope) { sent.push({ id, message, envelope }); },
+			$cancelRequest(id, requestId) { cancelled.push({ id, requestId }); },
+			$onDidChangeMcpServerDefinitions() { },
+		};
+		let capturedDelegate: IMcpHostDelegate | undefined;
+		const mcpRegistry = new class extends mock<IMcpRegistry>() {
+			override readonly collections = observableValue<readonly McpCollectionDefinition[]>('collections', []);
+			override registerDelegate(delegate: IMcpHostDelegate) {
+				capturedDelegate = delegate;
+				return { dispose() { } };
+			}
+		};
+		const mainThread = createMainThreadMcp(disposables, proxy, mcpRegistry);
+		assert.ok(capturedDelegate);
+
+		const launch: McpServerLaunch = { type: McpServerTransportType.HTTP, uri: URI.parse('https://myserver.example/mcp'), headers: [] };
+		const serverDefinition: McpServerDefinition = { id: 'seam-server', label: 'Seam', launch, cacheNonce: 'nonce-seam' };
+		const collection: McpCollectionDefinition = {
+			remoteAuthority: null,
+			id: 'collection-seam',
+			label: 'Collection',
+			serverDefinitions: observableValue<readonly McpServerDefinition[]>('serverDefinitions', [serverDefinition]),
+			trustBehavior: McpServerTrust.Kind.Trusted,
+			scope: StorageScope.WORKSPACE,
+			configTarget: ConfigurationTarget.WORKSPACE_FOLDER,
+			order: McpCollectionSortOrder.WorkspaceFolder,
+		};
+		const transport = disposables.add(capturedDelegate.start(collection, serverDefinition, launch, {}));
+
+		const envelope: IMcpMessageEnvelope = { kind: 'request', requestId: 3, protocolVersion: '2026-07-28', method: 'tools/list', headers: { 'Mcp-Method': 'tools/list' } };
+		transport.send({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, envelope);
+		transport.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+		assert.deepStrictEqual(sent.map(s => s.envelope), [envelope, undefined]);
+		assert.strictEqual(sent[0].message, JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list' }));
+
+		transport.cancelRequest!(3);
+		assert.deepStrictEqual(cancelled, [{ id: sent[0].id, requestId: 3 }]);
+
+		const aborts: IMcpRequestAbort[] = [];
+		disposables.add(transport.onDidAbortRequest!(abort => aborts.push(abort)));
+		mainThread.$onDidAbortRequest(sent[0].id, { requestId: 3, reason: 'legacy-probe', httpStatus: 400 });
+		mainThread.$onDidAbortRequest(sent[0].id + 1000, { requestId: 3, reason: 'legacy-probe' });
+		assert.deepStrictEqual(aborts, [{ requestId: 3, reason: 'legacy-probe', httpStatus: 400 }]);
 	});
 });
 

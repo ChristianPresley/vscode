@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
+import { JsonRpcId } from '../../../base/common/jsonRpcProtocol.js';
 import { readFile } from 'fs/promises';
 import { homedir } from 'os';
 import type { RequestInit as UndiciRequestInit } from 'undici';
@@ -18,7 +19,7 @@ import { StreamSplitter } from '../../../base/node/nodeStreams.js';
 import { findExecutable } from '../../../base/node/processes.js';
 import { LogLevel } from '../../../platform/log/common/log.js';
 import { expandEnvironmentVariablesInLaunch } from '../../contrib/mcp/common/mcpEnvironmentVariableExpansion.js';
-import { McpConnectionState, McpServerEnvironmentVariableExpansion, McpServerLaunch, McpServerTransportStdio, McpServerTransportType } from '../../contrib/mcp/common/mcpTypes.js';
+import { IMcpMessageEnvelope, McpConnectionState, McpServerEnvironmentVariableExpansion, McpServerLaunch, McpServerTransportStdio, McpServerTransportType } from '../../contrib/mcp/common/mcpTypes.js';
 import { McpStdioStateHandler } from '../../contrib/mcp/node/mcpStdioStateHandler.js';
 import { CommonRequestInit, CommonResponse, ExtHostMcpService, McpHTTPHandle } from '../common/extHostMcp.js';
 
@@ -51,12 +52,20 @@ export class NodeExtHostMpcService extends ExtHostMcpService {
 		}
 	}
 
-	override $sendMessage(id: number, message: string): void {
+	override $sendMessage(id: number, message: string, envelope?: IMcpMessageEnvelope): void {
 		const nodeServer = this.nodeServers.get(id);
 		if (nodeServer) {
+			// stdio frames carry no envelope: the era shows in the message itself.
 			nodeServer.write(message);
 		} else {
-			super.$sendMessage(id, message);
+			super.$sendMessage(id, message, envelope);
+		}
+	}
+
+	override $cancelRequest(id: number, requestId: JsonRpcId): void {
+		if (!this.nodeServers.has(id)) {
+			// stdio has no per-request stream to abort; the engine sends notifications/cancelled instead.
+			super.$cancelRequest(id, requestId);
 		}
 	}
 

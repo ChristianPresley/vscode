@@ -8,6 +8,7 @@ import { assertNever } from '../../../../base/common/assert.js';
 import { decodeHex, encodeHex, VSBuffer } from '../../../../base/common/buffer.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Event } from '../../../../base/common/event.js';
+import { JsonRpcId } from '../../../../base/common/jsonRpcProtocol.js';
 import { IMarkdownString } from '../../../../base/common/htmlContent.js';
 import { Disposable, IDisposable } from '../../../../base/common/lifecycle.js';
 import { equals as objectsEqual } from '../../../../base/common/objects.js';
@@ -900,6 +901,53 @@ export interface IMcpClientMethods {
 	createMessageRequestHandler?(req: MCPLegacy.CreateMessageRequest['params'], token?: CancellationToken): Promise<MCPLegacy.CreateMessageResult>;
 	/** Handler for `elicitation/create` */
 	elicitationRequestHandler?(req: MCPLegacy.ElicitRequest['params'], token?: CancellationToken): Promise<MCPLegacy.ElicitResult>;
+}
+
+/**
+ * Transport-level metadata the protocol engine attaches to every message it
+ * sends. Transports that need it (Streamable HTTP, gRPC) derive their wire
+ * behaviour from it: the protocol era from `protocolVersion`, the mirrored
+ * HTTP headers, deadlines. A message sent without an envelope is treated as
+ * legacy (2025-11-25) traffic and goes on the wire exactly as before.
+ */
+export interface IMcpMessageEnvelope {
+	readonly kind: 'request' | 'notification' | 'listen';
+	/** The JSON-RPC id for requests and listen streams. */
+	readonly requestId?: JsonRpcId;
+	/** The protocol revision the message is sent under. */
+	readonly protocolVersion: string;
+	readonly method: string;
+	/** Mirrored `Mcp-*` headers computed by the engine (modern HTTP and gRPC only). */
+	readonly headers?: Readonly<Record<string, string>>;
+	/** A per-request deadline for transports that support one (gRPC). */
+	readonly deadlineMs?: number;
+}
+
+/**
+ * Reported by a transport when a request can no longer be answered by the
+ * peer: the engine fails the pending request locally. Transports never
+ * synthesize JSON-RPC error messages for these conditions.
+ */
+export interface IMcpRequestAbort {
+	readonly requestId: JsonRpcId;
+	readonly reason:
+	/** A modern probe hit a legacy server (recognized by its HTTP status/body). */
+	| 'legacy-probe'
+	/** The HTTP response status does not carry a JSON-RPC message. */
+	| 'http-status'
+	/** The response stream ended before the response arrived. */
+	| 'stream-closed'
+	/** The request could not be sent or the connection failed. */
+	| 'transport-error'
+	/** A gRPC status-only failure (no `mcp-error-*` trailers). */
+	| 'grpc-status'
+	/** The per-request deadline elapsed. */
+	| 'deadline'
+	/** The message cannot be expressed on this transport. */
+	| 'unexpressible';
+	readonly message?: string;
+	readonly httpStatus?: number;
+	readonly grpcStatus?: number;
 }
 
 /**
