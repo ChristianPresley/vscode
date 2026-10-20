@@ -9,6 +9,7 @@ import { DeferredPromise, disposableTimeout, IntervalTimer, isThenable } from '.
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { CancellationError } from '../../../../base/common/errors.js';
 import { Emitter } from '../../../../base/common/event.js';
+import { jsonRpcCodeForGrpcStatus } from '../../../../base/common/grpc/status.js';
 import { Iterable } from '../../../../base/common/iterator.js';
 import { IJsonRpcNotification, IJsonRpcRequest, isJsonRpcNotification, isJsonRpcRequest, JsonRpcError, JsonRpcId, JsonRpcMessage, JsonRpcProtocol } from '../../../../base/common/jsonRpcProtocol.js';
 import { Disposable, DisposableStore, IDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
@@ -18,10 +19,10 @@ import { canLog, ILogger, log, LogLevel } from '../../../../platform/log/common/
 import { collectHeaderAnnotations, McpHeaderAnnotation } from '../../../../platform/mcp/common/mcpHttpHeaders.js';
 import { eraForProtocolVersion, LATEST_MCP_PROTOCOL_VERSION, McpProtocolEra, META_SERVER_INFO, negotiateProtocolVersion, SUPPORTED_MCP_PROTOCOL_VERSIONS } from '../../../../platform/mcp/common/mcpProtocolVersions.js';
 import { MCP } from '../../../../platform/mcp/common/modelContextProtocol.js';
-import { IProductService } from '../../../../platform/product/common/productService.js';
 import { McpTasks } from '../../../../platform/mcp/common/modelContextProtocolTasks.js';
-import { buildClientCapabilities, buildEnvelope, buildRequestMeta, getResultType, IMcpRequestMetaBase, mapLogLevelToMcp, MAX_MRTR_ROUNDS, McpProtocolEvent, parseInputRequiredResult, PROBE_TIMEOUT_MS, validateElicitFormContent } from './mcpProtocolMeta.js';
+import { IProductService } from '../../../../platform/product/common/productService.js';
 import { McpModernTask } from './mcpModernTask.js';
+import { buildClientCapabilities, buildEnvelope, buildRequestMeta, getResultType, IMcpRequestMetaBase, mapLogLevelToMcp, MAX_MRTR_ROUNDS, McpProtocolEvent, parseInputRequiredResult, PROBE_TIMEOUT_MS, validateElicitFormContent } from './mcpProtocolMeta.js';
 import { IMcpMessageTransport } from './mcpRegistryTypes.js';
 import { IMcpListenHost, McpSubscriptionManager } from './mcpSubscriptions.js';
 import { IMcpTaskInternal, McpTaskManager } from './mcpTaskManager.js';
@@ -79,9 +80,9 @@ interface ISendOptions {
 	readonly deadlineMs?: number;
 	/** Result types the caller handles itself (besides `complete`). */
 	readonly acceptResultTypes?: readonly string[];
-}
 	/** Declare the Tasks extension (`io.modelcontextprotocol/tasks`) in this request's client capabilities (modern only). */
 	readonly tasks?: boolean;
+}
 
 type ProbeOutcome =
 	| { readonly kind: 'modern'; readonly version: string; readonly result: MCP.DiscoverResult }
@@ -727,8 +728,8 @@ export class McpServerRequestHandler extends Disposable {
 				sampling: !!this._createMessageRequestHandler,
 				samplingTools: true,
 				elicitation: !!this._elicitationRequestHandler,
-			}),
 				tasks,
+			}),
 			logLevel: this._logLevel,
 		};
 	}
@@ -769,6 +770,14 @@ export class McpServerRequestHandler extends Disposable {
 			return;
 		}
 		const message = abort.message ?? `The request was aborted by the transport (${abort.reason})`;
+		// A gRPC status-only failure with a JSON-RPC equivalent (INVALID_ARGUMENT, UNIMPLEMENTED,
+		// NOT_FOUND, INTERNAL, ...) is a protocol error; CANCELLED, DEADLINE_EXCEEDED, UNAVAILABLE,
+		// UNAUTHENTICATED and PERMISSION_DENIED stay transport failures.
+		const code = abort.reason === 'grpc-status' && abort.grpcStatus !== undefined ? jsonRpcCodeForGrpcStatus(abort.grpcStatus) : undefined;
+		if (code !== undefined) {
+			this._rpc.failPendingRequest(abort.requestId, new MpcResponseError(message, code, { grpcStatus: abort.grpcStatus }));
+			return;
+		}
 		this._rpc.failPendingRequest(abort.requestId, new McpClientError('request-aborted', message, abort));
 	}
 
@@ -1071,15 +1080,6 @@ export class McpServerRequestHandler extends Disposable {
 		}
 	}
 
-	//#endregion
-
-	//#region public API
-
-	/** Re-fetches `server/discover` (modern servers). */
-	async discover(token?: CancellationToken): Promise<MCP.DiscoverResult | undefined> {
-		if (this.era !== 'modern') {
-			return undefined;
-		}
 	/**
 	 * Answers the input requests of a task waiting in `input_required` (the
 	 * Tasks extension) with the same handlers and checks as a multi
@@ -1097,6 +1097,15 @@ export class McpServerRequestHandler extends Disposable {
 		return inputResponses;
 	}
 
+	//#endregion
+
+	//#region public API
+
+	/** Re-fetches `server/discover` (modern servers). */
+	async discover(token?: CancellationToken): Promise<MCP.DiscoverResult | undefined> {
+		if (this.era !== 'modern') {
+			return undefined;
+		}
 		const result = await this._request<MCP.DiscoverResult>('server/discover', {}, token ?? CancellationToken.None);
 		this._discoverResult = result;
 		this._discoverHint = cacheHintOf(result);
@@ -1257,15 +1266,6 @@ export class McpServerRequestHandler extends Disposable {
 	 * answer with a `CreateTaskResult`, which is then polled to its result.
 	 */
 	async callTool(params: MCPLegacy.CallToolRequest['params'] & MCPLegacy.Request['params'], token: CancellationToken = CancellationToken.None, onStatusMessage?: (message: string) => void, context?: IMcpToolCallContext): Promise<MCPLegacy.CallToolResult> {
-		const response = await this._sendWithInputs<MCPLegacy.CallToolResult | MCPLegacy.CreateTaskResult>('tools/call', params, token, context, onStatusMessage);
-
-		if (this._negotiated?.era === 'legacy' && isTaskResult(response)) {
-			const task = new McpTask<MCPLegacy.CallToolResult>(response.task, token, onStatusMessage);
-			this._taskManager.adoptClientTask(task);
-			task.setHandler(this);
-			return task.result.finally(() => {
-				this._taskManager.abandonClientTask(task.id);
-			});
 		if (this._negotiated?.era === 'modern') {
 			const { task, ...modernParams } = params;
 			const tasks = task !== undefined && this.supportsModernTasks;
@@ -1282,6 +1282,15 @@ export class McpServerRequestHandler extends Disposable {
 			});
 		}
 
+		const response = await this._sendWithInputs<MCPLegacy.CallToolResult | MCPLegacy.CreateTaskResult>('tools/call', params, token, context, onStatusMessage);
+
+		if (this._negotiated?.era === 'legacy' && isTaskResult(response)) {
+			const task = new McpTask<MCPLegacy.CallToolResult>(response.task, token, onStatusMessage);
+			this._taskManager.adoptClientTask(task);
+			task.setHandler(this);
+			return task.result.finally(() => {
+				this._taskManager.abandonClientTask(task.id);
+			});
 		}
 
 		return response as MCPLegacy.CallToolResult;
@@ -1336,15 +1345,6 @@ export class McpServerRequestHandler extends Disposable {
 		);
 	}
 
-	//#endregion
-}
-
-/** Collects the per-page caching hints of a paginated listing into one hint (shortest TTL, private if any page is). */
-class CacheHintCollector {
-	private _ttlMs: number | undefined;
-	private _scope: 'public' | 'private' | undefined;
-	private _sawHint = false;
-	private readonly _receivedAt = Date.now();
 	/** Whether the server speaks 2026-07-28 and advertises the Tasks extension (`io.modelcontextprotocol/tasks`). */
 	get supportsModernTasks(): boolean {
 		if (this._negotiated?.era !== 'modern') {
@@ -1369,6 +1369,15 @@ class CacheHintCollector {
 		return this._request<McpTasks.CancelTaskResult>('tasks/cancel', params, token ?? CancellationToken.None, { tasks: true });
 	}
 
+	//#endregion
+}
+
+/** Collects the per-page caching hints of a paginated listing into one hint (shortest TTL, private if any page is). */
+class CacheHintCollector {
+	private _ttlMs: number | undefined;
+	private _scope: 'public' | 'private' | undefined;
+	private _sawHint = false;
+	private readonly _receivedAt = Date.now();
 
 	add(result: unknown): void {
 		const hint = cacheHintOf(result);

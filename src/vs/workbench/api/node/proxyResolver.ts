@@ -141,6 +141,8 @@ export function connectProxyResolver(
 	const target = (proxyAgent as any).default || proxyAgent;
 	target.resolveProxyURL = resolveProxyURL;
 	target.resolveProxyByURL = resolveProxyByURL;
+	// For connections that tunnel through a proxy themselves (the gRPC transport of MCP).
+	target.lookupProxyAuthorization = params.lookupProxyAuthorization;
 
 	patchGlobalFetch(params, configProvider, mainThreadTelemetry, initData, resolveProxyURL, disposables);
 	patchGlobalWebSocket(params, resolveProxyURL);

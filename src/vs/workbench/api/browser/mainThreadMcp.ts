@@ -56,6 +56,10 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 	private readonly _servers = new Map<number, ExtHostMcpServerLaunch>();
 	private readonly _serverDefinitions = new Map<number, McpServerDefinition>();
 	private readonly _serverRequestUrls = new Map<number, Set<string>>();
+	/** Running gRPC servers whose launch sets `tls.insecure`. */
+	private readonly _insecureGrpcServers = new Set<number>();
+	/** Server definitions already warned about `tls.insecure` in this window. */
+	private readonly _warnedInsecureGrpcDefinitions = new Set<string>();
 	private readonly _serverAuthTracking = new McpServerAuthTracker();
 	private readonly _proxy: Proxied<ExtHostMcpShape>;
 	private readonly _collectionDefinitions = this._register(new DisposableMap<string, {
@@ -113,6 +117,10 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 				if (serverDefinition.launch.type === McpServerTransportType.Stdio && _extHostContext.extensionHostKind === ExtensionHostKind.LocalWebWorker) {
 					return false;
 				}
+				// gRPC needs Node.js `http2`, which the web worker extension host does not have.
+				if (serverDefinition.launch.type === McpServerTransportType.Grpc && _extHostContext.extensionHostKind === ExtensionHostKind.LocalWebWorker) {
+					return false;
+				}
 				return true;
 			},
 			async substituteVariables(serverDefinition, launch) {
@@ -138,6 +146,12 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 				this._serverDefinitions.set(id, serverDefiniton);
 				if (resolveLaunch.type === McpServerTransportType.HTTP) {
 					this._serverRequestUrls.set(id, new Set([resolveLaunch.uri.toString(true)]));
+				} else if (resolveLaunch.type === McpServerTransportType.Grpc) {
+					// The allow list governs gRPC destinations by their grpc:// or grpcs:// URL, as HTTP ones by theirs.
+					this._serverRequestUrls.set(id, new Set([resolveLaunch.uri.toString(true)]));
+					if (resolveLaunch.tls?.insecure) {
+						this._insecureGrpcServers.add(id);
+					}
 				}
 				proxy.$startMcp(id, {
 					launch: resolveLaunch,
@@ -250,7 +264,30 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 			return allowed.value;
 		}
 
+		if (this._insecureGrpcServers.has(id)) {
+			const denied = this._checkInsecureGrpc(id, definition);
+			if (denied !== undefined) {
+				return denied;
+			}
+		}
+
 		urls.add(url);
+		return undefined;
+	}
+
+	/**
+	 * `tls.insecure` turns off the verification of the server certificate. Under an allow list
+	 * defined by policy it is denied; otherwise the server's log gets a warning once per window.
+	 */
+	private _checkInsecureGrpc(id: number, definition: McpServerDefinition): string | undefined {
+		const policyAllowList = getMcpServerMatchers(this._configurationService.inspect<readonly IMcpServerMatcher[]>(mcpAllowedServersConfig).policyValue);
+		if (policyAllowList !== undefined) {
+			return nls.localize('mcp.grpc.insecureDenied', "The MCP server '{0}' turns off TLS certificate verification (`tls.insecure`), which is not allowed while your organization manages the allowed MCP servers.", definition.label);
+		}
+		if (!this._warnedInsecureGrpcDefinitions.has(definition.id)) {
+			this._warnedInsecureGrpcDefinitions.add(definition.id);
+			this._servers.get(id)?.pushLog(LogLevel.Warning, nls.localize('mcp.grpc.insecureWarning', "TLS certificate verification is turned off for the MCP server '{0}' (`tls.insecure`). Only use this for local development.", definition.label));
+		}
 		return undefined;
 	}
 
@@ -266,6 +303,7 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 			this._servers.delete(id);
 			this._serverDefinitions.delete(id);
 			this._serverRequestUrls.delete(id);
+			this._insecureGrpcServers.delete(id);
 			this._serverAuthTracking.untrack(id);
 		}
 	}
@@ -355,7 +393,7 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		let providerId = await this._authenticationService.getOrActivateProviderIdForServer(authorizationServer, resourceServer);
 
 		const resolvedClientId = clientId ?? authDetails.clientId;
-		const mcpServerUrl = server.launch.type === McpServerTransportType.HTTP ? server.launch.uri.toString(true) : undefined;
+		const mcpServerUrl = server.launch.type === McpServerTransportType.HTTP || server.launch.type === McpServerTransportType.Grpc ? server.launch.uri.toString(true) : undefined;
 		let clientSecretStorageKey: string | undefined;
 		let clientSecret: string | undefined;
 		let boundIssuer: string | undefined;
@@ -369,6 +407,17 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 				didLookupClientSecret = true;
 			} catch {
 				// Best-effort lookup; proceed without a client secret.
+			}
+		}
+
+		// Pre-registered credentials belong to one authorization server: the one configured
+		// (`oauth.authorizationServer`) or the one they were first used with. Nothing is sent to another.
+		if (resolvedClientId) {
+			const launchOAuth = server.launch.type === McpServerTransportType.HTTP || server.launch.type === McpServerTransportType.Grpc ? server.launch.oauth as IMcpRemoteServerOAuthConfiguration | undefined : undefined;
+			const expectedIssuer = resolveMcpOAuthPolicy(launchOAuth).authorizationServer ?? boundIssuer;
+			const discoveredIssuer = authDetails.authorizationServerMetadata.issuer;
+			if (expectedIssuer !== undefined && expectedIssuer !== discoveredIssuer) {
+				throw new OAuthClientError('issuer_not_registered', nls.localize('mcp.oauth.issuerMismatch', "The OAuth client '{0}' of the MCP server '{1}' is registered with the authorization server '{2}', but the server now names '{3}'. No credentials were sent. Update `oauth.clientId` (and `oauth.authorizationServer`) in the server's configuration to sign in with the new authorization server.", resolvedClientId, server.label, expectedIssuer, discoveredIssuer));
 			}
 		}
 
@@ -504,10 +553,10 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		const { authorizationServer, clientId, resource, audience } = authContext;
 		const providerOptions = { authorizationServer, clientId, clientSecret, resource, audience };
 		const sessions = await this._authenticationService.getSessions(providerId, scopes, { ...providerOptions, silent: errorOnUserInteraction }, true);
-		// Only HTTP servers authenticate, so the server URL is always known here. A token is only released
-		// to a server whose current URL matches the one the user consented to, so changing the URL while
-		// keeping the same id requires re-consent.
-		if (server.launch.type !== McpServerTransportType.HTTP) {
+		// Only HTTP and gRPC servers authenticate, so the server URL is always known here. A token is only
+		// released to a server whose current URL matches the one the user consented to, so changing the URL
+		// while keeping the same id requires re-consent.
+		if (server.launch.type !== McpServerTransportType.HTTP && server.launch.type !== McpServerTransportType.Grpc) {
 			return undefined;
 		}
 		const mcpServerUrl = server.launch.uri.toString(true);
@@ -713,6 +762,7 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		this._servers.clear();
 		this._serverDefinitions.clear();
 		this._serverRequestUrls.clear();
+		this._insecureGrpcServers.clear();
 		this._serverAuthTracking.clear();
 		super.dispose();
 	}

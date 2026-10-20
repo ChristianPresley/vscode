@@ -8,6 +8,8 @@ on:
       - 'src/vs/base/node/grpcChannel.ts'
       - 'src/vs/base/node/grpcServer.ts'
       - 'src/vs/platform/mcp/**'
+      - 'src/vs/workbench/api/node/extHostMcpGrpc.ts'
+      - 'src/vs/workbench/api/test/node/extHostMcpGrpc*.ts'
       - 'test/mcp-grpc/**'
       - '.github/workflows/mcp-grpc-interop.yml'
   workflow_dispatch:

@@ -22,6 +22,7 @@ import { expandEnvironmentVariablesInLaunch } from '../../contrib/mcp/common/mcp
 import { IMcpMessageEnvelope, McpConnectionState, McpServerEnvironmentVariableExpansion, McpServerLaunch, McpServerTransportStdio, McpServerTransportType } from '../../contrib/mcp/common/mcpTypes.js';
 import { McpStdioStateHandler } from '../../contrib/mcp/node/mcpStdioStateHandler.js';
 import { CommonRequestInit, CommonResponse, ExtHostMcpService, McpHTTPHandle } from '../common/extHostMcp.js';
+import { McpGrpcHandle } from './extHostMcpGrpc.js';
 
 export class NodeExtHostMpcService extends ExtHostMcpService {
 	private nodeServers = this._register(new DisposableMap<number, McpStdioStateHandler>());
@@ -31,6 +32,8 @@ export class NodeExtHostMpcService extends ExtHostMcpService {
 			this.startNodeMpc(id, launch, defaultCwd);
 		} else if (launch.type === McpServerTransportType.HTTP) {
 			this._sseEventSources.set(id, new McpHTTPHandleNode(id, launch, this._proxy, this._logService, errorOnUserInteraction));
+		} else if (launch.type === McpServerTransportType.Grpc) {
+			this._sseEventSources.set(id, new McpGrpcHandle(id, launch, this._proxy, this._logService, errorOnUserInteraction));
 		} else {
 			super._startMcp(id, launch, defaultCwd, errorOnUserInteraction);
 		}

@@ -31,7 +31,7 @@ import { ExtHostMcpShape, IMcpAuthenticationDetails, IAuthMetadataSource, IStart
 import { IExtHostInitDataService } from './extHostInitDataService.js';
 import { IExtHostRpcService } from './extHostRpcService.js';
 import * as Convert from './extHostTypeConverters.js';
-import { McpHttpServerDefinition, McpStdioServerDefinition, McpToolAvailability } from './extHostTypes.js';
+import { McpGrpcServerDefinition, McpHttpServerDefinition, McpStdioServerDefinition, McpToolAvailability } from './extHostTypes.js';
 import { IExtHostVariableResolverProvider } from './extHostVariableResolverService.js';
 import { IExtHostWorkspace } from './extHostWorkspace.js';
 import { createMcpOAuthClient, IMcpOAuthServerPolicy, MCP_OAUTH_MAX_AUTHORIZATION_REQUESTS, MCP_OAUTH_MAX_CHALLENGE_CYCLES, MCP_OAUTH_REJECTIONS_BEFORE_REREGISTRATION, resolveMcpOAuthPolicy } from './mcpOAuthClientFactory.js';
@@ -66,7 +66,14 @@ const serverDataValidation = vObj({
 	authentication: vOptionalProp(vObj({
 		providerId: vString(),
 		scopes: vArray(vString()),
-	}))
+	})),
+	// McpGrpcServerDefinition (proposed API `mcpGrpcServerDefinition`)
+	tls: vOptionalProp(vObj({
+		ca: vOptionalProp(vString()),
+		insecure: vOptionalProp(vBoolean()),
+		serverName: vOptionalProp(vString()),
+	})),
+	binding: vOptionalProp(vNumber()),
 });
 
 // Can be validated with:
@@ -230,6 +237,9 @@ export class ExtHostMcpService extends Disposable implements IExtHostMpcService 
 				if ((item as vscode.McpHttpServerDefinition2).authentication) {
 					checkProposedApiEnabled(extension, 'mcpToolDefinitions');
 				}
+				if (item instanceof McpGrpcServerDefinition) {
+					checkProposedApiEnabled(extension, 'mcpGrpcServerDefinition');
+				}
 
 				let staticMetadata: McpServerStaticMetadata | undefined;
 				const castAs2 = item as McpStdioServerDefinition | McpHttpServerDefinition;
@@ -327,6 +337,13 @@ export class ExtHostMcpService extends Disposable implements IExtHostMpcService 
 	}
 }
 
+/** A gateway server for the API; `grpcAddress` only when the gateway serves gRPC. */
+function reviveGatewayServer(server: IMcpGatewayServerDto): vscode.McpGatewayServer {
+	return server.grpcAddress
+		? { label: server.label, address: URI.revive(server.address), grpcAddress: URI.revive(server.grpcAddress) }
+		: { label: server.label, address: URI.revive(server.address) };
+}
+
 function stringifyError(err: unknown): string {
 	if (!(err instanceof Error)) {
 		return String(err);
@@ -338,13 +355,6 @@ function stringifyError(err: unknown): string {
 		cause = cause instanceof Error ? cause.cause : undefined;
 	}
 	return msg;
-}
-
-/** A gateway server for the API; `grpcAddress` only when the gateway serves gRPC. */
-function reviveGatewayServer(server: IMcpGatewayServerDto): vscode.McpGatewayServer {
-	return server.grpcAddress
-		? { label: server.label, address: URI.revive(server.address), grpcAddress: URI.revive(server.grpcAddress) }
-		: { label: server.label, address: URI.revive(server.address) };
 }
 
 const enum HttpMode {
@@ -1538,29 +1548,38 @@ function splitScopeParameter(scope: string | undefined): string[] {
 	return scope ? scope.split(AUTH_SCOPE_SEPARATOR).filter(s => s.trim().length > 0) : [];
 }
 
-		return new AuthMetadata(
-			URI.parse(serverMetadataUrl),
-			metadata,
-			resource,
-			scopesChallenge,
-			{ resourceMetadataSource, serverMetadataSource },
-			log
-		);
-	} catch (e) {
-		log(LogLevel.Warning, `Error populating auth server metadata for ${serverMetadataUrl}: ${String(e)}`);
-	}
+/**
+ * Step-ups (re-authorizations for `insufficient_scope`) per canonical resource
+ * for the lifetime of the extension host. With the initial authorization they
+ * may make at most {@link MCP_OAUTH_MAX_AUTHORIZATION_REQUESTS} authorization
+ * requests.
+ */
+const processStepUps = new Map<string, number>();
 
-	// If there's no well-known server metadata, then use the default values based off of the url.
-	const defaultMetadata = getDefaultMetadataForUrl(new URL(baseUrl));
-	log(LogLevel.Info, 'Using default auth metadata');
-	return new AuthMetadata(
-		URI.parse(baseUrl),
-		defaultMetadata,
-		resource,
-		scopesChallenge,
-		{ resourceMetadataSource, serverMetadataSource: IAuthServerMetadataSource.Default },
-		log
-	);
+/** What an {@link McpAuthHeaderProvider} needs from the transport that owns it. */
+export interface IMcpAuthHeaderProviderHost {
+	readonly id: number;
+	readonly launch: {
+		readonly uri: URI;
+		readonly headers: readonly (readonly [string, string])[];
+		readonly oauth?: McpServerTransportHTTP['oauth'];
+		readonly authentication?: McpServerTransportHTTP['authentication'];
+	};
+	readonly proxy: Pick<MainThreadMcpShape, '$getTokenFromServerMetadata' | '$getTokenForProviderId' | '$onDidChangeState' | '$logMcpAuthSetup'>;
+	readonly errorOnUserInteraction?: boolean;
+	/** The protocol revision of the traffic; metadata requests to the resource origin carry it. */
+	protocolVersion(): string | undefined;
+	/**
+	 * Fetches authorization metadata. It is not subject to the server allow
+	 * list; `transportHeaders` are generated headers that survive cross-origin
+	 * redirects.
+	 */
+	fetchMetadata(url: string, init: MinimalRequestInit, transportHeaders: Readonly<Record<string, string>> | undefined): Promise<CommonResponse>;
+	log(level: LogLevel, message: string): void;
+	/** The URL protected resource metadata is discovered for, when it is not the launch URI (a `grpc(s)://` server's HTTPS identity). */
+	resourceUrl?(): string;
+	/** Step-ups per resource; defaults to the process-wide counter. */
+	readonly stepUps?: Map<string, number>;
 }
 
 /**

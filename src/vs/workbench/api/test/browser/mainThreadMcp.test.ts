@@ -36,6 +36,7 @@ import { IAuthenticationMcpService } from '../../../services/authentication/brow
 import { IAuthenticationMcpUsageService } from '../../../services/authentication/browser/authenticationMcpUsageService.js';
 import { AuthenticationSession, AuthenticationSessionsChangeEvent, IAuthenticationGetSessionsOptions, IAuthenticationProvider, IAuthenticationService, IAuthenticationWwwAuthenticateRequest } from '../../../services/authentication/common/authentication.js';
 import { IDynamicAuthenticationProviderStorageService } from '../../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
+import { ExtensionHostKind } from '../../../services/extensions/common/extensionHostKind.js';
 import { IExtensionService } from '../../../services/extensions/common/extensions.js';
 import { TestExtensionService } from '../../../test/common/workbenchTestServices.js';
 import { IMcpServerAuthContext, MainThreadMcp, McpServerAuthTracker } from '../../browser/mainThreadMcp.js';
@@ -43,7 +44,7 @@ import { ExtHostMcpShape, IMcpAuthenticationDetails } from '../../common/extHost
 import { CommonRequestInit, CommonResponse, McpHTTPHandle } from '../../common/extHostMcp.js';
 import { SingleProxyRPCProtocol } from '../common/testRPCProtocol.js';
 
-function createMainThreadMcp(disposables: Pick<DisposableStore, 'add'>, proxy: Partial<ExtHostMcpShape>, registry: IMcpRegistry, configure?: (services: TestInstantiationService) => void): MainThreadMcp {
+function createMainThreadMcp(disposables: Pick<DisposableStore, 'add'>, proxy: Partial<ExtHostMcpShape>, registry: IMcpRegistry, configure?: (services: TestInstantiationService) => void, extensionHostKind?: ExtensionHostKind): MainThreadMcp {
 	const services = disposables.add(new TestInstantiationService());
 	services.stub(IMcpRegistry, registry);
 	services.stub(IDialogService, {});
@@ -63,7 +64,8 @@ function createMainThreadMcp(disposables: Pick<DisposableStore, 'add'>, proxy: P
 		isServerAllowed: () => true,
 	});
 	configure?.(services);
-	return disposables.add(services.createInstance(MainThreadMcp, SingleProxyRPCProtocol(proxy)));
+	const context = SingleProxyRPCProtocol(proxy);
+	return disposables.add(services.createInstance(MainThreadMcp, extensionHostKind === undefined ? context : { ...context, extensionHostKind }));
 }
 
 suite('MainThreadMcp - McpServerAuthTracker', () => {
@@ -760,5 +762,118 @@ suite('MainThreadMcp - request policy', () => {
 		mainThread.$onDidChangeState(1, { state: McpConnectionState.Kind.Stopped });
 		await assert.rejects(fetch(), isCancellationError);
 		assert.deepStrictEqual(requests, []);
+	});
+});
+
+suite('MainThreadMcp - gRPC', () => {
+	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
+
+	/** A configuration whose `inspect` reports the given values as policy values. */
+	class PolicyConfigurationService extends TestConfigurationService {
+		constructor(configuration: Record<string, unknown>, private readonly _policy: Record<string, unknown>) {
+			super(configuration);
+		}
+
+		override inspect<T>(key: string, overrides?: IConfigurationOverrides): IConfigurationValue<T> {
+			const value = super.inspect<T>(key, overrides);
+			return Object.prototype.hasOwnProperty.call(this._policy, key) ? { ...value, policyValue: this._policy[key] as T } : value;
+		}
+	}
+
+	function grpcLaunch(url: string, tls?: { insecure?: boolean }): McpServerLaunch {
+		return { type: McpServerTransportType.Grpc, uri: URI.parse(url), headers: [], tls };
+	}
+
+	function collectionOf(definitions: McpServerDefinition[]): McpCollectionDefinition {
+		return {
+			id: 'collection-grpc',
+			label: 'Collection',
+			remoteAuthority: null,
+			serverDefinitions: observableValue<readonly McpServerDefinition[]>('definitions', definitions),
+			trustBehavior: McpServerTrust.Kind.Trusted,
+			scope: StorageScope.WORKSPACE,
+			configTarget: ConfigurationTarget.USER,
+			order: McpCollectionSortOrder.WorkspaceFolder,
+		};
+	}
+
+	function create(options: { allowed?: readonly IMcpServerMatcher[]; policyAllowed?: readonly IMcpServerMatcher[]; extensionHostKind?: ExtensionHostKind } = {}) {
+		const configuration = new PolicyConfigurationService(
+			{ [mcpAllowedServersConfig]: options.policyAllowed ?? options.allowed },
+			options.policyAllowed ? { [mcpAllowedServersConfig]: options.policyAllowed } : {},
+		);
+		disposables.add(configuration.onDidChangeConfigurationEmitter);
+		const policy = disposables.add(new AllowedMcpServersService(configuration));
+		const started: Parameters<ExtHostMcpShape['$startMcp']>[] = [];
+		let delegate: IMcpHostDelegate | undefined;
+		const registry = new class extends mock<IMcpRegistry>() {
+			override readonly collections = observableValue<readonly McpCollectionDefinition[]>('collections', []);
+			override registerDelegate(value: IMcpHostDelegate) {
+				delegate = value;
+				return { dispose() { } };
+			}
+		};
+		const mainThread = createMainThreadMcp(disposables, {
+			$startMcp(...args) { started.push(args); },
+			$stopMcp() { },
+			$sendMessage() { },
+			$onDidChangeMcpServerDefinitions() { },
+		}, registry, services => {
+			services.stub(IConfigurationService, configuration);
+			services.stub(IAllowedMcpServersService, policy);
+		}, options.extensionHostKind);
+		assert.ok(delegate);
+		return { mainThread, delegate, started };
+	}
+
+	test('gRPC servers start on Node.js extension hosts only', () => {
+		const grpc: McpServerDefinition = { id: 'grpc', label: 'gRPC', cacheNonce: 'n', launch: grpcLaunch('grpc://127.0.0.1:50051') };
+		const http: McpServerDefinition = { id: 'http', label: 'HTTP', cacheNonce: 'n', launch: { type: McpServerTransportType.HTTP, uri: URI.parse('https://example.com/mcp'), headers: [] } };
+		const web = create({ extensionHostKind: ExtensionHostKind.LocalWebWorker });
+		const node = create({ extensionHostKind: ExtensionHostKind.LocalProcess });
+		assert.deepStrictEqual({
+			webGrpc: web.delegate.canStart(collectionOf([grpc]), grpc),
+			webHttp: web.delegate.canStart(collectionOf([http]), http),
+			nodeGrpc: node.delegate.canStart(collectionOf([grpc]), grpc),
+		}, { webGrpc: false, webHttp: true, nodeGrpc: true });
+	});
+
+	test('the allow list governs gRPC destinations by their URL', async () => {
+		const { mainThread, delegate, started } = create({ allowed: [{ serverUrl: 'grpc://allowed.example:50051' }] });
+		const allowed: McpServerDefinition = { id: 'a', label: 'Allowed', cacheNonce: 'n', launch: grpcLaunch('grpc://allowed.example:50051') };
+		const other: McpServerDefinition = { id: 'b', label: 'Other', cacheNonce: 'n', launch: grpcLaunch('grpc://other.example:50051') };
+		disposables.add(delegate.start(collectionOf([allowed, other]), allowed, allowed.launch));
+		disposables.add(delegate.start(collectionOf([allowed, other]), other, other.launch));
+
+		assert.strictEqual(await mainThread.$checkMcpServerAllowed(1, 'grpc://allowed.example:50051'), undefined);
+		assert.match(await mainThread.$checkMcpServerAllowed(2, 'grpc://other.example:50051') ?? '', /not in the list of servers allowed/);
+		assert.deepStrictEqual(started.map(([id, opts]) => [id, opts.launch.type]), [[1, McpServerTransportType.Grpc], [2, McpServerTransportType.Grpc]]);
+	});
+
+	test('tls.insecure is denied under an allow list defined by policy', async () => {
+		const { mainThread, delegate } = create({ policyAllowed: [{ serverName: 'Insecure' }] });
+		const insecure: McpServerDefinition = { id: 'i', label: 'Insecure', cacheNonce: 'n', launch: grpcLaunch('grpcs://dev.example:50051', { insecure: true }) };
+		const verified: McpServerDefinition = { id: 'v', label: 'Insecure', cacheNonce: 'n', launch: grpcLaunch('grpcs://dev.example:50051') };
+		disposables.add(delegate.start(collectionOf([insecure]), insecure, insecure.launch));
+		disposables.add(delegate.start(collectionOf([verified]), verified, verified.launch));
+
+		assert.match(await mainThread.$checkMcpServerAllowed(1, 'grpcs://dev.example:50051') ?? '', /tls\.insecure/);
+		assert.strictEqual(await mainThread.$checkMcpServerAllowed(2, 'grpcs://dev.example:50051'), undefined);
+	});
+
+	test('tls.insecure without a policy allow list is allowed with a warning once per server', async () => {
+		const { mainThread, delegate } = create();
+		const insecure: McpServerDefinition = { id: 'i', label: 'Insecure', cacheNonce: 'n', launch: grpcLaunch('grpcs://dev.example:50051', { insecure: true }) };
+		const logs: string[] = [];
+		const first = disposables.add(delegate.start(collectionOf([insecure]), insecure, insecure.launch));
+		disposables.add(first.onDidLog(e => e.level === LogLevel.Warning && logs.push(e.message)));
+		assert.strictEqual(await mainThread.$checkMcpServerAllowed(1, 'grpcs://dev.example:50051'), undefined);
+		assert.strictEqual(await mainThread.$checkMcpServerAllowed(1, 'grpcs://dev.example:50051'), undefined);
+		mainThread.$onDidChangeState(1, { state: McpConnectionState.Kind.Stopped });
+		const second = disposables.add(delegate.start(collectionOf([insecure]), insecure, insecure.launch));
+		disposables.add(second.onDidLog(e => e.level === LogLevel.Warning && logs.push(e.message)));
+		assert.strictEqual(await mainThread.$checkMcpServerAllowed(2, 'grpcs://dev.example:50051'), undefined);
+		assert.strictEqual(logs.length, 1);
+		assert.match(logs[0], /tls\.insecure/);
 	});
 });
