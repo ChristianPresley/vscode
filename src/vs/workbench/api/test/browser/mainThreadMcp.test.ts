@@ -13,12 +13,12 @@ import { JsonRpcId } from '../../../../base/common/jsonRpcProtocol.js';
 import { URI } from '../../../../base/common/uri.js';
 import { mock } from '../../../../base/test/common/mock.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { ConfigurationTarget, IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
+import { ConfigurationTarget, IConfigurationOverrides, IConfigurationService, IConfigurationValue } from '../../../../platform/configuration/common/configuration.js';
 import { TestConfigurationService } from '../../../../platform/configuration/test/common/testConfigurationService.js';
 import { IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
 import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { TestInstantiationService } from '../../../../platform/instantiation/test/common/instantiationServiceMock.js';
-import { NullLogService } from '../../../../platform/log/common/log.js';
+import { LogLevel, NullLogService } from '../../../../platform/log/common/log.js';
 import { IMcpServerMatcher } from '../../../../platform/mcp/common/allowedMcpServers.js';
 import { AllowedMcpServersService } from '../../../../platform/mcp/common/allowedMcpServersService.js';
 import { IAllowedMcpServersService, mcpAccessConfig, mcpAllowedServersConfig, mcpDeniedServersConfig, McpAccessValue } from '../../../../platform/mcp/common/mcpManagement.js';
@@ -27,7 +27,9 @@ import { StorageScope } from '../../../../platform/storage/common/storage.js';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
 import { IWorkbenchMcpGatewayService } from '../../../contrib/mcp/common/mcpGatewayService.js';
 import { IMcpHostDelegate, IMcpRegistry } from '../../../contrib/mcp/common/mcpRegistryTypes.js';
-import { IMcpMessageEnvelope, IMcpRequestAbort, McpCollectionDefinition, McpCollectionSortOrder, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, McpServerTrust, mcpOAuthClientSecretStorageKey } from '../../../contrib/mcp/common/mcpTypes.js';
+import { IMcpMessageEnvelope, IMcpRequestAbort, McpCollectionDefinition, McpCollectionSortOrder, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportHTTP, McpServerTransportType, McpServerTrust, mcpOAuthClientSecretStorageKey } from '../../../contrib/mcp/common/mcpTypes.js';
+import { OAuthClientError } from '../../../../base/common/oauth.js';
+import { IMcpRemoteServerOAuthConfiguration } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
 import { mcpEnterpriseManagedAuthIdpSection } from '../../../contrib/mcp/common/mcpConfiguration.js';
 import { IAuthenticationMcpAccessService } from '../../../services/authentication/browser/authenticationMcpAccessService.js';
 import { IAuthenticationMcpService } from '../../../services/authentication/browser/authenticationMcpService.js';
@@ -442,6 +444,172 @@ suite('MainThreadMcp - re-validation', () => {
 
 	test('revalidates clients without a secret-storage key without reading secret storage', async () => {
 		await assertRevalidationContext(false, undefined);
+	});
+});
+
+suite('MainThreadMcp - authorization rules', () => {
+
+	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
+
+	const serverUrl = 'https://myserver.example/mcp';
+	const asA = 'https://as-a.example';
+	const asB = 'https://as-b.example';
+
+	interface IAuthHarness {
+		readonly mainThreadMcp: MainThreadMcp;
+		readonly secrets: Map<string, string>;
+		readonly getSessionsCalls: Array<{ id: string; scopes: ReadonlyArray<string> | IAuthenticationWwwAuthenticateRequest | undefined }>;
+		readonly removed: Array<[string, string]>;
+		readonly unregistered: string[];
+		readonly removedProviders: string[];
+		readonly created: string[];
+	}
+
+	function createHarness(options: {
+		readonly providerId?: string;
+		readonly dynamic?: boolean;
+		readonly sessions?: AuthenticationSession[];
+		readonly oauth?: McpServerTransportHTTP['oauth'];
+		readonly interactedProviders?: string[];
+	} = {}): IAuthHarness {
+		const secrets = new Map<string, string>();
+		const getSessionsCalls: IAuthHarness['getSessionsCalls'] = [];
+		const removed: Array<[string, string]> = [];
+		const unregistered: string[] = [];
+		const removedProviders: string[] = [];
+		const created: string[] = [];
+		const sessions = options.sessions ?? [{ id: 'session-1', accessToken: 'access-token', account: { id: 'a', label: 'user' }, scopes: [] }];
+		const authenticationService = new class extends mock<IAuthenticationService>() {
+			override readonly onDidChangeSessions = Event.None;
+			override async getOrActivateProviderIdForServer(): Promise<string | undefined> { return options.providerId; }
+			override isDynamicAuthenticationProvider(): boolean { return options.dynamic ?? true; }
+			override getProvider(id: string): IAuthenticationProvider {
+				return new class extends mock<IAuthenticationProvider>() {
+					override readonly id = id;
+					override readonly label = 'Test Provider';
+					override readonly supportsMultipleAccounts = false;
+				};
+			}
+			override async getSessions(id: string, scopes?: ReadonlyArray<string> | IAuthenticationWwwAuthenticateRequest): Promise<ReadonlyArray<AuthenticationSession>> {
+				getSessionsCalls.push({ id, scopes });
+				return sessions;
+			}
+			override async removeSession(id: string, sessionId: string): Promise<void> { removed.push([id, sessionId]); }
+			override unregisterAuthenticationProvider(id: string): void { unregistered.push(id); }
+			override async createDynamicAuthenticationProvider(authorizationServer: URI): Promise<IAuthenticationProvider | undefined> {
+				const id = `${authorizationServer.toString(true)} ${serverUrl}`;
+				created.push(id);
+				return this.getProvider(id);
+			}
+		};
+		const mcpRegistry = new class extends mock<IMcpRegistry>() {
+			override readonly collections = observableValue<readonly McpCollectionDefinition[]>('collections', []);
+			delegate: IMcpHostDelegate | undefined;
+			override registerDelegate(delegate: IMcpHostDelegate) {
+				this.delegate = delegate;
+				return { dispose() { } };
+			}
+		};
+		const mainThreadMcp = createMainThreadMcp(disposables, { $startMcp() { }, $stopMcp() { }, $sendMessage() { }, $onDidChangeMcpServerDefinitions() { } }, mcpRegistry, services => {
+			services.stub(IAuthenticationService, authenticationService);
+			services.stub(IAuthenticationMcpService, { getAccountPreference: () => undefined });
+			services.stub(IAuthenticationMcpAccessService, { isAccessAllowedForUrl: () => true });
+			services.stub(IAuthenticationMcpUsageService, { addAccountUsage() { } });
+			services.stub(ISecretStorageService, {
+				async get(key: string) { return secrets.get(key); },
+				async set(key: string, value: string) { secrets.set(key, value); },
+			});
+			services.stub(IDynamicAuthenticationProviderStorageService, {
+				getInteractedProviders: () => (options.interactedProviders ?? []).map(providerId => ({ providerId, label: providerId, authorizationServer: providerId.split(' ')[0], clientId: 'c' })),
+				async removeDynamicProvider(providerId: string) { removedProviders.push(providerId); },
+				async getClientRegistration() { return undefined; },
+			});
+		});
+		const launch: McpServerTransportHTTP = { type: McpServerTransportType.HTTP, uri: URI.parse(serverUrl), headers: [], oauth: options.oauth };
+		const serverDefinition: McpServerDefinition = { id: 'my-server', label: 'My Server', launch, cacheNonce: 'nonce-1' };
+		const collection: McpCollectionDefinition = {
+			remoteAuthority: null,
+			id: 'collection-1',
+			label: 'Collection',
+			serverDefinitions: observableValue<readonly McpServerDefinition[]>('serverDefinitions', [serverDefinition]),
+			trustBehavior: McpServerTrust.Kind.Trusted,
+			scope: StorageScope.WORKSPACE,
+			configTarget: ConfigurationTarget.USER,
+			order: McpCollectionSortOrder.Extension,
+		};
+		mcpRegistry.delegate!.start(collection, serverDefinition, launch, {});
+		mainThreadMcp.$onDidChangeState(1, { state: McpConnectionState.Kind.Running });
+		return { mainThreadMcp, secrets, getSessionsCalls, removed, unregistered, removedProviders, created };
+	}
+
+	function details(issuer: string, overrides: Partial<IMcpAuthenticationDetails> = {}): IMcpAuthenticationDetails {
+		return {
+			authorizationServer: URI.parse(issuer).toJSON(),
+			authorizationServerMetadata: { issuer, response_types_supported: ['code'], scopes_supported: ['as.scope'] },
+			resourceMetadata: { resource: serverUrl, authorization_servers: [issuer] },
+			scopes: undefined,
+			resource: serverUrl,
+			...overrides,
+		};
+	}
+
+	test('a rejected token removes its session, looked up without a scope filter', async () => {
+		const sessions: AuthenticationSession[] = [
+			{ id: 'old', accessToken: 'rejected-token', account: { id: 'a', label: 'user' }, scopes: ['x'] },
+			{ id: 'other', accessToken: 'other-token', account: { id: 'a', label: 'user' }, scopes: [] },
+		];
+		const { mainThreadMcp, getSessionsCalls, removed } = createHarness({ providerId: 'dynamic-provider', sessions });
+		await mainThreadMcp.$getTokenFromServerMetadata(1, details(asA), { rejectedToken: 'rejected-token' });
+		assert.deepStrictEqual({ firstLookup: getSessionsCalls[0], removed }, { firstLookup: { id: 'dynamic-provider', scopes: undefined }, removed: [['dynamic-provider', 'old']] });
+	});
+
+	test('a rejection never removes the session of a shared, non-dynamic provider', async () => {
+		const { mainThreadMcp, removed } = createHarness({ providerId: 'github', dynamic: false });
+		await mainThreadMcp.$getTokenFromServerMetadata(1, details(asA), { rejectedToken: 'access-token' });
+		assert.deepStrictEqual(removed, []);
+	});
+
+	test('scopes fall back to the authorization server only for servers without protected resource metadata', async () => {
+		const withPrm = createHarness({ providerId: 'p' });
+		await withPrm.mainThreadMcp.$getTokenFromServerMetadata(1, details(asA), {});
+		const withoutPrm = createHarness({ providerId: 'p' });
+		await withoutPrm.mainThreadMcp.$getTokenFromServerMetadata(1, details(asA, { resourceMetadata: undefined }), {});
+		const challenged = createHarness({ providerId: 'p' });
+		await challenged.mainThreadMcp.$getTokenFromServerMetadata(1, details(asA, { scopes: ['challenge.scope'] }), {});
+		assert.deepStrictEqual([withPrm, withoutPrm, challenged].map(h => h.getSessionsCalls[0].scopes), [[], ['as.scope'], ['challenge.scope']]);
+	});
+
+	test('pre-registered credentials are bound to the issuer of their first successful use and never sent to another', async () => {
+		const harness = createHarness({ providerId: 'p' });
+		const key = mcpOAuthClientSecretStorageKey(serverUrl, 'static-client');
+		harness.secrets.set(key, 'static-secret');
+		await harness.mainThreadMcp.$getTokenFromServerMetadata(1, details(asA, { clientId: 'static-client' }), {});
+		assert.deepStrictEqual(JSON.parse(harness.secrets.get(key)!), { clientSecret: 'static-secret', issuer: asA });
+
+		const lookups = harness.getSessionsCalls.length;
+		await assert.rejects(harness.mainThreadMcp.$getTokenFromServerMetadata(1, details(asB, { clientId: 'static-client' }), {}), (error: unknown) => {
+			assert.ok(error instanceof OAuthClientError && error.code === 'issuer_not_registered');
+			assert.ok(error.message.includes(asA) && error.message.includes(asB), error.message);
+			return true;
+		});
+		assert.strictEqual(harness.getSessionsCalls.length, lookups, 'nothing was requested from the other authorization server');
+	});
+
+	test('a configured oauth.authorizationServer binds the client from the start', async () => {
+		const oauthConfig: IMcpRemoteServerOAuthConfiguration = { clientId: 'static-client', authorizationServer: asA };
+		const { mainThreadMcp, getSessionsCalls } = createHarness({ providerId: 'p', oauth: oauthConfig });
+		await assert.rejects(mainThreadMcp.$getTokenFromServerMetadata(1, details(asB, { clientId: 'static-client' }), {}), /registered with the authorization server/);
+		assert.deepStrictEqual(getSessionsCalls, []);
+		await mainThreadMcp.$getTokenFromServerMetadata(1, details(asA, { clientId: 'static-client' }), {});
+		assert.strictEqual(getSessionsCalls.length, 1);
+	});
+
+	test('a new authorization server for the resource retires the dynamic provider of the previous one', async () => {
+		const stale = `${URI.parse(asA).toString(true)} ${serverUrl}`;
+		const unrelated = `${URI.parse(asA).toString(true)} https://other.example/mcp`;
+		const { mainThreadMcp, unregistered, removedProviders, created } = createHarness({ providerId: undefined, interactedProviders: [stale, unrelated] });
+		await mainThreadMcp.$getTokenFromServerMetadata(1, details(asB), {});
+		assert.deepStrictEqual({ unregistered, removedProviders, created }, { unregistered: [stale], removedProviders: [stale], created: [`${URI.parse(asB).toString(true)} ${serverUrl}`] });
 	});
 });
 

@@ -3,48 +3,9 @@
 # 2026-07-28; the suite then fails on any other failing (or WARNING) check and on
 # every listed check that passes.
 #
-# Each entry names one check, `<scenario>:<check-id>`. The conformance client
-# has no OAuth support yet, so every authorization scenario stops at the first
-# 401 and fails the checks of the flow it never runs. Milestone M5 implements
-# OAuth and empties this list. Refresh it with
+# Each entry names one check, `<scenario>:<check-id>`. Every scored scenario
+# passes, the authorization ones included (milestone M5: the transport answers
+# the challenges and the conformance OAuth client, built with the product's
+# rule set, registers and authorizes), so the list is empty. Refresh it with
 # `node test/mcp-conformance/run.ts client --requirements 2026-07-28 --update-baseline`.
-client:
-  - auth/authorization-server-migration:sep-2352-reregister-on-as-change
-  - auth/basic-cimd:cimd-client-id-used
-  - auth/iss-normalized:sep-2468-client-no-normalization
-  - auth/iss-not-advertised:sep-2468-client-proceed-no-iss
-  - auth/iss-supported-missing:sep-2468-client-reject-missing-iss
-  - auth/iss-supported:sep-2468-client-compare-iss-supported
-  - auth/iss-unexpected:sep-2468-client-compare-iss-unadvertised
-  - auth/iss-wrong-issuer:sep-2468-client-compare-iss-supported
-  - auth/metadata-default:authorization-request
-  - auth/metadata-default:client-registration
-  - auth/metadata-default:token-request
-  - auth/metadata-var1:authorization-request
-  - auth/metadata-var1:client-registration
-  - auth/metadata-var1:token-request
-  - auth/metadata-var2:authorization-request
-  - auth/metadata-var2:client-registration
-  - auth/metadata-var2:token-request
-  - auth/metadata-var3:authorization-request
-  - auth/metadata-var3:client-registration
-  - auth/metadata-var3:token-request
-  - auth/offline-access-not-supported:sep-2207-offline-access-not-requested
-  - auth/offline-access-scope:sep-2207-offline-access-requested
-  - auth/pre-registration:pre-registration-auth
-  - auth/scope-from-scopes-supported:scope-from-scopes-supported
-  - auth/scope-from-www-authenticate:scope-from-www-authenticate
-  - auth/scope-omitted-when-undefined:scope-omitted-when-undefined
-  - auth/scope-retry-limit:scope-retry-limit
-  - auth/scope-step-up:scope-step-up-escalation
-  - auth/scope-step-up:scope-step-up-initial
-  - auth/scope-step-up:sep-2350-scope-union-on-reauth
-  - auth/token-endpoint-auth-basic:resource-parameter-in-authorization
-  - auth/token-endpoint-auth-basic:resource-parameter-in-token
-  - auth/token-endpoint-auth-basic:token-endpoint-auth-method
-  - auth/token-endpoint-auth-none:resource-parameter-in-authorization
-  - auth/token-endpoint-auth-none:resource-parameter-in-token
-  - auth/token-endpoint-auth-none:token-endpoint-auth-method
-  - auth/token-endpoint-auth-post:resource-parameter-in-authorization
-  - auth/token-endpoint-auth-post:resource-parameter-in-token
-  - auth/token-endpoint-auth-post:token-endpoint-auth-method
+client: []

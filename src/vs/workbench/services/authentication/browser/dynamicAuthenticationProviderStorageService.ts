@@ -5,9 +5,9 @@
 
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
-import { IDynamicAuthenticationProviderStorageService, DynamicAuthenticationProviderInfo, DynamicAuthenticationProviderTokensChangeEvent } from '../common/dynamicAuthenticationProviderStorage.js';
+import { IDynamicAuthenticationProviderStorageService, DynamicAuthenticationProviderInfo, DynamicAuthenticationProviderTokensChangeEvent, IDynamicAuthenticationProviderClientRegistration } from '../common/dynamicAuthenticationProviderStorage.js';
 import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
-import { IAuthorizationTokenResponse, isAuthorizationTokenResponse } from '../../../../base/common/oauth.js';
+import { IAuthorizationTokenResponse, isAuthorizationTokenResponse, OAuthTokenEndpointAuthMethod } from '../../../../base/common/oauth.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
@@ -50,15 +50,16 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		}));
 	}
 
-	async getClientRegistration(providerId: string): Promise<{ clientId?: string; clientSecret?: string } | undefined> {
+	async getClientRegistration(providerId: string): Promise<IDynamicAuthenticationProviderClientRegistration | undefined> {
 		// First try new combined SecretStorage format
 		const key = `dynamicAuthProvider:clientRegistration:${providerId}`;
 		const credentialsValue = await this.secretStorageService.get(key);
 		if (credentialsValue) {
 			try {
-				const credentials = JSON.parse(credentialsValue);
-				if (credentials && (credentials.clientId || credentials.clientSecret)) {
-					return credentials;
+				const credentials: unknown = JSON.parse(credentialsValue);
+				const registration = toClientRegistration(credentials);
+				if (registration && (registration.clientId || registration.clientSecret)) {
+					return registration;
 				}
 			} catch {
 				await this.secretStorageService.delete(key);
@@ -78,13 +79,13 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		return provider?.clientId;
 	}
 
-	async storeClientRegistration(providerId: string, authorizationServer: string, clientId: string, clientSecret?: string, label?: string): Promise<void> {
+	async storeClientRegistration(providerId: string, authorizationServer: string, clientId: string, clientSecret?: string, label?: string, tokenEndpointAuthMethod?: OAuthTokenEndpointAuthMethod): Promise<void> {
 		// Store provider information for backward compatibility and UI display
 		this._trackProvider(providerId, authorizationServer, clientId, label);
 
-		// Store both client ID and secret together in SecretStorage
+		// Store the client ID, secret and token endpoint authentication method together in SecretStorage
 		const key = `dynamicAuthProvider:clientRegistration:${providerId}`;
-		const credentials = { clientId, clientSecret };
+		const credentials: IDynamicAuthenticationProviderClientRegistration = { clientId, clientSecret, tokenEndpointAuthMethod };
 		await this.secretStorageService.set(key, JSON.stringify(credentials));
 	}
 
@@ -172,7 +173,8 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		if (value) {
 			const parsed = JSON.parse(value);
 			if (!Array.isArray(parsed) || !parsed.every((t) => typeof t.created_at === 'number' && isAuthorizationTokenResponse(t))) {
-				this.logService.error(`Invalid session data for ${authProviderId} (${clientId}) in secret storage:`, parsed);
+				// The data may hold tokens: only its shape is logged.
+				this.logService.error(`Invalid session data for ${authProviderId} (${clientId}) in secret storage: ${Array.isArray(parsed) ? `an array of ${parsed.length}` : typeof parsed}`);
 				await this.secretStorageService.delete(key);
 				return undefined;
 			}
@@ -185,8 +187,30 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		const key = JSON.stringify({ isDynamicAuthProvider: true, authProviderId, clientId });
 		const value = JSON.stringify(sessions);
 		await this.secretStorageService.set(key, value);
-		this.logService.trace(`Set session data for ${authProviderId} (${clientId}) in secret storage:`, sessions);
+		// Never the tokens themselves: a summary of what was stored.
+		this.logService.trace(`Set session data for ${authProviderId} (${clientId}) in secret storage: ${sessions.length} session(s)`, sessions.map(describeStoredToken));
 	}
+}
+
+const TOKEN_ENDPOINT_AUTH_METHODS: readonly OAuthTokenEndpointAuthMethod[] = ['none', 'client_secret_basic', 'client_secret_post'];
+
+/** Reads a stored registration; one stored by an older version has no `tokenEndpointAuthMethod`. */
+function toClientRegistration(value: unknown): IDynamicAuthenticationProviderClientRegistration | undefined {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		return undefined;
+	}
+	const record = value as { readonly clientId?: unknown; readonly clientSecret?: unknown; readonly tokenEndpointAuthMethod?: unknown };
+	const method = TOKEN_ENDPOINT_AUTH_METHODS.find(m => m === record.tokenEndpointAuthMethod);
+	return {
+		clientId: typeof record.clientId === 'string' ? record.clientId : undefined,
+		clientSecret: typeof record.clientSecret === 'string' ? record.clientSecret : undefined,
+		...(method ? { tokenEndpointAuthMethod: method } : {}),
+	};
+}
+
+/** A loggable summary of a stored token response. */
+function describeStoredToken(token: IAuthorizationTokenResponse & { created_at: number }): string {
+	return `token_type=${token.token_type}, scope=${token.scope ?? '(none)'}, created_at=${token.created_at}, expires_in=${token.expires_in ?? '(none)'}, refresh_token=${token.refresh_token ? 'present' : 'absent'}`;
 }
 
 registerSingleton(IDynamicAuthenticationProviderStorageService, DynamicAuthenticationProviderStorageService, InstantiationType.Delayed);

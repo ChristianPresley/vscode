@@ -26,7 +26,8 @@ import { ExtensionHostKind } from '../../services/extensions/common/extensionHos
 import { Dto, Proxied } from '../../services/extensions/common/proxyIdentifier.js';
 import { IURLService } from '../../../platform/url/common/url.js';
 import { DeferredPromise, raceTimeout } from '../../../base/common/async.js';
-import { fetchAuthorizationServerMetadata, IAuthorizationTokenResponse } from '../../../base/common/oauth.js';
+import { fetchAuthorizationServerMetadata, IAuthorizationTokenResponse, isValidClientMetadataUrl, OAuthTokenEndpointAuthMethod } from '../../../base/common/oauth.js';
+import { serializeStoredClientSecret } from '../common/mcpOAuthClientFactory.js';
 import { IDynamicAuthenticationProviderStorageService } from '../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
 import { IClipboardService } from '../../../platform/clipboard/common/clipboardService.js';
 import { IQuickInputService } from '../../../platform/quickinput/common/quickInput.js';
@@ -185,13 +186,22 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 				const clientSecret = overrideClientId
 					? overrideClientSecret
 					: (overrideClientSecret ?? clientDetails?.clientSecret);
+				// The recorded method belongs to the stored registration only.
+				let tokenEndpointAuthMethod = !overrideClientId && clientDetails?.clientId === clientId ? clientDetails?.tokenEndpointAuthMethod : undefined;
 				let initialTokens: (IAuthorizationTokenResponse & { created_at: number })[] | undefined = undefined;
 				if (clientId) {
 					initialTokens = await this.dynamicAuthProviderStorageService.getSessionsForDynamicAuthProvider(authProviderId, clientId);
 					// If we don't already have a client id, check if the server supports the Client Id Metadata flow (see docs on the property)
 					// and add the "client id" if so.
 				} else if (serverMetadata.client_id_metadata_document_supported) {
-					clientId = this.productService.authClientIdMetadataUrl;
+					const metadataUrl = this.productService.authClientIdMetadataUrl;
+					// A Client ID Metadata Document is identified by an https URL with a path and no fragment.
+					if (metadataUrl && isValidClientMetadataUrl(metadataUrl)) {
+						clientId = metadataUrl;
+						tokenEndpointAuthMethod = 'none';
+					} else if (metadataUrl) {
+						this.logService.warn(`Not using the client ID metadata document URL '${metadataUrl}': it must be an https URL with a path and no fragment.`);
+					}
 				}
 				return await this._proxy.$registerDynamicAuthProvider(
 					authorizationServer,
@@ -199,7 +209,8 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 					resource,
 					clientId,
 					clientSecret,
-					initialTokens
+					initialTokens,
+					tokenEndpointAuthMethod
 				);
 			},
 			createXaa: async (issuer) => {
@@ -356,14 +367,14 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 			supportedAuthorizationServers: [details.authorizationServer],
 			resourceServer: details.resourceServer,
 		});
-		await this.dynamicAuthProviderStorageService.storeClientRegistration(details.id, URI.revive(details.authorizationServer).toString(true), details.clientId, details.clientSecret, details.label);
+		await this.dynamicAuthProviderStorageService.storeClientRegistration(details.id, URI.revive(details.authorizationServer).toString(true), details.clientId, details.clientSecret, details.label, details.tokenEndpointAuthMethod);
 	}
 
 	async $setSessionsForDynamicAuthProvider(authProviderId: string, clientId: string, sessions: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<void> {
 		await this.dynamicAuthProviderStorageService.setSessionsForDynamicAuthProvider(authProviderId, clientId, sessions);
 	}
 
-	async $sendDidChangeDynamicProviderInfo({ providerId, clientId, authorizationServer, label, clientSecret }: Partial<{ providerId: string; clientId: string; authorizationServer: UriComponents; label: string; clientSecret: string }>): Promise<void> {
+	async $sendDidChangeDynamicProviderInfo({ providerId, clientId, authorizationServer, label, clientSecret, tokenEndpointAuthMethod }: Partial<{ providerId: string; clientId: string; authorizationServer: UriComponents; label: string; clientSecret: string; tokenEndpointAuthMethod: OAuthTokenEndpointAuthMethod }>): Promise<void> {
 		this.logService.info(`Client ID for authentication provider ${providerId} changed to ${clientId}`);
 		const existing = this.dynamicAuthProviderStorageService.getInteractedProviders().find(p => p.providerId === providerId);
 		if (!existing) {
@@ -376,7 +387,8 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 			authorizationServer ? URI.revive(authorizationServer).toString(true) : existing.authorizationServer,
 			clientId || existing.clientId,
 			clientSecret,
-			label || existing.label
+			label || existing.label,
+			tokenEndpointAuthMethod
 		);
 	}
 
@@ -747,7 +759,8 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 				// Clear any stale value so subsequent prompts can still capture a fresh secret if needed.
 				await this.secretStorageService.delete(key);
 			} else {
-				await this.secretStorageService.set(key, trimmed);
+				// Bound to an issuer on its first successful use (mainThreadMcp).
+				await this.secretStorageService.set(key, serializeStoredClientSecret({ clientSecret: trimmed }));
 			}
 		} catch (err) {
 			this.logService.warn(`[XAA] Failed to persist resource client secret for ${resource} / ${resourceClientId}: ${(err as Error).message}`);

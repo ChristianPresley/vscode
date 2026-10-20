@@ -11,9 +11,17 @@ import { escape, htmlAttributeEncodeValue } from '../../../base/common/strings.j
 import { URI } from '../../../base/common/uri.js';
 import { ILogger } from '../../../platform/log/common/log.js';
 
+/**
+ * The parameters of the authorization response that reached the redirect URI
+ * (RFC 6749 section 4.1.2), form-decoded and otherwise unvalidated: the caller
+ * validates `iss` first (RFC 9207), then `state`, then acts on `error`.
+ */
 export interface IOAuthResult {
-	code: string;
-	state: string;
+	readonly code?: string;
+	readonly state?: string;
+	readonly iss?: string;
+	readonly error?: string;
+	readonly errorDescription?: string;
 }
 
 export interface ILoopbackServer {
@@ -42,6 +50,17 @@ export interface ILoopbackServer {
 	waitForOAuthResponse(): Promise<IOAuthResult>;
 }
 
+function parseOAuthResult(params: URLSearchParams): IOAuthResult {
+	const get = (name: string) => params.get(name) ?? undefined;
+	return {
+		code: get('code'),
+		state: get('state'),
+		iss: get('iss'),
+		error: get('error'),
+		errorDescription: get('error_description'),
+	};
+}
+
 export class LoopbackAuthServer implements ILoopbackServer {
 	private readonly _server: Promise<http.Server>;
 	private readonly _resultPromise: Promise<IOAuthResult>;
@@ -64,29 +83,25 @@ export class LoopbackAuthServer implements ILoopbackServer {
 				const reqUrl = new URL(req.url!, `http://${req.headers.host}`);
 				switch (reqUrl.pathname) {
 					case '/': {
-						const code = reqUrl.searchParams.get('code') ?? undefined;
-						const state = reqUrl.searchParams.get('state') ?? undefined;
-						const error = reqUrl.searchParams.get('error') ?? undefined;
-						if (error) {
-							res.writeHead(302, { location: `/done?error=${reqUrl.searchParams.get('error_description') || error}` });
+						if (deferredPromise.isSettled) {
+							// Only the first authorization response counts.
+							res.writeHead(302, { location: '/done' });
 							res.end();
-							deferredPromise.error(new Error(error));
 							break;
 						}
-						if (!code || !state) {
+						const result = parseOAuthResult(reqUrl.searchParams);
+						if (!result.error && (!result.code || !result.state)) {
 							res.writeHead(400);
 							res.end();
 							break;
 						}
-						if (this.state !== state) {
-							res.writeHead(302, { location: `/done?error=${encodeURIComponent('State does not match.')}` });
-							res.end();
-							deferredPromise.error(new Error('State does not match.'));
-							break;
-						}
-						deferredPromise.complete({ code, state });
-						res.writeHead(302, { location: '/done' });
+						// The page only reflects what the browser can tell; the caller validates `iss` and `state` before it uses the code.
+						const pageError = result.error
+							? (result.errorDescription || result.error)
+							: result.state !== this.state ? 'State does not match.' : undefined;
+						res.writeHead(302, { location: pageError ? `/done?error=${encodeURIComponent(pageError)}` : '/done' });
 						res.end();
+						deferredPromise.complete(result);
 						break;
 					}
 					// Serve the static files

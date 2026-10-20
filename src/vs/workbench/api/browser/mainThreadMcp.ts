@@ -19,18 +19,22 @@ import { IConfigurationService } from '../../../platform/configuration/common/co
 import { IDialogService, IPromptButton } from '../../../platform/dialogs/common/dialogs.js';
 import { ExtensionIdentifier } from '../../../platform/extensions/common/extensions.js';
 import { LogLevel } from '../../../platform/log/common/log.js';
-import { IAllowedMcpServersService } from '../../../platform/mcp/common/mcpManagement.js';
+import { getMcpServerMatchers, IMcpServerMatcher } from '../../../platform/mcp/common/allowedMcpServers.js';
+import { IAllowedMcpServersService, mcpAllowedServersConfig } from '../../../platform/mcp/common/mcpManagement.js';
 import { ITelemetryService } from '../../../platform/telemetry/common/telemetry.js';
 import { ISecretStorageService } from '../../../platform/secrets/common/secrets.js';
-import { IWorkbenchMcpGatewayService } from '../../contrib/mcp/common/mcpGatewayService.js';
+import { IMcpGatewayResultServer, IWorkbenchMcpGatewayService } from '../../contrib/mcp/common/mcpGatewayService.js';
 import { IMcpMessageTransport, IMcpRegistry } from '../../contrib/mcp/common/mcpRegistryTypes.js';
 import { IMcpMessageEnvelope, IMcpRequestAbort, extensionPrefixedIdentifier, McpCollectionDefinition, McpCollectionProvenance, McpCollectionSortOrder, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, McpServerTrust, mcpOAuthClientSecretStorageKey, UserInteractionRequiredError } from '../../contrib/mcp/common/mcpTypes.js';
 import { IMcpEnterpriseManagedAuthIdpConfig, mcpEnterpriseManagedAuthIdpSection } from '../../contrib/mcp/common/mcpConfiguration.js';
 import { IAuthenticationMcpAccessService } from '../../services/authentication/browser/authenticationMcpAccessService.js';
 import { IAuthenticationMcpService } from '../../services/authentication/browser/authenticationMcpService.js';
 import { IAuthenticationMcpUsageService } from '../../services/authentication/browser/authenticationMcpUsageService.js';
-import { AuthenticationSession, AuthenticationSessionAccount, IAuthenticationService } from '../../services/authentication/common/authentication.js';
+import { AuthenticationSession, AuthenticationSessionAccount, getDynamicAuthenticationProviderId, IAuthenticationService } from '../../services/authentication/common/authentication.js';
 import { IDynamicAuthenticationProviderStorageService } from '../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
+import { OAuthClientError } from '../../../base/common/oauth.js';
+import { IMcpRemoteServerOAuthConfiguration } from '../../../platform/mcp/common/mcpPlatformTypes.js';
+import { parseStoredClientSecret, resolveMcpOAuthPolicy, selectMcpAuthorizationScopes, serializeStoredClientSecret } from '../common/mcpOAuthClientFactory.js';
 import { ExtensionHostKind, extensionHostKindToString } from '../../services/extensions/common/extensionHostKind.js';
 import { IExtensionService } from '../../services/extensions/common/extensions.js';
 import { IExtHostContext, extHostNamedCustomer } from '../../services/extensions/common/extHostCustomers.js';
@@ -291,14 +295,15 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		return this._getSessionForProvider(id, server, providerId, scopes, { clientId: options.clientId }, options.errorOnUserInteraction);
 	}
 
-	async $getTokenFromServerMetadata(id: number, authDetails: IMcpAuthenticationDetails, { errorOnUserInteraction, forceNewRegistration, clientId }: IMcpAuthenticationOptions = {}): Promise<string | undefined> {
+	async $getTokenFromServerMetadata(id: number, authDetails: IMcpAuthenticationDetails, { errorOnUserInteraction, forceNewRegistration, clientId, rejectedToken }: IMcpAuthenticationOptions = {}): Promise<string | undefined> {
 		const server = this._serverDefinitions.get(id);
 		if (!server) {
 			return undefined;
 		}
 		const authorizationServer = URI.revive(authDetails.authorizationServer);
 		const resourceServer = authDetails.resourceMetadata?.resource ? URI.parse(authDetails.resourceMetadata.resource) : undefined;
-		const resolvedScopes = authDetails.scopes ?? authDetails.resourceMetadata?.scopes_supported ?? authDetails.authorizationServerMetadata.scopes_supported ?? [];
+		// The challenge's scopes, else the resource's; only a server without protected resource metadata falls back to the authorization server's.
+		const resolvedScopes = selectMcpAuthorizationScopes({ challengeScopes: authDetails.scopes, resourceMetadata: authDetails.resourceMetadata, serverMetadata: authDetails.authorizationServerMetadata });
 
 		// Enterprise-managed servers route through an XAA / ID-JAG provider keyed by the user-configured
 		// SSO issuer instead of doing a per-server DCR against the resource's authorization server.
@@ -334,10 +339,13 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 				// Match the resource-scoped key used by $promptForResourceClientSecret.
 				clientSecretStorageKey = mcpOAuthClientSecretStorageKey(resource, resourceClientId);
 				try {
-					resourceClientSecret = await this._secretStorageService.get(clientSecretStorageKey);
+					resourceClientSecret = parseStoredClientSecret(await this._secretStorageService.get(clientSecretStorageKey))?.clientSecret;
 				} catch {
 					// Best-effort lookup; fall through.
 				}
+			}
+			if (rejectedToken) {
+				await this._removeRejectedSession(xaaProviderId, rejectedToken);
 			}
 			return this._getSessionForProvider(id, server, xaaProviderId, xaaScopes, {
 				authorizationServer: issuer, clientId: resourceClientId, resource, audience, clientSecretStorageKey
@@ -350,11 +358,14 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		const mcpServerUrl = server.launch.type === McpServerTransportType.HTTP ? server.launch.uri.toString(true) : undefined;
 		let clientSecretStorageKey: string | undefined;
 		let clientSecret: string | undefined;
+		let boundIssuer: string | undefined;
 		let didLookupClientSecret = false;
 		if (resolvedClientId && mcpServerUrl) {
 			clientSecretStorageKey = mcpOAuthClientSecretStorageKey(mcpServerUrl, resolvedClientId);
 			try {
-				clientSecret = await this._secretStorageService.get(clientSecretStorageKey);
+				const stored = parseStoredClientSecret(await this._secretStorageService.get(clientSecretStorageKey));
+				clientSecret = stored?.clientSecret;
+				boundIssuer = stored?.issuer;
 				didLookupClientSecret = true;
 			} catch {
 				// Best-effort lookup; proceed without a client secret.
@@ -384,16 +395,83 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		}
 
 		if (!providerId) {
+			// The resource may have moved to another authorization server: the provider registered with
+			// the previous one must not be used again (SEP-2352).
+			await this._removeStaleDynamicProviders(authorizationServer, authDetails.resourceMetadata);
 			const provider = await this._authenticationService.createDynamicAuthenticationProvider(authorizationServer, authDetails.authorizationServerMetadata, authDetails.resourceMetadata, resolvedClientId, clientSecret);
 			if (!provider) {
 				return undefined;
 			}
 			providerId = provider.id;
+		} else if (rejectedToken) {
+			await this._removeRejectedSession(providerId, rejectedToken);
 		}
 
-		return this._getSessionForProvider(id, server, providerId, resolvedScopes, {
+		const token = await this._getSessionForProvider(id, server, providerId, resolvedScopes, {
 			authorizationServer, clientId: resolvedClientId, resource: authDetails.resourceMetadata?.resource, clientSecretStorageKey
 		}, errorOnUserInteraction, clientSecret);
+		if (token && clientSecretStorageKey && clientSecret !== undefined && boundIssuer === undefined) {
+			// First successful use: bind the pre-registered credentials to this issuer.
+			await this._bindClientSecret(clientSecretStorageKey, clientSecret, authDetails.authorizationServerMetadata.issuer);
+		}
+		return token;
+	}
+
+	/** Records the issuer pre-registered credentials were first used with (best effort). */
+	private async _bindClientSecret(key: string, clientSecret: string, issuer: string): Promise<void> {
+		try {
+			await this._secretStorageService.set(key, serializeStoredClientSecret({ clientSecret, issuer }));
+		} catch {
+			// Best effort: the credentials stay unbound and are bound on their next use.
+		}
+	}
+
+	/**
+	 * Removes the session whose access token the MCP server rejected, so the
+	 * provider cannot hand it out again. Sessions are looked up without a scope
+	 * filter because the rejected token may have been issued for other scopes.
+	 * Only per-resource (dynamic) providers are touched: a rejection by one MCP
+	 * server must not sign the user out of a shared provider.
+	 */
+	private async _removeRejectedSession(providerId: string, rejectedToken: string): Promise<void> {
+		if (!this._authenticationService.isDynamicAuthenticationProvider(providerId)) {
+			return;
+		}
+		try {
+			const sessions = await this._authenticationService.getSessions(providerId);
+			const rejected = sessions.find(session => session.accessToken === rejectedToken);
+			if (rejected) {
+				await this._authenticationService.removeSession(providerId, rejected.id);
+			}
+		} catch {
+			// The provider may be gone already; the new token request proceeds regardless.
+		}
+	}
+
+	/**
+	 * Unregisters the dynamic providers of this resource that belong to another
+	 * authorization server: their registration and tokens must not be reused
+	 * once the resource names a new one.
+	 */
+	private async _removeStaleDynamicProviders(authorizationServer: URI, resourceMetadata: IMcpAuthenticationDetails['resourceMetadata']): Promise<void> {
+		if (!resourceMetadata?.resource) {
+			return;
+		}
+		try {
+			const currentId = getDynamicAuthenticationProviderId(authorizationServer, resourceMetadata);
+			const suffix = ` ${resourceMetadata.resource}`;
+			for (const stale of this._dynamicAuthenticationProviderStorageService.getInteractedProviders()) {
+				if (stale.providerId === currentId || !stale.providerId.endsWith(suffix)) {
+					continue;
+				}
+				if (this._authenticationService.isDynamicAuthenticationProvider(stale.providerId)) {
+					this._authenticationService.unregisterAuthenticationProvider(stale.providerId);
+				}
+				await this._dynamicAuthenticationProviderStorageService.removeDynamicProvider(stale.providerId);
+			}
+		} catch {
+			// Best effort: a stale provider only lingers in the accounts list.
+		}
 	}
 
 	private _ensureXaaIssuer(): URI {
@@ -548,7 +626,7 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 			try {
 				// Replay the original context, but resolve the current secret so rotation takes effect.
 				const clientSecret = context.clientSecretStorageKey
-					? await this._secretStorageService.get(context.clientSecretStorageKey)
+					? parseStoredClientSecret(await this._secretStorageService.get(context.clientSecretStorageKey))?.clientSecret
 					: undefined;
 				await this._getSessionForProvider(serverId, serverDefinition, providerId, scopes, context, true, clientSecret);
 			} catch (e) {
@@ -591,12 +669,12 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		const store = new DisposableStore();
 		store.add(result);
 		store.add(result.onDidChangeServers(servers => {
-			this._proxy.$onDidChangeGatewayServers(gatewayId, servers.map(s => ({ label: s.label, address: s.address })));
+			this._proxy.$onDidChangeGatewayServers(gatewayId, servers.map(gatewayServerDto));
 		}));
 		this._gateways.set(gatewayId, store);
 
 		return {
-			servers: result.servers.map(s => ({ label: s.label, address: s.address })),
+			servers: result.servers.map(gatewayServerDto),
 			gatewayId,
 		};
 	}

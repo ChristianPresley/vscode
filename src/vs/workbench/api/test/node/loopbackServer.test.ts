@@ -79,6 +79,41 @@ function appUriForAuthority(authority: string): URI {
 	});
 }
 
+suite('LoopbackAuthServer - authorization response', () => {
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	/** Starts a server, sends it one redirect and reports the browser's answer and what the caller would receive. */
+	async function respond(query: (state: string) => string): Promise<{ status: number; location: string | null; result: unknown; state: string }> {
+		const server = new LoopbackAuthServer(new NullLogger(), URI.parse('vscode://dynamicauthprovider/as.example/redirect'), 'Test');
+		await server.start();
+		try {
+			const response = await fetch(`${server.redirectUri}?${query(server.state)}`, { redirect: 'manual' });
+			await response.text();
+			const result = await Promise.race([server.waitForOAuthResponse(), new Promise(resolve => setTimeout(() => resolve('pending'), 50))]);
+			return { status: response.status, location: response.headers.get('location'), result, state: server.state };
+		} finally {
+			await server.stop();
+		}
+	}
+
+	test('resolves the form-decoded code, state, iss and error for the caller to validate', async () => {
+		const ok = await respond(state => `code=the%2Bcode&state=${encodeURIComponent(state)}&iss=${encodeURIComponent('https://as.example/')}`);
+		const denied = await respond(state => `error=access_denied&error_description=Nope+not+today&state=${encodeURIComponent(state)}&iss=${encodeURIComponent('https://as.example')}`);
+		const forged = await respond(() => 'code=the-code&state=someone-elses');
+		assert.deepStrictEqual([ok, denied, forged].map(r => ({ status: r.status, location: r.location, result: r.result })), [
+			{ status: 302, location: '/done', result: { code: 'the+code', state: ok.state, iss: 'https://as.example/', error: undefined, errorDescription: undefined } },
+			{ status: 302, location: `/done?error=${encodeURIComponent('Nope not today')}`, result: { code: undefined, state: denied.state, iss: 'https://as.example', error: 'access_denied', errorDescription: 'Nope not today' } },
+			// The caller rejects the mismatching state; the browser is told so.
+			{ status: 302, location: `/done?error=${encodeURIComponent('State does not match.')}`, result: { code: 'the-code', state: 'someone-elses', iss: undefined, error: undefined, errorDescription: undefined } },
+		]);
+	});
+
+	test('ignores a request that is neither a code nor an error', async () => {
+		const empty = await respond(() => 'foo=bar');
+		assert.deepStrictEqual({ status: empty.status, result: empty.result }, { status: 400, result: 'pending' });
+	});
+});
+
 suite('LoopbackAuthServer - getHtml', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
 

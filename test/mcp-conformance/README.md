@@ -13,7 +13,7 @@ The suite has two legs, and both are measured at each specification revision the
 | --- | --- |
 | `run.ts` | The harness: runs the suite for each leg and revision, judges the results against the baselines, kills leftover clients and checks the requirement matrix. |
 | `run.test.ts` | Tests of the harness with the suite stubbed out (`node --test run.test.ts`). |
-| `expected-failures-client-<revision>.yml` | The known failing checks of the scored client scenarios of a revision. Today these are the authorization scenarios, because the client has no OAuth support yet (milestone M5 empties both lists). |
+| `expected-failures-client-<revision>.yml` | The known failing checks of the scored client scenarios of a revision. Both lists are empty: the authorization scenarios run through the conformance OAuth client (`src/vs/workbench/api/node/mcpConformanceOAuth.ts`), which is built with the product's rule set (milestone M5). |
 | `expected-failures-server-<revision>.yml` | The same for the server leg. Both lists are empty. |
 | `expected-failures-unscored.yml` | The known failures of the scenarios the requirement sets run without scoring (`not_scored`): the six authorization-extension client scenarios, as whole scenarios, and the `wire-schema-valid` check of the eight `tasks-*` server scenarios that create a task (the suite validates a CreateTaskResult against CallToolResult, which requires `content`). |
 | `requirement-matrix.md` | One row per scenario of both requirement sets, legs and revisions, with its status: `driven`, `gap` or `n-a`. |

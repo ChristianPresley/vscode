@@ -72,6 +72,23 @@ export interface IMcpStdioServerConfiguration extends ICommonMcpServerConfigurat
 
 export interface IMcpRemoteServerOAuthConfiguration {
 	readonly clientId?: string;
+	/**
+	 * The issuer URL of the authorization server the pre-registered {@link clientId}
+	 * (and its client secret) belongs to. A discovered issuer that differs is an
+	 * error and no credentials are sent to it.
+	 */
+	readonly authorizationServer?: string;
+	/**
+	 * Escape hatch: `assume-supported` treats an authorization server that does not
+	 * advertise the `S256` PKCE method in `code_challenge_methods_supported` as if it
+	 * did. The default, `require-advertised`, refuses to authorize against it.
+	 */
+	readonly pkce?: 'require-advertised' | 'assume-supported';
+	/**
+	 * Escape hatch: allow `http://` authorization endpoints on non-loopback hosts.
+	 * Defaults to false; loopback hosts are always allowed.
+	 */
+	readonly allowInsecureHttp?: boolean;
 }
 
 export interface IMcpRemoteServerConfiguration extends ICommonMcpServerConfiguration {

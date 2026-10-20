@@ -6,9 +6,10 @@
 import assert from 'assert';
 import type { ProgressOptions } from 'vscode';
 import { encodeBase64, VSBuffer } from '../../../../base/common/buffer.js';
+import { DeferredPromise } from '../../../../base/common/async.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Emitter } from '../../../../base/common/event.js';
-import { IAuthorizationServerMetadata } from '../../../../base/common/oauth.js';
+import { IAuthorizationServerMetadata, OAuthClientError } from '../../../../base/common/oauth.js';
 import { URI, UriComponents } from '../../../../base/common/uri.js';
 import { mock } from '../../../../base/test/common/mock.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
@@ -88,6 +89,7 @@ suite('DynamicAuthProvider', () => {
 				token_endpoint: 'https://login.microsoftonline.com/organizations/oauth2/v2.0/token',
 				response_types_supported: ['code'],
 				scopes_supported: ['openid', 'profile', 'offline_access'],
+				code_challenge_methods_supported: ['S256'],
 			},
 		},
 		nonMicrosoft: {
@@ -98,6 +100,7 @@ suite('DynamicAuthProvider', () => {
 				token_endpoint: 'https://auth.example.com/token',
 				response_types_supported: ['code'],
 				scopes_supported: ['openid', 'profile', 'offline_access'],
+				code_challenge_methods_supported: ['S256'],
 			},
 		},
 		// A Microsoft authorization endpoint must not opt a non-Microsoft token endpoint into Microsoft behavior.
@@ -109,6 +112,7 @@ suite('DynamicAuthProvider', () => {
 				token_endpoint: 'https://auth.example.com/token',
 				response_types_supported: ['code'],
 				scopes_supported: ['openid', 'profile', 'offline_access'],
+				code_challenge_methods_supported: ['S256'],
 			},
 		},
 	};
@@ -118,21 +122,33 @@ suite('DynamicAuthProvider', () => {
 		readonly initialTokens?: IAuthorizationToken[];
 		readonly fetcher?: typeof fetch;
 		readonly onDidOpenUri?: (uri: string) => void;
+		readonly clientSecret?: string;
+		readonly logger?: ILogger;
+		/** The query of the redirect the URI handler receives; without it the browser "fails to open". */
+		readonly redirectQuery?: (authorizationUrl: URL) => string;
 	}): TestDynamicAuthProvider {
 		const loggerService = new class extends mock<ILoggerService>() {
 			override createLogger(): ILogger {
-				return new NullLogger();
+				return options.logger ?? new NullLogger();
 			}
 		}();
+		const opened = new DeferredPromise<URL>();
 		const proxy = new class extends mock<Proxied<MainThreadAuthenticationShape>>() {
 			override $setSessionsForDynamicAuthProvider = (): Promise<void> => Promise.resolve();
-			// Never settles, so an abandoned authorization flow leaves no rejected promise behind.
-			override $waitForUriHandler = (): Promise<UriComponents> => new Promise<UriComponents>(() => { });
+			// Never settles without a redirect, so an abandoned authorization flow leaves no rejected promise behind.
+			override $waitForUriHandler = async (expected: UriComponents): Promise<UriComponents> => {
+				const redirectQuery = options.redirectQuery;
+				if (!redirectQuery) {
+					return new Promise<UriComponents>(() => { });
+				}
+				return { ...expected, query: redirectQuery(await opened.p) };
+			};
 		}();
 		const extHostWindow = new class extends mock<IExtHostWindow>() {
 			override async openUri(uri: string | URI): Promise<boolean> {
 				options.onDidOpenUri?.(uri.toString());
-				return false;
+				opened.complete(new URL(uri.toString()));
+				return !!options.redirectQuery;
 			}
 		}();
 		const extHostUrls = new class extends mock<IExtHostUrlsService>() {
@@ -159,12 +175,163 @@ suite('DynamicAuthProvider', () => {
 			options.serverMetadata,
 			{ resource: options.resource },
 			'client-id',
-			undefined,
+			options.clientSecret,
 			disposables.add(new Emitter()),
 			options.initialTokens ?? [],
 			options.fetcher,
 		));
 	}
+
+	function tokenResponse(body: object): Response {
+		return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+	}
+
+	async function expectOAuthError(promise: Promise<unknown>, code: string): Promise<void> {
+		await assert.rejects(promise, (error: unknown) => {
+			assert.ok(error instanceof OAuthClientError, `expected an OAuthClientError, got ${String(error)}`);
+			assert.strictEqual(error.code, code);
+			return true;
+		});
+	}
+
+	const expiredToken = (scope: string): IAuthorizationToken => ({
+		access_token: jwt({ sub: 'account', jti: 'expired' }),
+		token_type: 'Bearer',
+		scope,
+		expires_in: 1,
+		refresh_token: 'refresh-token',
+		created_at: 0,
+	});
+
+	test('refuses the authorization code flow when PKCE S256 is not advertised', async () => {
+		const openedUris: string[] = [];
+		const withoutPkce: IAuthorizationServerMetadata = { ...servers.nonMicrosoft.serverMetadata, code_challenge_methods_supported: undefined };
+		const provider = createProvider({ ...servers.nonMicrosoft, serverMetadata: withoutPkce, resource, onDidOpenUri: uri => openedUris.push(uri) });
+
+		await expectOAuthError(provider.createSession(['api://res/Read'], {}), 'pkce_unsupported');
+		assert.deepStrictEqual(openedUris, [], 'no authorization request is made');
+	});
+
+	test('the authorization request carries an S256 challenge of a verifier sent at the token endpoint', async () => {
+		const bodies: Record<string, string>[] = [];
+		let challenge: string | null = null;
+		const provider = createProvider({
+			...servers.nonMicrosoft,
+			resource,
+			redirectQuery: url => {
+				challenge = url.searchParams.get('code_challenge');
+				assert.strictEqual(url.searchParams.get('code_challenge_method'), 'S256');
+				return 'code=the-code';
+			},
+			fetcher: async (_input, init) => {
+				bodies.push(Object.fromEntries(new URLSearchParams(String(init?.body))));
+				return tokenResponse({ access_token: jwt({ sub: 'account' }), token_type: 'Bearer' });
+			},
+		});
+
+		await provider.createSession(['api://res/Read'], {});
+		const verifier = bodies[0].code_verifier;
+		const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+		assert.strictEqual(challenge, encodeBase64(VSBuffer.wrap(digest), false, true));
+		assert.strictEqual(bodies[0].code, 'the-code');
+	});
+
+	test('validates iss before the code and before an error', async () => {
+		const withIss = { ...servers.nonMicrosoft.serverMetadata, authorization_response_iss_parameter_supported: true };
+		const outcomes: string[] = [];
+		for (const query of [
+			`code=the-code&iss=${encodeURIComponent('https://evil.example.com')}`,
+			`error=access_denied&iss=${encodeURIComponent('https://evil.example.com')}`,
+			'code=the-code',
+			`code=the-code&iss=${encodeURIComponent('https://auth.example.com/')}`,
+			`error=access_denied&iss=${encodeURIComponent('https://auth.example.com')}`,
+		]) {
+			let tokenRequests = 0;
+			const provider = createProvider({
+				...servers.nonMicrosoft,
+				serverMetadata: withIss,
+				resource,
+				redirectQuery: () => query,
+				fetcher: async () => {
+					tokenRequests++;
+					return tokenResponse({ access_token: jwt({ sub: 'account' }), token_type: 'Bearer' });
+				},
+			});
+			try {
+				await provider.createSession(['api://res/Read'], {});
+				outcomes.push(`signed in after ${tokenRequests} token request(s)`);
+			} catch (error) {
+				outcomes.push(`${error instanceof OAuthClientError ? error.code : String(error)} after ${tokenRequests} token request(s)`);
+			}
+		}
+		assert.deepStrictEqual(outcomes, [
+			'iss_mismatch after 0 token request(s)',
+			'iss_mismatch after 0 token request(s)',
+			'iss_missing after 0 token request(s)',
+			'iss_mismatch after 0 token request(s)',
+			'authorization_denied after 0 token request(s)',
+		]);
+	});
+
+	test('authenticates at the token endpoint with the recorded method', async () => {
+		const requests: Record<string, { authorization: string | null; clientSecret: string | undefined; clientId: string | undefined }> = {};
+		for (const method of ['client_secret_basic', 'client_secret_post', 'none'] as const) {
+			const provider = createProvider({
+				...servers.nonMicrosoft,
+				resource,
+				clientSecret: method === 'none' ? undefined : 's3cret',
+				initialTokens: [expiredToken('api://res/Read')],
+				fetcher: async (_input, init) => {
+					const body = new URLSearchParams(String(init?.body));
+					requests[method] = { authorization: new Headers(init?.headers).get('Authorization'), clientSecret: body.get('client_secret') ?? undefined, clientId: body.get('client_id') ?? undefined };
+					return tokenResponse({ access_token: jwt({ sub: 'account' }), token_type: 'Bearer', expires_in: 3600 });
+				},
+			});
+			provider.setTokenEndpointAuthMethod(method);
+			await provider.getSessions(['api://res/Read'], { silent: true } satisfies IAuthenticationProviderSessionOptions);
+		}
+		assert.deepStrictEqual(requests, {
+			client_secret_basic: { authorization: `Basic ${encodeBase64(VSBuffer.fromString('client-id:s3cret'))}`, clientSecret: undefined, clientId: 'client-id' },
+			client_secret_post: { authorization: null, clientSecret: 's3cret', clientId: 'client-id' },
+			none: { authorization: null, clientSecret: undefined, clientId: 'client-id' },
+		});
+	});
+
+	test('a client with a secret and no recorded method uses client_secret_basic unless only client_secret_post is supported', () => {
+		const basic = createProvider({ ...servers.nonMicrosoft, resource, clientSecret: 's3cret' });
+		const post = createProvider({ ...servers.nonMicrosoft, serverMetadata: { ...servers.nonMicrosoft.serverMetadata, token_endpoint_auth_methods_supported: ['client_secret_post'] }, resource, clientSecret: 's3cret' });
+		const publicClient = createProvider({ ...servers.nonMicrosoft, resource });
+		assert.deepStrictEqual([basic.tokenEndpointAuthMethod, post.tokenEndpointAuthMethod, publicClient.tokenEndpointAuthMethod], ['client_secret_basic', 'client_secret_post', 'none']);
+	});
+
+	test('logs neither the code, the verifier, the client secret nor any token', async () => {
+		const lines: string[] = [];
+		const logger = new class extends NullLogger {
+			override trace(message: string) { lines.push(message); }
+			override debug(message: string) { lines.push(message); }
+			override info(message: string) { lines.push(message); }
+			override warn(message: string) { lines.push(message); }
+			override error(message: string | Error) { lines.push(String(message)); }
+		}();
+		const accessToken = jwt({ sub: 'account', secret: 'access-token-value' });
+		let verifier = '';
+		const provider = createProvider({
+			...servers.nonMicrosoft,
+			resource,
+			clientSecret: 'client-secret-value',
+			logger,
+			redirectQuery: () => 'code=authorization-code-value',
+			fetcher: async (_input, init) => {
+				verifier = new URLSearchParams(String(init?.body)).get('code_verifier') ?? '';
+				return tokenResponse({ access_token: accessToken, token_type: 'Bearer', refresh_token: 'refresh-token-value', id_token: jwt({ sub: 'id-token-value' }), expires_in: 3600 });
+			},
+		});
+
+		await provider.createSession(['api://res/Read'], {});
+		const leaked = ['authorization-code-value', verifier, 'client-secret-value', accessToken, 'refresh-token-value'].filter(secret => lines.some(line => line.includes(secret)));
+		assert.ok(verifier.length > 0 && lines.length > 0);
+		assert.deepStrictEqual(leaked, []);
+	});
 
 	test('does not rotate the client while silently refreshing a token', async () => {
 		let fetchCalls = 0;

@@ -14,7 +14,8 @@ import { getAuthenticationSessionRequestKey, IAuthenticationGetSessionsOptions, 
 import { createDecorator } from '../../../platform/instantiation/common/instantiation.js';
 import { IExtHostRpcService } from './extHostRpcService.js';
 import { URI, UriComponents } from '../../../base/common/uri.js';
-import { AuthorizationErrorType, fetchDynamicRegistration, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationErrorResponse, isAuthorizationTokenResponse } from '../../../base/common/oauth.js';
+import { AuthorizationErrorType, buildClientAuthentication, createPkcePair, fetchDynamicRegistration, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationProtectedResourceMetadata, IAuthorizationRedirectParams, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationErrorResponse, isAuthorizationTokenResponse, OAuthClientError, OAuthTokenEndpointAuthMethod, parseAuthorizationRedirect, pkceSupported, selectRegistrationAuthMethod, selectTokenEndpointAuthMethod, validateIssuerParameter } from '../../../base/common/oauth.js';
+import { redact } from '../../../base/common/oauthClient.js';
 import { IExtHostWindow } from './extHostWindow.js';
 import { IExtHostInitDataService } from './extHostInitDataService.js';
 import { ILogger, ILoggerService, ILogService } from '../../../platform/log/common/log.js';
@@ -22,7 +23,6 @@ import { autorun, derivedOpts, IObservable, ISettableObservable, observableValue
 import { stringHash } from '../../../base/common/hash.js';
 import { DisposableStore, IDisposable } from '../../../base/common/lifecycle.js';
 import { IExtHostUrlsService } from './extHostUrls.js';
-import { encodeBase64, VSBuffer } from '../../../base/common/buffer.js';
 import { equals as arraysEqual } from '../../../base/common/arrays.js';
 import { IExtHostProgress } from './extHostProgress.js';
 import { NotificationTelemetryId } from '../../../platform/notification/common/notificationTelemetry.js';
@@ -279,17 +279,22 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 		resourceMetadata: IAuthorizationProtectedResourceMetadata | undefined,
 		clientId: string | undefined,
 		clientSecret: string | undefined,
-		initialTokens: IAuthorizationToken[] | undefined
+		initialTokens: IAuthorizationToken[] | undefined,
+		tokenEndpointAuthMethod?: OAuthTokenEndpointAuthMethod,
 	): Promise<string> {
 		if (!clientId) {
 			const authorizationServer = URI.revive(authorizationServerComponents);
+			tokenEndpointAuthMethod = undefined;
 			if (serverMetadata.registration_endpoint) {
 				try {
-					const registration = await fetchDynamicRegistration(serverMetadata, this._initData.environment.appName, resourceMetadata?.scopes_supported);
+					const registration = await fetchDynamicRegistration(serverMetadata, this._initData.environment.appName, resourceMetadata?.scopes_supported, {
+						tokenEndpointAuthMethod: selectRegistrationAuthMethod(serverMetadata.token_endpoint_auth_methods_supported),
+					});
 					clientId = registration.client_id;
 					clientSecret = registration.client_secret;
+					tokenEndpointAuthMethod = selectTokenEndpointAuthMethod(registration.token_endpoint_auth_method, serverMetadata.token_endpoint_auth_methods_supported, registration.client_secret !== undefined);
 				} catch (err) {
-					this._logService.warn(`Dynamic registration failed for ${authorizationServer.toString()}: ${err.message}. Prompting user for client ID and client secret...`);
+					this._logService.warn(`Dynamic registration failed for ${authorizationServer.toString()}: ${redact(err.message)}. Prompting user for client ID and client secret...`);
 				}
 			}
 			// Still no client id so dynamic client registration was either not supported or failed
@@ -324,6 +329,9 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 			this._onDidDynamicAuthProviderTokensChange,
 			initialTokens || []
 		);
+		if (tokenEndpointAuthMethod) {
+			provider.setTokenEndpointAuthMethod(tokenEndpointAuthMethod);
+		}
 
 		// Use the sequencer to ensure dynamic provider registration is serialized
 		await this._providerOperations.queue(provider.id, async () => {
@@ -338,7 +346,8 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 						provider.onDidChangeClientId(() => this._proxy.$sendDidChangeDynamicProviderInfo({
 							providerId: provider.id,
 							clientId: provider.clientId,
-							clientSecret: provider.clientSecret
+							clientSecret: provider.clientSecret,
+							tokenEndpointAuthMethod: provider.tokenEndpointAuthMethod,
 						}))
 					),
 					options: { supportsMultipleAccounts: true }
@@ -352,7 +361,8 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 				authorizationServer: authorizationServerComponents,
 				resourceServer: resourceMetadata ? URI.parse(resourceMetadata.resource) : undefined,
 				clientId: provider.clientId,
-				clientSecret: provider.clientSecret
+				clientSecret: provider.clientSecret,
+				tokenEndpointAuthMethod: provider.tokenEndpointAuthMethod,
 			});
 		});
 
@@ -496,6 +506,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	protected readonly _logger: ILogger;
 	protected readonly _isMicrosoftAuth: boolean;
 	private readonly _disposable: DisposableStore;
+	/** How the client authenticates at the token endpoint (RFC 6749 section 2.3). */
+	protected _tokenEndpointAuthMethod: OAuthTokenEndpointAuthMethod;
 
 	constructor(
 		@IExtHostWindow protected readonly _extHostWindow: IExtHostWindow,
@@ -523,6 +535,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		// Metadata is untrusted, so the token endpoint must also be Microsoft to earn Microsoft-specific treatment.
 		this._isMicrosoftAuth = (isMicrosoftAuthUrl(stringifiedServer) || isMicrosoftAuthUrl(_serverMetadata.authorization_endpoint))
 			&& isMicrosoftAuthUrl(_serverMetadata.token_endpoint);
+		// A client without a recorded method is public without a secret, and uses the method the server supports with one.
+		this._tokenEndpointAuthMethod = selectTokenEndpointAuthMethod(undefined, _serverMetadata.token_endpoint_auth_methods_supported, _clientSecret !== undefined);
 
 		this._logger = loggerService.createLogger(this.id, { name: `Auth: ${this.label}` });
 		this._disposable = new DisposableStore();
@@ -557,6 +571,78 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 
 	get clientSecret(): string | undefined {
 		return this._clientSecret;
+	}
+
+	get tokenEndpointAuthMethod(): OAuthTokenEndpointAuthMethod {
+		return this._tokenEndpointAuthMethod;
+	}
+
+	/** Records the token endpoint authentication method the registration was made with. */
+	setTokenEndpointAuthMethod(method: OAuthTokenEndpointAuthMethod): void {
+		this._tokenEndpointAuthMethod = method;
+	}
+
+	/**
+	 * The authorization code flows require PKCE `S256` to be advertised by
+	 * the authorization server (`oauth.pkce: "assume-supported"` in `mcp.json`
+	 * makes the MCP transport hand on metadata that advertises it).
+	 */
+	protected _assertPkceSupported(): void {
+		if (!pkceSupported(this._serverMetadata)) {
+			throw new OAuthClientError('pkce_unsupported', nls.localize('pkceUnsupported', "The authorization server '{0}' does not advertise support for PKCE (S256), which is required to sign in securely.", this._serverMetadata.issuer));
+		}
+	}
+
+	/** Creates the PKCE verifier and its `S256` challenge (RFC 7636). */
+	protected _createPkcePair(): Promise<{ verifier: string; challenge: string }> {
+		return createPkcePair(
+			bytes => crypto.getRandomValues(new Uint8Array(bytes)),
+			async data => new Uint8Array(await crypto.subtle.digest('SHA-256', data as Uint8Array<ArrayBuffer>)),
+		);
+	}
+
+	/**
+	 * Validates an authorization response in the order RFC 9207 requires: the
+	 * `iss` parameter first (it is compared to the recorded issuer by exact
+	 * string equality), then `state` when one is expected, then an `error`.
+	 * Returns the authorization code.
+	 */
+	protected _validateAuthorizationResponse(params: IAuthorizationRedirectParams, expectedState: string | undefined): string {
+		const issError = validateIssuerParameter(this._serverMetadata.authorization_response_iss_parameter_supported, params.iss, this._serverMetadata.issuer);
+		if (issError) {
+			this._logger.error(`Rejecting the authorization response: ${issError.message}`);
+			throw issError;
+		}
+		if (expectedState !== undefined && params.state !== expectedState) {
+			throw new OAuthClientError('state_mismatch', nls.localize('authStateMismatch', "The authorization response does not carry the state of the request."));
+		}
+		if (params.error) {
+			const reason = params.errorDescription ? `${params.error} (${params.errorDescription})` : params.error;
+			throw new OAuthClientError('authorization_denied', nls.localize('authDenied', "The authorization server denied the request: {0}", reason), { error: params.error, errorDescription: params.errorDescription });
+		}
+		if (!params.code) {
+			throw new OAuthClientError('authorization_denied', nls.localize('authNoCode', "Authentication failed: no authorization code was received."));
+		}
+		return params.code;
+	}
+
+	/** The token endpoint request: the grant's parameters plus the client authentication of {@link tokenEndpointAuthMethod}. */
+	protected _buildTokenRequest(params: Record<string, string>): { headers: Record<string, string>; body: string } {
+		const auth = buildClientAuthentication(this._tokenEndpointAuthMethod, this._clientId, this._clientSecret);
+		const body = new URLSearchParams({ ...auth.body, ...params });
+		return {
+			headers: {
+				'Content-Type': 'application/x-www-form-urlencoded',
+				'Accept': 'application/json',
+				...auth.headers,
+			},
+			body: body.toString(),
+		};
+	}
+
+	/** A loggable summary of a token response: never the tokens themselves. */
+	protected _describeTokenResponse(token: IAuthorizationTokenResponse): string {
+		return `token_type=${token.token_type}, scope=${token.scope ?? '(none)'}, expires_in=${token.expires_in ?? '(none)'}, refresh_token=${token.refresh_token ? 'present' : 'absent'}, id_token=${token.id_token ? 'present' : 'absent'}`;
 	}
 
 	/**
@@ -655,6 +741,12 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 					break;
 				}
 			} catch (err) {
+				if (err instanceof OAuthClientError) {
+					// A protocol or security failure (PKCE unsupported, an issuer mismatch, ...) is not
+					// something another flow fixes: surface it as is.
+					this._logger.error(`Authentication failed: ${err.message}`);
+					throw err;
+				}
 				const nextMode = this._createFlows[i + 1]?.label;
 				if (!nextMode) {
 					break; // No more flows to try
@@ -712,10 +804,10 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		if (!this._serverMetadata.token_endpoint) {
 			throw new Error('Token endpoint not available in server metadata');
 		}
+		this._assertPkceSupported();
 
 		// Generate PKCE code verifier (random string) and code challenge (SHA-256 hash of verifier)
-		const codeVerifier = this.generateRandomString(64);
-		const codeChallenge = await this.generateCodeChallenge(codeVerifier);
+		const { verifier: codeVerifier, challenge: codeChallenge } = await this._createPkcePair();
 
 		// Generate a random state value to prevent CSRF
 		const nonce = this.generateRandomString(32);
@@ -773,6 +865,10 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				this._logger.info('Authorization code request was cancelled by the user.');
 				throw err;
 			}
+			if (err instanceof OAuthClientError) {
+				// The authorization response failed validation (iss, error): surfaced as is.
+				throw err;
+			}
 			this._logger.error(`Failed to receive authorization code: ${err}`);
 			throw new Error(`Failed to receive authorization code: ${err}`);
 		}
@@ -792,26 +888,18 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			.substring(0, length);
 	}
 
-	protected async generateCodeChallenge(codeVerifier: string): Promise<string> {
-		const encoder = new TextEncoder();
-		const data = encoder.encode(codeVerifier);
-		const digest = await crypto.subtle.digest('SHA-256', data);
-
-		// Base64url encode the digest
-		return encodeBase64(VSBuffer.wrap(new Uint8Array(digest)), false, false)
-			.replace(/\+/g, '-')
-			.replace(/\//g, '_')
-			.replace(/=+$/, '');
-	}
-
 	private async waitForAuthorizationCode(expectedState: URI): Promise<{ code: string }> {
 		const result = await this._proxy.$waitForUriHandler(expectedState);
+		const query = result.query || '';
+		// The issuer and an error are validated before the code is used (RFC 9207). The state is
+		// the callback URI itself, which the URI handler already matched.
+		this._validateAuthorizationResponse(parseAuthorizationRedirect(query), undefined);
 		// Extract the code parameter directly from the query string. NOTE, URLSearchParams does not work here because
 		// it will decode the query string and we need to keep it encoded.
-		const codeMatch = /[?&]code=([^&]+)/.exec(result.query || '');
+		const codeMatch = /[?&]code=([^&]+)/.exec(query.startsWith('?') || query.startsWith('&') ? query : `?${query}`);
 		if (!codeMatch || codeMatch.length < 2) {
 			// No code parameter found in the query string
-			throw new Error('Authentication failed: No authorization code received');
+			throw new OAuthClientError('authorization_denied', 'Authentication failed: No authorization code received');
 		}
 		return { code: codeMatch[1] };
 	}
@@ -821,57 +909,50 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			throw new Error('Token endpoint not available in server metadata');
 		}
 
-		const tokenRequest = new URLSearchParams();
-		tokenRequest.append('client_id', this._clientId);
-		tokenRequest.append('grant_type', 'authorization_code');
-		tokenRequest.append('code', code);
-		tokenRequest.append('redirect_uri', redirectUri);
-		tokenRequest.append('code_verifier', codeVerifier);
+		const params: Record<string, string> = {
+			grant_type: 'authorization_code',
+			code,
+			redirect_uri: redirectUri,
+			code_verifier: codeVerifier,
+		};
 
 		// Add resource indicator if available (RFC 8707)
 		const resource = this._resourceIndicator;
 		if (resource) {
-			tokenRequest.append('resource', resource);
+			params.resource = resource;
 		}
 
-		// Add client secret if available
-		if (this._clientSecret) {
-			tokenRequest.append('client_secret', this._clientSecret);
-		}
-
-		this._logger.info('Exchanging authorization code for token...');
+		const request = this._buildTokenRequest(params);
+		this._logger.info(`Exchanging authorization code for token (${this._tokenEndpointAuthMethod} client authentication)...`);
 		this._logger.trace(`Url: ${this._serverMetadata.token_endpoint}`);
-		this._logger.trace(`Token request body: ${tokenRequest.toString()}`);
 		let response: Response;
 		try {
 			response = await this._fetch(this._serverMetadata.token_endpoint, {
 				method: 'POST',
-				headers: {
-					'Content-Type': 'application/x-www-form-urlencoded',
-					'Accept': 'application/json'
-				},
-				body: tokenRequest.toString()
+				headers: request.headers,
+				body: request.body
 			});
 		} catch (err) {
-			this._logger.error(`Failed to exchange authorization code for token: ${err}`);
-			throw new Error(`Failed to exchange authorization code for token: ${err}`);
+			this._logger.error(`Failed to exchange authorization code for token: ${redact(String(err))}`);
+			throw new Error(`Failed to exchange authorization code for token: ${redact(String(err))}`);
 		}
 
-		if (!response.ok) {
-			const text = await response.text();
-			throw new Error(`Token exchange failed: ${response.status} ${response.statusText} - ${text}`);
+		let result: unknown;
+		try {
+			result = await response.json();
+		} catch {
+			result = undefined;
 		}
-
-		const result = await response.json();
-		if (isAuthorizationTokenResponse(result)) {
-			this._logger.info(`Successfully exchanged authorization code for token.`);
+		if (response.ok && isAuthorizationTokenResponse(result)) {
+			this._logger.info(`Successfully exchanged authorization code for token (${this._describeTokenResponse(result)}).`);
 			return result;
 		} else if (isAuthorizationErrorResponse(result) && result.error === AuthorizationErrorType.InvalidClient) {
 			this._logger.warn(`Client ID (${this._clientId}) was invalid, generated a new one.`);
 			await this._generateNewClientId();
 			throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
 		}
-		throw new Error(`Invalid authorization token response: ${JSON.stringify(result)}`);
+		const description = isAuthorizationErrorResponse(result) ? `${result.error}${result.error_description ? ` (${result.error_description})` : ''}` : 'no error details';
+		throw new Error(`Token exchange failed: ${response.status} ${response.statusText} - ${redact(description)}`);
 	}
 
 	protected async exchangeRefreshTokenForToken(refreshToken: string, scopes: readonly string[], allowClientRegistration: boolean): Promise<IAuthorizationToken> {
@@ -879,40 +960,39 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			throw new Error('Token endpoint not available in server metadata');
 		}
 
-		const tokenRequest = new URLSearchParams();
-		tokenRequest.append('client_id', this._clientId);
-		tokenRequest.append('grant_type', 'refresh_token');
-		tokenRequest.append('refresh_token', refreshToken);
+		const params: Record<string, string> = {
+			grant_type: 'refresh_token',
+			refresh_token: refreshToken,
+		};
 
 		if (this._isMicrosoftAuth) {
 			const requestScopeString = this._getRequestScopes(scopes).join(' ');
 			if (requestScopeString) {
-				tokenRequest.append('scope', requestScopeString);
+				params.scope = requestScopeString;
 			}
 		}
 
 		// Add resource indicator if available (RFC 8707)
 		const resource = this._resourceIndicator;
 		if (resource) {
-			tokenRequest.append('resource', resource);
+			params.resource = resource;
 		}
 
-		// Add client secret if available
-		if (this._clientSecret) {
-			tokenRequest.append('client_secret', this._clientSecret);
-		}
-
+		const request = this._buildTokenRequest(params);
 		const response = await this._fetch(this._serverMetadata.token_endpoint, {
 			method: 'POST',
-			headers: {
-				'Content-Type': 'application/x-www-form-urlencoded',
-				'Accept': 'application/json'
-			},
-			body: tokenRequest.toString()
+			headers: request.headers,
+			body: request.body
 		});
 
-		const result = await response.json();
+		let result: unknown;
+		try {
+			result = await response.json();
+		} catch {
+			result = undefined;
+		}
 		if (isAuthorizationTokenResponse(result)) {
+			this._logger.info(`Refreshed the token (${this._describeTokenResponse(result)}).`);
 			return {
 				...result,
 				created_at: Date.now(),
@@ -926,18 +1006,23 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			await this._generateNewClientId();
 			throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
 		}
-		throw new Error(`Invalid authorization token response: ${JSON.stringify(result)}`);
+		const description = isAuthorizationErrorResponse(result) ? `${result.error}${result.error_description ? ` (${result.error_description})` : ''}` : 'no error details';
+		throw new Error(`Invalid authorization token response: ${response.status} - ${redact(description)}`);
 	}
 
 	protected async _generateNewClientId(): Promise<void> {
 		try {
-			const registration = await fetchDynamicRegistration(this._serverMetadata, this._initData.environment.appName, this._resourceMetadata?.scopes_supported);
+			const supported = this._serverMetadata.token_endpoint_auth_methods_supported;
+			const registration = await fetchDynamicRegistration(this._serverMetadata, this._initData.environment.appName, this._resourceMetadata?.scopes_supported, {
+				tokenEndpointAuthMethod: selectRegistrationAuthMethod(supported),
+			});
 			this._clientId = registration.client_id;
 			this._clientSecret = registration.client_secret;
+			this._tokenEndpointAuthMethod = selectTokenEndpointAuthMethod(registration.token_endpoint_auth_method, supported, registration.client_secret !== undefined);
 			this._onDidChangeClientId.fire();
 		} catch (err) {
 			// When DCR fails, try to prompt the user for a client ID and client secret
-			this._logger.info(`Dynamic registration failed for ${this.authorizationServer.toString()}: ${err}. Prompting user for client ID and client secret.`);
+			this._logger.info(`Dynamic registration failed for ${this.authorizationServer.toString()}: ${redact(String(err))}. Prompting user for client ID and client secret.`);
 
 			try {
 				const clientDetails = await this._proxy.$promptForClientRegistration(this.authorizationServer.toString());
@@ -946,6 +1031,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				}
 				this._clientId = clientDetails.clientId;
 				this._clientSecret = clientDetails.clientSecret;
+				this._tokenEndpointAuthMethod = selectTokenEndpointAuthMethod(undefined, this._serverMetadata.token_endpoint_auth_methods_supported, clientDetails.clientSecret !== undefined);
 				this._logger.info(`User provided client ID for ${this.authorizationServer.toString()}`);
 				if (clientDetails.clientSecret) {
 					this._logger.info(`User provided client secret for ${this.authorizationServer.toString()}`);
@@ -955,8 +1041,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 
 				this._onDidChangeClientId.fire();
 			} catch (promptErr) {
-				this._logger.error(`Failed to fetch new client ID and user did not provide one: ${err}`);
-				throw new Error(`Failed to fetch new client ID and user did not provide one: ${err}`);
+				this._logger.error(`Failed to fetch new client ID and user did not provide one: ${redact(String(err))}`);
+				throw new Error(`Failed to fetch new client ID and user did not provide one: ${redact(String(err))}`);
 			}
 		}
 	}

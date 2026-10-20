@@ -22,7 +22,7 @@ import { IExtHostProgress } from '../common/extHostProgress.js';
 import { IProgressStep } from '../../../platform/progress/common/progress.js';
 import { CancellationError, isCancellationError } from '../../../base/common/errors.js';
 import { URI } from '../../../base/common/uri.js';
-import { LoopbackAuthServer } from './loopbackServer.js';
+import { IOAuthResult, LoopbackAuthServer } from './loopbackServer.js';
 
 export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 
@@ -82,10 +82,10 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		if (!this._serverMetadata.token_endpoint) {
 			throw new Error('Token endpoint not available in server metadata');
 		}
+		this._assertPkceSupported();
 
 		// Generate PKCE code verifier (random string) and code challenge (SHA-256 hash of verifier)
-		const codeVerifier = this.generateRandomString(64);
-		const codeChallenge = await this.generateCodeChallenge(codeVerifier);
+		const { verifier: codeVerifier, challenge: codeChallenge } = await this._createPkcePair();
 
 		// Generate a random state value to prevent CSRF
 		const nonce = this.generateRandomString(32);
@@ -146,11 +146,10 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 				message: nls.localize('completeAuth', "Complete the authentication in the browser window that has opened."),
 			});
 
-			// Wait for the authorization code via the loopback server
-			let code: string | undefined;
+			// Wait for the authorization response via the loopback server
+			let response: IOAuthResult;
 			try {
-				const response = await raceCancellationError(promise, token);
-				code = response.code;
+				response = await raceCancellationError(promise, token);
 			} catch (err) {
 				if (isCancellationError(err)) {
 					this._logger.info('Authorization code request was cancelled by the user.');
@@ -159,6 +158,8 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 				this._logger.error(`Failed to receive authorization code: ${err}`);
 				throw new Error(`Failed to receive authorization code: ${err}`);
 			}
+			// RFC 9207: the issuer first, then the state, then an error; only then is the code used.
+			const code = this._validateAuthorizationResponse(response, server.state);
 			this._logger.info(`Authorization code received for scopes: ${scopeString}`);
 
 			// Exchange the authorization code for tokens
@@ -255,24 +256,22 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 			}
 
 			// Poll the token endpoint
-			const tokenRequest = new URLSearchParams();
-			tokenRequest.append('grant_type', 'urn:ietf:params:oauth:grant-type:device_code');
-			tokenRequest.append('device_code', deviceCodeData.device_code);
-			tokenRequest.append('client_id', this._clientId);
+			const tokenParams: Record<string, string> = {
+				grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+				device_code: deviceCodeData.device_code,
+			};
 
 			// Add resource indicator if available (RFC 8707)
 			if (resource) {
-				tokenRequest.append('resource', resource);
+				tokenParams.resource = resource;
 			}
+			const tokenRequest = this._buildTokenRequest(tokenParams);
 
 			try {
 				const tokenResponse = await fetch(this._serverMetadata.token_endpoint, {
 					method: 'POST',
-					headers: {
-						'Content-Type': 'application/x-www-form-urlencoded',
-						'Accept': 'application/json'
-					},
-					body: tokenRequest.toString()
+					headers: tokenRequest.headers,
+					body: tokenRequest.body
 				});
 
 				if (tokenResponse.ok) {

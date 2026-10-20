@@ -169,6 +169,26 @@ const mcpOAuthSchema: IJSONSchema = {
 			type: 'boolean',
 			default: false,
 			markdownDescription: localize('app.mcp.json.oauth.enterpriseManaged', "(Preview) When set to `true`, this MCP server authenticates through the SSO issuer configured by `#mcp.enterpriseManagedAuth.idp#` using OAuth Identity Assertion Authorization Grant (ID-JAG). After a one-time sign-in, subsequent enterprise-managed servers connect silently. The IdP issuer and client credentials are read from the `#mcp.enterpriseManagedAuth.idp#` setting; the `clientId` on this server entry is passed to the resource authorization server.")
+		},
+		authorizationServer: {
+			type: 'string',
+			format: 'uri',
+			markdownDescription: localize('app.mcp.json.oauth.authorizationServer', "The issuer URL of the authorization server that `clientId` and its client secret are registered with. When the server names a different authorization server, VS Code refuses to send these credentials to it. When omitted, the credentials are bound to the authorization server they are first used with.")
+		},
+		pkce: {
+			type: 'string',
+			enum: ['require-advertised', 'assume-supported'],
+			default: 'require-advertised',
+			enumDescriptions: [
+				localize('app.mcp.json.oauth.pkce.requireAdvertised', "Only authorize against authorization servers that advertise the `S256` PKCE method."),
+				localize('app.mcp.json.oauth.pkce.assumeSupported', "Use PKCE `S256` even when the authorization server does not advertise it. Only use this for servers known to support PKCE."),
+			],
+			markdownDescription: localize('app.mcp.json.oauth.pkce', "Whether the authorization server must advertise PKCE `S256` support in its metadata (`code_challenge_methods_supported`).")
+		},
+		allowInsecureHttp: {
+			type: 'boolean',
+			default: false,
+			markdownDescription: localize('app.mcp.json.oauth.allowInsecureHttp', "Allow `http://` authorization server endpoints on hosts other than loopback. Only use this for local development; tokens and credentials are sent unencrypted.")
 		}
 	}
 };

@@ -18,31 +18,31 @@ One row per scenario that the requirement sets of `@modelcontextprotocol/conform
 | --- | --- | --- | --- | --- | --- |
 | client | 2026-07-28 | `tools_call` | scored | driven | `tools/list`, then `tools/call` with arguments that satisfy the input schema |
 | client | 2026-07-28 | `request-metadata` | scored | driven | `server/discover`, retried after the version rejection; `_meta` on every request |
-| client | 2026-07-28 | `auth/metadata-default` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2026-07-28 | `auth/metadata-var1` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2026-07-28 | `auth/metadata-var2` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2026-07-28 | `auth/metadata-var3` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2026-07-28 | `auth/basic-cimd` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/scope-from-www-authenticate` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/scope-from-scopes-supported` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/scope-omitted-when-undefined` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/scope-step-up` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2026-07-28 | `auth/scope-retry-limit` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/token-endpoint-auth-basic` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2026-07-28 | `auth/token-endpoint-auth-post` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2026-07-28 | `auth/token-endpoint-auth-none` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2026-07-28 | `auth/pre-registration` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/resource-mismatch` | scored | driven | passes: the client sends nothing to the mismatching resource (it has no OAuth yet, M5) |
-| client | 2026-07-28 | `auth/offline-access-scope` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/offline-access-not-supported` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/authorization-server-migration` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/iss-supported` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/iss-not-advertised` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/iss-supported-missing` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/iss-wrong-issuer` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/iss-unexpected` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/iss-normalized` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2026-07-28 | `auth/metadata-issuer-mismatch` | scored | driven | passes: the client sends nothing to the mismatching issuer (it has no OAuth yet, M5) |
+| client | 2026-07-28 | `auth/metadata-default` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/metadata-var1` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/metadata-var2` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/metadata-var3` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/basic-cimd` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/scope-from-www-authenticate` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/scope-from-scopes-supported` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/scope-omitted-when-undefined` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/scope-step-up` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/scope-retry-limit` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/token-endpoint-auth-basic` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/token-endpoint-auth-post` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/token-endpoint-auth-none` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/pre-registration` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/resource-mismatch` | scored | driven | the protected resource metadata names another resource: discovery fails (`resource_mismatch`) before any authorization request |
+| client | 2026-07-28 | `auth/offline-access-scope` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/offline-access-not-supported` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/authorization-server-migration` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/iss-supported` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/iss-not-advertised` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/iss-supported-missing` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/iss-wrong-issuer` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/iss-unexpected` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/iss-normalized` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2026-07-28 | `auth/metadata-issuer-mismatch` | scored | driven | the authorization server metadata names another issuer: discovery fails (`issuer_mismatch`) before registration |
 | client | 2026-07-28 | `sep-2322-client-request-state` | scored | driven | echoes `requestState` on the MRTR retries and omits it when absent |
 | client | 2026-07-28 | `http-standard-headers` | scored | driven | `Mcp-Method` and `Mcp-Name` on every tool, resource and prompt request |
 | client | 2026-07-28 | `http-custom-headers` | scored | driven | mirrors the `x-mcp-header` parameters into `Mcp-Param-*` headers |
@@ -64,20 +64,20 @@ One row per scenario that the requirement sets of `@modelcontextprotocol/conform
 | client | 2025-11-25 | `tools_call` | scored | driven | `tools/list`, then `tools/call` with arguments that satisfy the input schema |
 | client | 2025-11-25 | `elicitation-sep1034-client-defaults` | scored | driven | accepts the form elicitation with the schema defaults (SEP-1034) |
 | client | 2025-11-25 | `sse-retry` | scored | driven | the transport resumes the closed SSE stream after the advertised `retry`; also runs alone after the parallel run |
-| client | 2025-11-25 | `auth/metadata-default` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2025-11-25 | `auth/metadata-var1` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2025-11-25 | `auth/metadata-var2` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2025-11-25 | `auth/metadata-var3` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2025-11-25 | `auth/basic-cimd` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2025-11-25 | `auth/scope-from-www-authenticate` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2025-11-25 | `auth/scope-from-scopes-supported` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2025-11-25 | `auth/scope-omitted-when-undefined` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2025-11-25 | `auth/scope-step-up` | scored | gap | OAuth (M5): 2 checks baselined |
-| client | 2025-11-25 | `auth/scope-retry-limit` | scored | gap | OAuth (M5): 1 check baselined |
-| client | 2025-11-25 | `auth/token-endpoint-auth-basic` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2025-11-25 | `auth/token-endpoint-auth-post` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2025-11-25 | `auth/token-endpoint-auth-none` | scored | gap | OAuth (M5): 3 checks baselined |
-| client | 2025-11-25 | `auth/pre-registration` | scored | gap | OAuth (M5): 1 check baselined |
+| client | 2025-11-25 | `auth/metadata-default` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2025-11-25 | `auth/metadata-var1` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2025-11-25 | `auth/metadata-var2` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2025-11-25 | `auth/metadata-var3` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2025-11-25 | `auth/basic-cimd` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2025-11-25 | `auth/scope-from-www-authenticate` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2025-11-25 | `auth/scope-from-scopes-supported` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2025-11-25 | `auth/scope-omitted-when-undefined` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2025-11-25 | `auth/scope-step-up` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2025-11-25 | `auth/scope-retry-limit` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2025-11-25 | `auth/token-endpoint-auth-basic` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2025-11-25 | `auth/token-endpoint-auth-post` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2025-11-25 | `auth/token-endpoint-auth-none` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
+| client | 2025-11-25 | `auth/pre-registration` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
 | client | 2025-11-25 | `auth/client-credentials-jwt` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
 | client | 2025-11-25 | `auth/client-credentials-basic` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
 | client | 2025-11-25 | `auth/enterprise-managed-authorization` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |

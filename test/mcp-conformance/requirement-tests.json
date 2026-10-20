@@ -106,18 +106,34 @@
 		},
 		{
 			"id": "basic/authorization#009-4d66f7",
-			"status": "gap",
-			"reason": "The conformance client has no OAuth client yet (milestone M5); the auth/metadata-* scenarios are baselined."
+			"status": "tested",
+			"tests": [
+				"conformance:client/auth/metadata-default",
+				"conformance:client/auth/metadata-var1",
+				"conformance:client/auth/metadata-var2",
+				"conformance:client/auth/metadata-var3",
+				"conformance:client/auth/resource-mismatch",
+				"src/vs/base/test/common/oauthClient.test.ts",
+				"src/vs/workbench/api/test/common/extHostMcpAuth.test.ts"
+			]
 		},
 		{
 			"id": "basic/authorization/security-considerations#011-49ea51",
-			"status": "gap",
-			"reason": "The conformance client has no OAuth client yet (milestone M5)."
+			"status": "tested",
+			"tests": [
+				"conformance:client/auth/metadata-default",
+				"src/vs/base/test/common/oauthClient.test.ts",
+				"src/vs/workbench/api/test/browser/extHostAuthentication.test.ts"
+			]
 		},
 		{
 			"id": "basic/authorization/client-registration#028-e7ba6f",
-			"status": "gap",
-			"reason": "The conformance client has no OAuth client yet (milestone M5); auth/authorization-server-migration is baselined."
+			"status": "tested",
+			"tests": [
+				"conformance:client/auth/authorization-server-migration",
+				"src/vs/base/test/common/oauthClient.test.ts",
+				"src/vs/workbench/api/test/browser/mainThreadMcp.test.ts"
+			]
 		}
 	]
 }

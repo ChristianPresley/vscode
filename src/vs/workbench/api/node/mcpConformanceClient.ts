@@ -21,6 +21,7 @@ import { McpServerRequestHandler } from '../../contrib/mcp/common/mcpServerReque
 import { McpTaskManager } from '../../contrib/mcp/common/mcpTaskManager.js';
 import { IMcpClientMethods, McpServerTransportHTTP, McpServerTransportType } from '../../contrib/mcp/common/mcpTypes.js';
 import { McpHTTPHandle } from '../common/extHostMcp.js';
+import { CONFORMANCE_LAUNCH_OAUTH, createConformanceOAuthClient, createConformanceTokenSource } from './mcpConformanceOAuth.js';
 import { ConformanceMainThreadMcp, IConformanceContext, IConformanceTokenSource, InProcessMcpTransport, parseConformanceContext, StderrLogger } from './mcpConformanceProxy.js';
 import { IScenarioClient, resolveScenario, schemaDefaults } from './mcpConformanceScenarios.js';
 
@@ -226,7 +227,7 @@ function createScenarioClient(handler: McpServerRequestHandler, context: IConfor
 export interface IConformanceMainOptions {
 	/** Receives every stderr line (defaults to `process.stderr`). */
 	readonly writeStderr?: (line: string) => void;
-	/** Bearer tokens for the authorization scenarios. */
+	/** Bearer tokens for the authorization scenarios; defaults to the conformance OAuth client (mcpConformanceOAuth.ts). */
 	readonly tokenSource?: IConformanceTokenSource;
 	/** Overrides the transport handle (tests). */
 	readonly createHandle?: (id: number, launch: McpServerTransportHTTP, proxy: ConformanceMainThreadMcp, logService: ILogService) => McpHTTPHandle;
@@ -257,8 +258,24 @@ export async function main(argv: readonly string[], env: ConformanceEnv, options
 
 	try {
 		const proxy = disposables.add(new ConformanceMainThreadMcp());
-		proxy.tokenSource = options.tokenSource;
-		const launch: McpServerTransportHTTP = { type: McpServerTransportType.HTTP, uri: URI.parse(args.serverUrl), headers: [] };
+		if (options.tokenSource) {
+			proxy.tokenSource = options.tokenSource;
+		} else {
+			// Every authorization scenario runs through the product's OAuth rule set.
+			const oauthClient = disposables.add(createConformanceOAuthClient({
+				context: args.context,
+				protocolVersion: args.protocolVersion,
+				log: (level, message) => {
+					switch (level) {
+						case 'error': logger.error(`[oauth] ${message}`); break;
+						case 'warn': logger.warn(`[oauth] ${message}`); break;
+						default: logger.info(`[oauth] ${message}`); break;
+					}
+				},
+			}));
+			proxy.tokenSource = createConformanceTokenSource(oauthClient);
+		}
+		const launch: McpServerTransportHTTP = { type: McpServerTransportType.HTTP, uri: URI.parse(args.serverUrl), headers: [], oauth: CONFORMANCE_LAUNCH_OAUTH };
 		const createHandle = options.createHandle ?? ((id, l, p, log) => new McpHTTPHandle(id, l, p, log, true));
 		const transport = disposables.add(new InProcessMcpTransport(HANDLE_ID, proxy, () => createHandle(HANDLE_ID, launch, proxy, logService), message => logger.warn(message)));
 		disposables.add(transport.onDidLog(e => {
