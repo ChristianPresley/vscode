@@ -90,3 +90,14 @@
 .mcp-config-form .mcp-config-form-footer .mcp-config-form-other-properties {
 	margin-inline-end: auto;
 }
+
+.mcp-config-form .mcp-config-form-checkbox {
+	display: flex;
+	align-items: center;
+	gap: var(--vscode-spacing-size80);
+}
+
+.mcp-config-form .mcp-config-form-checkbox-label {
+	font-size: var(--vscode-fontSize-body1);
+	color: var(--vscode-foreground);
+}

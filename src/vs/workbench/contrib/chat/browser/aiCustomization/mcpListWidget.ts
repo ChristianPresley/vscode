@@ -1970,6 +1970,21 @@ function getMcpServerConfiguration(definition: McpServerDefinition): IMcpServerC
 			headers: launch.headers.length > 0 ? Object.fromEntries(launch.headers) : undefined,
 			oauth: launch.oauth,
 			dev: definition.devMode,
+			protocolVersion: definition.protocolVersionHint,
+		};
+	}
+	if (launch.type === McpServerTransportType.Grpc) {
+		return {
+			type: McpServerType.GRPC,
+			url: launch.uri.toString(true),
+			headers: launch.headers.length > 0 ? Object.fromEntries(launch.headers) : undefined,
+			tls: launch.tls,
+			binding: launch.binding,
+			deadlineMs: launch.deadlineMs,
+			keepAliveMs: launch.keepAliveMs,
+			oauth: launch.oauth,
+			dev: definition.devMode,
+			protocolVersion: definition.protocolVersionHint,
 		};
 	}
 	return {
@@ -1981,6 +1996,7 @@ function getMcpServerConfiguration(definition: McpServerDefinition): IMcpServerC
 		cwd: launch.cwd,
 		sandboxEnabled: definition.sandboxEnabled,
 		dev: definition.devMode,
+		protocolVersion: definition.protocolVersionHint,
 	};
 }
 

@@ -37,7 +37,8 @@ export class McpServerConfigurationFormAccessibilityHelp implements IAccessibleV
 export function getMcpServerConfigurationFormHelpContent(): string {
 	return [
 		localize('mcpFormHelp.overview', "You are in the configuration form of an MCP server. It edits the server's entry in its configuration file, and only offers the fields that file can store."),
-		localize('mcpFormHelp.type', "Server Type is a group of options: stdio runs a local process, http connects to a remote server, and sse connects using Server-Sent Events. Use the arrow keys to change the type; the fields below change to match it."),
+		localize('mcpFormHelp.type', "Server Type is a group of options: stdio runs a local process, http connects to a remote server, sse connects using Server-Sent Events, and grpc connects over gRPC. Use the arrow keys to change the type; the fields below change to match it."),
+		localize('mcpFormHelp.grpc', "A grpc server has a Binding group of options, auto, tunnel or typed, that selects the gRPC service the server implements, and TLS fields: a certificate authority path, a server name, and a checkbox that skips certificate verification. These are only offered when the configuration file is a VS Code mcp.json."),
 		localize('mcpFormHelp.arguments', "Arguments are separated by spaces. If an argument contains spaces or is empty, enter all arguments as a JSON array of strings instead, for example [\"--path\", \"My Documents\"]."),
 		localize('mcpFormHelp.rows', "Environment variables and headers are rows of a name field, a value field and a Remove button. Use Add Variable or Add Header to add a row; focus moves to its name field. Removing a row moves focus to the next row, or to the add button when no rows remain."),
 		localize('mcpFormHelp.validation', "Invalid fields are marked as invalid and announce their error. Errors that apply to the whole form, such as a value the configuration file does not support, are announced below the fields."),

@@ -34,7 +34,7 @@ function getExpandableUrl(expansion: McpServerEnvironmentVariableExpansion): str
 /** Whether any field that {@link expandEnvironmentVariablesInLaunch} expands contains a reference. */
 export function launchHasEnvironmentVariableReferences(launch: McpServerLaunch, expansion: McpServerEnvironmentVariableExpansion): boolean {
 	const has = (value: string) => hasEnvVarReferences(value, expansionOptions);
-	if (launch.type === McpServerTransportType.HTTP) {
+	if (launch.type !== McpServerTransportType.Stdio) {
 		const url = getExpandableUrl(expansion);
 		return (url !== undefined && has(url))
 			|| launch.headers.some(([, value]) => has(value));
@@ -49,11 +49,11 @@ export function launchHasEnvironmentVariableReferences(launch: McpServerLaunch, 
  * environment of the host that runs or connects to the server:
  *
  * - Stdio: `command`, each of `args`, and `env` values. Environment variable names are never expanded.
- * - HTTP: the URL, if the Copilot runtime would accept it, and header values. Header names are never expanded.
+ * - HTTP and gRPC: the URL, if the Copilot runtime would accept it, and header values. Header names are never expanded.
  */
 export function expandEnvironmentVariablesInLaunch(launch: McpServerLaunch, expansion: McpServerEnvironmentVariableExpansion, context: IMcpEnvironmentVariableExpansionContext): McpServerLaunch {
 	const resolve = createEnvVarResolver(context.env, context.caseInsensitive, expansionOptions);
-	if (launch.type === McpServerTransportType.HTTP) {
+	if (launch.type !== McpServerTransportType.Stdio) {
 		const url = getExpandableUrl(expansion);
 		return {
 			...launch,

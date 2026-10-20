@@ -158,6 +158,14 @@ suite('copilotPluginConverters', () => {
 			assert.deepStrictEqual(result, {});
 		});
 
+		test('skips grpc servers, which the SDK cannot reach', () => {
+			const defs: IMcpServerDefinition[] = [
+				{ name: 'grpc', uri: URI.file('/plugin'), configuration: { type: McpServerType.GRPC, url: 'grpcs://localhost:50051' }, customization: stubMcpCustomization('grpc') },
+				{ name: 'remote', uri: URI.file('/plugin'), configuration: { type: McpServerType.REMOTE, url: 'https://example.com/mcp' }, customization: stubMcpCustomization('remote') },
+			];
+			assert.deepStrictEqual(toSdkMcpServers(defs), { remote: { type: 'http', url: 'https://example.com/mcp', tools: ['*'] } });
+		});
+
 		test('omits optional fields when undefined', () => {
 			const defs: IMcpServerDefinition[] = [{
 				name: 'minimal',

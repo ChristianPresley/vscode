@@ -230,6 +230,16 @@ suite('claudeSdkOptions / MCP server projection', () => {
 		assert.strictEqual(result.servers.sse.type, 'sse');
 		assert.deepStrictEqual(result.skipped, ['additional']);
 	});
+
+	test('skips grpc servers, which the Claude SDK cannot reach', () => {
+		const primary = URI.file('/primary');
+		const result = toClaudeMcpServers([
+			{ ...definition('grpc', primary, true), configuration: { type: McpServerType.GRPC, url: 'grpcs://localhost:50051', binding: 'tunnel' } },
+			definition('remote', primary, true),
+		], primary);
+
+		assert.deepStrictEqual({ servers: Object.keys(result.servers), skipped: result.skipped }, { servers: ['remote'], skipped: ['grpc'] });
+	});
 });
 
 suite('claudeSdkOptions / buildOptions plugins projection', () => {

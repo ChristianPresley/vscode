@@ -38,10 +38,14 @@ export function toSdkClientToolName(name: string): string {
 
 /**
  * Converts parsed MCP server definitions into the SDK's `mcpServers` config.
+ * gRPC servers have no SDK representation and are skipped.
  */
 export function toSdkMcpServers(defs: readonly IMcpServerDefinition[]): Record<string, MCPServerConfig> {
 	const result: Record<string, MCPServerConfig> = {};
 	for (const def of defs) {
+		if (def.configuration.type === McpServerType.GRPC) {
+			continue;
+		}
 		result[def.name] = toSdkMcpServer(def.name, def.configuration, def.defaultCwd);
 	}
 	return result;

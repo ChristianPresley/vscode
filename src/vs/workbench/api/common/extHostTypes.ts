@@ -4328,6 +4328,25 @@ export class McpHttpServerDefinition implements vscode.McpHttpServerDefinition {
 		public authentication?: { providerId: string; scopes: string[] },
 	) { }
 }
+
+export enum McpGrpcBinding {
+	Auto = 1,
+	Tunnel = 2,
+	Typed = 3,
+}
+
+export class McpGrpcServerDefinition extends McpHttpServerDefinition implements vscode.McpGrpcServerDefinition {
+	constructor(
+		label: string,
+		uri: URI,
+		headers: Record<string, string> = {},
+		version?: string,
+		public readonly tls?: { ca?: string; insecure?: boolean; serverName?: string },
+		public readonly binding?: McpGrpcBinding,
+	) {
+		super(label, uri, headers, version);
+	}
+}
 //#endregion
 
 //#region Chat Prompt Files

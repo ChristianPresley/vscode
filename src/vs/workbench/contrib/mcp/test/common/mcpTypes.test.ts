@@ -345,6 +345,65 @@ suite('MCP Types', () => {
 		});
 	});
 
+	test('McpServerLaunch converts grpc configurations and validates the scheme', () => {
+		const launch = McpServerLaunch.fromServerConfiguration({
+			type: McpServerType.GRPC,
+			url: 'grpcs://mcp.example.com:50051',
+			headers: { Authorization: 'Bearer token' },
+			tls: { ca: '/certs/ca.pem', serverName: 'mcp.internal' },
+			binding: 'tunnel',
+			deadlineMs: 0,
+			keepAliveMs: 30000,
+			oauth: { clientId: 'client' },
+		});
+		const definition: McpServerDefinition = { id: 'grpc', label: 'gRPC', cacheNonce: 'nonce', protocolVersionHint: '2025-11-25', launch: launch! };
+		const roundTripped = McpServerDefinition.fromSerialized(JSON.parse(JSON.stringify(McpServerDefinition.toSerialized(definition))));
+		const httpLaunch: McpServerLaunch.Serialized = { type: McpServerTransportType.Grpc, uri: URI.parse('https://example.com/mcp').toJSON(), headers: [] };
+
+		assert.deepStrictEqual({
+			launch,
+			roundTripped: roundTripped.launch,
+			protocolVersionHint: roundTripped.protocolVersionHint,
+			invalidScheme: McpServerLaunch.fromServerConfiguration({ type: McpServerType.GRPC, url: 'https://example.com/mcp' }),
+			grpcScheme: McpServerLaunch.isGrpcScheme('grpc') && McpServerLaunch.isGrpcScheme('grpcs') && !McpServerLaunch.isGrpcScheme('https'),
+		}, {
+			launch: {
+				type: McpServerTransportType.Grpc,
+				uri: URI.parse('grpcs://mcp.example.com:50051'),
+				headers: [['Authorization', 'Bearer token']],
+				tls: { ca: '/certs/ca.pem', serverName: 'mcp.internal' },
+				binding: 'tunnel',
+				deadlineMs: 0,
+				keepAliveMs: 30000,
+				oauth: { clientId: 'client' },
+			},
+			roundTripped: launch,
+			protocolVersionHint: '2025-11-25',
+			invalidScheme: undefined,
+			grpcScheme: true,
+		});
+		assert.throws(() => McpServerLaunch.fromSerialized(httpLaunch), /must start with 'grpc:\/\/' or 'grpcs:\/\/'/);
+	});
+
+	test('McpServerLaunch matches network resources by authority for HTTP and by host name for gRPC', () => {
+		const http: McpServerLaunch = { type: McpServerTransportType.HTTP, uri: URI.parse('https://mcp.example.com:8443/mcp'), headers: [] };
+		const grpc: McpServerLaunch = { type: McpServerTransportType.Grpc, uri: URI.parse('grpcs://user@MCP.example.com:50051'), headers: [] };
+		const ipv6: McpServerLaunch = { type: McpServerTransportType.Grpc, uri: URI.parse('grpc://[::1]:50051'), headers: [] };
+		const stdio: McpServerLaunch = { type: McpServerTransportType.Stdio, command: 'server', args: [], env: {}, envFile: undefined, cwd: undefined, sandbox: undefined };
+
+		assert.deepStrictEqual([
+			McpServerLaunch.isServerNetworkAuthority(http, 'MCP.example.com:8443'),
+			McpServerLaunch.isServerNetworkAuthority(http, 'mcp.example.com'),
+			McpServerLaunch.isServerNetworkAuthority(grpc, 'mcp.example.com'),
+			McpServerLaunch.isServerNetworkAuthority(grpc, 'mcp.example.com:8080'),
+			McpServerLaunch.isServerNetworkAuthority(grpc, 'other.example.com'),
+			McpServerLaunch.isServerNetworkAuthority(grpc, 'mcp.example.com.evil.test'),
+			McpServerLaunch.isServerNetworkAuthority(ipv6, '[::1]:8080'),
+			McpServerLaunch.isServerNetworkAuthority(ipv6, '[::2]'),
+			McpServerLaunch.isServerNetworkAuthority(stdio, 'localhost'),
+		], [true, false, true, true, false, false, true, false, false]);
+	});
+
 	test('McpServerLaunch ignores root grants while combining deny rules without mutating configuration', () => {
 		const root: IMcpSandboxConfiguration = {
 			network: { allowedDomains: ['root-only.test'], deniedDomains: ['blocked.test'] },

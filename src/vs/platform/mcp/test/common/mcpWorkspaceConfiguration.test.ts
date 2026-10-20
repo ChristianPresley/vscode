@@ -72,6 +72,14 @@ suite('McpWorkspaceConfiguration', () => {
 		assert.strictEqual(error, '\'cwd\' is not supported in .mcp.json. Use .vscode/mcp.json.');
 	});
 
+	test('rejects grpc with a message', () => {
+		const error = getWorkspaceRootMcpConfigurationError({
+			name: 'grpc',
+			config: { type: McpServerType.GRPC, url: 'grpcs://localhost:50051' },
+		});
+		assert.strictEqual(error, 'gRPC servers are not supported in .mcp.json. Use .vscode/mcp.json.');
+	});
+
 	test('reads both JSONC shapes and skips invalid entries without changing other configurations', () => {
 		const servers = '"local": { "command": "node" }, "bad": null, "array": [], "unsupported": { "type": "ws" }, "remote": { "url": "https://example.com/mcp" },';
 		assert.deepStrictEqual([

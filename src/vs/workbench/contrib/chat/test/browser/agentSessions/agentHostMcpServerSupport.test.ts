@@ -524,6 +524,36 @@ suite('agentHostMcpServerSupport', () => {
 		]);
 	});
 
+	test('reports grpc servers as not delivered, reachable through the gateway only for Copilot CLI sessions', async () => {
+		const result = await assess([
+			makeMcpServer({
+				id: 'mcp.config.usrlocal.grpc',
+				collectionId: 'mcp.config.usrlocal',
+				provenance: McpCollectionProvenance.UserProfile,
+				launch: {
+					type: McpServerTransportType.Grpc,
+					uri: URI.parse('grpcs://localhost:50051'),
+					headers: [],
+					binding: 'tunnel',
+				},
+			}),
+		], [URI.file('/workspace')]);
+
+		assert.deepStrictEqual({
+			delivery: result.servers[0].delivery,
+			compatibility: result.servers[0].compatibility,
+			copilotCli: getMcpCompatibilityDetail(AgentHostMcpSupportReason.GrpcTransportNotPortable, 'agent-host-copilotcli'),
+			claude: getMcpCompatibilityDetail(AgentHostMcpSupportReason.GrpcTransportNotPortable, 'agent-host-claude'),
+			unknown: getMcpCompatibilityDetail(AgentHostMcpSupportReason.GrpcTransportNotPortable),
+		}, {
+			delivery: AgentHostMcpServerDelivery.NotDelivered,
+			compatibility: { kind: 'unsupported', reasons: [AgentHostMcpSupportReason.GrpcTransportNotPortable] },
+			copilotCli: 'gRPC servers are not forwarded to the Copilot CLI, but this server remains reachable through the MCP gateway.',
+			claude: 'gRPC servers are not supported by this agent.\nTo use this server with the agent, configure it with an HTTP or stdio transport.',
+			unknown: 'gRPC servers are not supported by this agent.\nTo use this server with the agent, configure it with an HTTP or stdio transport.',
+		});
+	});
+
 	test('reports runtime server enablement separately from compatibility', async () => {
 		const result = await assess([
 			makeMcpServer({

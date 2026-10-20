@@ -27,7 +27,7 @@ import { ExtensionIdentifier } from '../../../../platform/extensions/common/exte
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { IMcpGalleryManifest, McpGalleryManifestStatus } from '../../../../platform/mcp/common/mcpGalleryManifest.js';
 import { IGalleryMcpServer, IGalleryMcpServerConfiguration, IInstallableMcpServer, IQueryOptions } from '../../../../platform/mcp/common/mcpManagement.js';
-import { IMcpDevModeConfig, IMcpSandboxConfiguration, IMcpServerConfiguration, McpServerType } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
+import { IMcpDevModeConfig, IMcpGrpcServerTlsConfiguration, IMcpSandboxConfiguration, IMcpServerConfiguration, McpGrpcBinding, McpServerType } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
 import { McpResourceFormat } from '../../../../platform/mcp/common/mcpWorkspaceConfiguration.js';
 import { StorageScope } from '../../../../platform/storage/common/storage.js';
 import { IWorkspaceFolder, IWorkspaceFolderData } from '../../../../platform/workspace/common/workspace.js';
@@ -708,6 +708,8 @@ export const enum McpServerTransportType {
 	Stdio = 1 << 0,
 	/** An MCP server that uses Server-Sent Events */
 	HTTP = 1 << 1,
+	/** An MCP server reached over gRPC (HTTP/2), through the JSON-RPC tunnel or the typed service */
+	Grpc = 1 << 2,
 }
 
 /**
@@ -788,23 +790,96 @@ export interface McpServerTransportHTTP {
 	readonly authentication?: McpServerTransportHTTPAuthentication;
 }
 
+/**
+ * MCP server reached over gRPC on a `grpc://` (plaintext HTTP/2) or `grpcs://`
+ * (TLS) endpoint. The {@link binding} selects the zig-sdk JSON-RPC tunnel
+ * (`/mcp.zig.transport.v1.Mcp/Call`), Google's typed `model_context_protocol.Mcp`
+ * service, or `auto` (tunnel first, typed fallback).
+ */
+export interface McpServerTransportGrpc {
+	readonly type: McpServerTransportType.Grpc;
+	readonly uri: URI;
+	/** Additional metadata sent with every call, restricted to the configured URI's authority. */
+	readonly headers: [string, string][];
+	readonly tls?: IMcpGrpcServerTlsConfiguration;
+	readonly binding?: McpGrpcBinding;
+	/** Per-call deadline in milliseconds; unset means no deadline, including on `tools/call`. */
+	readonly deadlineMs?: number;
+	/** Interval in milliseconds between HTTP/2 keep-alive pings; unset disables them. */
+	readonly keepAliveMs?: number;
+	readonly oauth?: McpServerTransportHTTPOAuth;
+}
+
 export type McpServerLaunch =
 	| McpServerTransportStdio
-	| McpServerTransportHTTP;
+	| McpServerTransportHTTP
+	| McpServerTransportGrpc;
 
 export namespace McpServerLaunch {
 	export type Serialized =
 		| { type: McpServerTransportType.HTTP; transport?: 'sse' | 'streamable-http'; uri: UriComponents; headers: [string, string][]; oauth?: McpServerTransportHTTPOAuth; authentication?: McpServerTransportHTTPAuthentication }
+		| { type: McpServerTransportType.Grpc; uri: UriComponents; headers: [string, string][]; tls?: IMcpGrpcServerTlsConfiguration; binding?: McpGrpcBinding; deadlineMs?: number; keepAliveMs?: number; oauth?: McpServerTransportHTTPOAuth }
 		| { type: McpServerTransportType.Stdio; cwd: string | undefined; command: string; args: readonly string[]; env: Record<string, string | number | null>; envFile: string | undefined; sandbox: IMcpSandboxConfiguration | undefined };
 
 	export function toSerialized(launch: McpServerLaunch): McpServerLaunch.Serialized {
 		return launch;
 	}
 
+	/** Whether a URI scheme is one a gRPC launch accepts: `grpc` (plaintext HTTP/2) or `grpcs` (TLS). */
+	export function isGrpcScheme(scheme: string): boolean {
+		return scheme === 'grpc' || scheme === 'grpcs';
+	}
+
+	/**
+	 * Validates that {@link uri} is a `grpc://` or `grpcs://` endpoint and returns it,
+	 * throwing a user-facing error otherwise.
+	 */
+	export function validateGrpcUri(uri: URI): URI {
+		if (!isGrpcScheme(uri.scheme)) {
+			throw new Error(localize('mcp.grpc.invalidScheme', "The URL of a gRPC MCP server must start with 'grpc://' or 'grpcs://', but was '{0}'.", uri.toString(true)));
+		}
+		return uri;
+	}
+
+	/**
+	 * Whether a network resource (an icon, an `http:` link) at {@link authority} belongs to
+	 * the server of {@link launch}. HTTP servers match by authority (host and port). gRPC
+	 * servers match by host name, since their HTTP/2 port does not serve web resources.
+	 * Stdio servers have no network authority and never match.
+	 */
+	export function isServerNetworkAuthority(launch: McpServerLaunch, authority: string): boolean {
+		switch (launch.type) {
+			case McpServerTransportType.HTTP:
+				return launch.uri.authority.toLowerCase() === authority.toLowerCase();
+			case McpServerTransportType.Grpc:
+				return authorityHostname(launch.uri.authority) === authorityHostname(authority);
+			default:
+				return false;
+		}
+	}
+
+	/** The host name of a URI authority, without user info or port; IPv6 literals keep their brackets. */
+	function authorityHostname(authority: string): string {
+		const host = authority.slice(authority.lastIndexOf('@') + 1);
+		const end = host.startsWith('[') ? host.indexOf(']') + 1 : host.lastIndexOf(':');
+		return (end > 0 ? host.slice(0, end) : host).toLowerCase();
+	}
+
 	export function fromSerialized(launch: McpServerLaunch.Serialized): McpServerLaunch {
 		switch (launch.type) {
 			case McpServerTransportType.HTTP:
 				return { type: launch.type, transport: launch.transport, uri: URI.revive(launch.uri), headers: launch.headers, oauth: launch.oauth, authentication: launch.authentication };
+			case McpServerTransportType.Grpc:
+				return {
+					type: launch.type,
+					uri: validateGrpcUri(URI.revive(launch.uri)),
+					headers: launch.headers,
+					tls: launch.tls,
+					binding: launch.binding,
+					deadlineMs: launch.deadlineMs,
+					keepAliveMs: launch.keepAliveMs,
+					oauth: launch.oauth,
+				};
 			case McpServerTransportType.Stdio:
 				return {
 					type: launch.type,
@@ -830,6 +905,25 @@ export namespace McpServerLaunch {
 				cwd: configuration.cwd,
 				sandbox: mergeSandboxConfiguration(sandbox, configuration.sandbox),
 			};
+		}
+
+		if (configuration.type === McpServerType.GRPC) {
+			// An invalid URL (including a non-gRPC scheme) makes the configuration unusable, which callers
+			// report like any other invalid configuration rather than failing the whole discovery pass.
+			try {
+				return {
+					type: McpServerTransportType.Grpc,
+					uri: validateGrpcUri(URI.parse(configuration.url)),
+					headers: Object.entries(configuration.headers ?? {}),
+					tls: configuration.tls,
+					binding: configuration.binding,
+					deadlineMs: configuration.deadlineMs,
+					keepAliveMs: configuration.keepAliveMs,
+					oauth: configuration.oauth,
+				};
+			} catch {
+				return undefined;
+			}
 		}
 
 		try {
@@ -1056,6 +1150,32 @@ export class MpcResponseError extends Error {
 	}
 }
 
+export type McpClientErrorReason =
+	/** The stdio server answered neither `server/discover` nor `initialize` within the probe timeout. */
+	| 'probe-timeout'
+	/** The server advertises no revision the client speaks. */
+	| 'no-supported-version'
+	/** A result carried an unknown `resultType`. */
+	| 'invalid-result-type'
+	/** The server kept asking for input beyond the round limit. */
+	| 'too-many-rounds'
+	/** The server asked for an input kind the client did not declare. */
+	| 'undeclared-input-request'
+	/** An `input_required` result was malformed. */
+	| 'invalid-input-request'
+	/** The user's elicitation answer does not match the requested schema. */
+	| 'invalid-elicit-content'
+	/** The transport reported that the request can no longer be answered. */
+	| 'request-aborted';
+
+/** A failure of the client protocol engine itself (as opposed to an error the server returned). */
+export class McpClientError extends Error {
+	constructor(public readonly reason: McpClientErrorReason, message: string, public readonly detail?: unknown) {
+		super(message);
+		this.name = 'McpClientError';
+	}
+}
+
 export class McpConnectionFailedError extends Error { }
 
 export class UserInteractionRequiredError extends Error {
@@ -1150,32 +1270,6 @@ export interface IWorkbenchMcpServer {
 	getReadme(token: CancellationToken): Promise<string>;
 	getManifest(token: CancellationToken): Promise<IGalleryMcpServerConfiguration>;
 }
-export type McpClientErrorReason =
-	/** The stdio server answered neither `server/discover` nor `initialize` within the probe timeout. */
-	| 'probe-timeout'
-	/** The server advertises no revision the client speaks. */
-	| 'no-supported-version'
-	/** A result carried an unknown `resultType`. */
-	| 'invalid-result-type'
-	/** The server kept asking for input beyond the round limit. */
-	| 'too-many-rounds'
-	/** The server asked for an input kind the client did not declare. */
-	| 'undeclared-input-request'
-	/** An `input_required` result was malformed. */
-	| 'invalid-input-request'
-	/** The user's elicitation answer does not match the requested schema. */
-	| 'invalid-elicit-content'
-	/** The transport reported that the request can no longer be answered. */
-	| 'request-aborted';
-
-/** A failure of the client protocol engine itself (as opposed to an error the server returned). */
-export class McpClientError extends Error {
-	constructor(public readonly reason: McpClientErrorReason, message: string, public readonly detail?: unknown) {
-		super(message);
-		this.name = 'McpClientError';
-	}
-}
-
 
 export const IMcpWorkbenchService = createDecorator<IMcpWorkbenchService>('IMcpWorkbenchService');
 
@@ -1300,6 +1394,8 @@ export const enum McpCapability {
 	ResourcesListChanged = 1 << 6,
 	Tools = 1 << 7,
 	ToolsListChanged = 1 << 8,
+	/** The server speaks a stateless (2026-07-28 or later) revision. */
+	StatelessProtocol = 1 << 9,
 }
 
 export interface ISamplingOptions {
@@ -1403,8 +1499,6 @@ export interface IFormModeElicitResult extends IDisposable {
 	value: MCPLegacy.ElicitResult;
 }
 
-	/** The server speaks a stateless (2026-07-28 or later) revision. */
-	StatelessProtocol = 1 << 9,
 export type ElicitResult = IUrlModeElicitResult | IFormModeElicitResult;
 
 export const IMcpElicitationService = createDecorator<IMcpElicitationService>('IMcpElicitationService');

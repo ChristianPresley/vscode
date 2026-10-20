@@ -586,6 +586,8 @@ export function serializeMcpLaunch(launch: McpServerDefinition['launch'], server
 			result['env'] = env;
 		}
 		return result;
+	} else if (launch.type === McpServerTransportType.Grpc) {
+		throw new Error(localize('pluginMcpGrpcNotPortable', "MCP server '{0}' cannot be exported because Agent Plugins do not support gRPC servers.", serverLabel));
 	} else {
 		if (launch.headers.length > 0) {
 			throw new Error(localize('pluginMcpHeadersNotPortable', "MCP server '{0}' cannot be exported because portable plugins cannot include HTTP headers.", serverLabel));
@@ -600,7 +602,8 @@ export function serializeMcpLaunch(launch: McpServerDefinition['launch'], server
 
 export function serializeLegacyMcpLaunch(launch: McpServerDefinition['launch'], serverLabel = ''): object {
 	const portableLaunch = serializeMcpLaunch(launch, serverLabel);
-	if (launch.type === McpServerTransportType.Stdio) {
+	if (launch.type !== McpServerTransportType.HTTP) {
+		// Stdio is already portable; gRPC made `serializeMcpLaunch` throw.
 		return portableLaunch;
 	}
 	return {

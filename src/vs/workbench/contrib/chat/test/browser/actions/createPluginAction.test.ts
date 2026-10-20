@@ -17,7 +17,7 @@ import { InMemoryFileSystemProvider } from '../../../../../../platform/files/com
 import { NullLogService } from '../../../../../../platform/log/common/log.js';
 import { PromptsType } from '../../../common/promptSyntax/promptTypes.js';
 import { IPromptPath, PromptsStorage } from '../../../common/promptSyntax/service/promptsService.js';
-import { McpCollectionSortOrder, McpServerTransportType } from '../../../../mcp/common/mcpTypes.js';
+import { McpCollectionSortOrder, McpServerTransportGrpc, McpServerTransportType } from '../../../../mcp/common/mcpTypes.js';
 import {
 	validatePluginName,
 	getResourceLabel,
@@ -326,6 +326,17 @@ suite('CreatePluginAction helpers', () => {
 				envFile: undefined,
 				sandbox: undefined,
 			}, 'server'), /server.*command/);
+		});
+
+		test('rejects grpc with a message', () => {
+			const launch: McpServerTransportGrpc = {
+				type: McpServerTransportType.Grpc,
+				uri: URI.parse('grpcs://localhost:50051'),
+				headers: [],
+				binding: 'tunnel',
+			};
+			assert.throws(() => serializeMcpLaunch(launch, 'server'), /server.*Agent Plugins do not support gRPC servers/);
+			assert.throws(() => serializeLegacyMcpLaunch(launch, 'server'), /server.*gRPC/);
 		});
 
 	});

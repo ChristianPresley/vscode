@@ -30,6 +30,9 @@ export function getWorkspaceRootMcpConfigurationError(server: IInstallableMcpSer
 		return unsupported('configuration');
 	}
 	const type = config.type ?? (typeof config.command === 'string' ? McpServerType.LOCAL : McpServerType.REMOTE);
+	if (type === McpServerType.GRPC) {
+		return localize('unsupportedWorkspaceRootMcpGrpc', "gRPC servers are not supported in .mcp.json. Use .vscode/mcp.json.");
+	}
 	if (type !== McpServerType.LOCAL && type !== McpServerType.REMOTE) {
 		return unsupported('type');
 	}

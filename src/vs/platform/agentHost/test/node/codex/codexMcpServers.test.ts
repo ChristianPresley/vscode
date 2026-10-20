@@ -192,6 +192,25 @@ suite('codexMcpServers', () => {
 			});
 		});
 
+		test('skips grpc servers, which codex cannot reach', () => {
+			assert.deepStrictEqual({
+				servers: codexMcpServersFromConfig({
+					grpc: { type: 'grpc', url: 'grpcs://localhost:50051', binding: 'tunnel' },
+					good: { type: 'http', url: 'https://x/mcp' },
+				}),
+				direct: (() => {
+					try {
+						return toCodexMcpServerJson({ type: McpServerType.GRPC, url: 'grpcs://localhost:50051' });
+					} catch {
+						return 'rejected';
+					}
+				})(),
+			}, {
+				servers: { good: { url: 'https://x/mcp' } },
+				direct: 'rejected',
+			});
+		});
+
 		test('returns empty for undefined / empty config', () => {
 			assert.deepStrictEqual([
 				codexMcpServersFromConfig(undefined),

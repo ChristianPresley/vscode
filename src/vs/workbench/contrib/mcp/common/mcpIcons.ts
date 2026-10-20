@@ -50,14 +50,14 @@ function validateIcon(icon: MCPLegacy.Icon, launch: McpServerLaunch, logger: ILo
 	}
 
 	if (uri.scheme === 'https' || uri.scheme === 'http') {
-		if (launch.type !== McpServerTransportType.HTTP) {
-			logger.debug(`Ignoring icon with HTTP/HTTPS URL: ${icon.src} as the MCP server is not launched with HTTP transport.`);
+		// Remote icons are trusted by host: HTTP servers by authority, gRPC servers by host name.
+		if (launch.type !== McpServerTransportType.HTTP && launch.type !== McpServerTransportType.Grpc) {
+			logger.debug(`Ignoring icon with HTTP/HTTPS URL: ${icon.src} as the MCP server is not launched with a network transport.`);
 			return;
 		}
 
-		const expectedAuthority = launch.uri.authority.toLowerCase();
-		if (uri.authority.toLowerCase() !== expectedAuthority) {
-			logger.debug(`Ignoring icon with untrusted authority: ${icon.src}, expected authority: ${expectedAuthority}`);
+		if (!McpServerLaunch.isServerNetworkAuthority(launch, uri.authority)) {
+			logger.debug(`Ignoring icon with untrusted authority: ${icon.src}, expected authority: ${launch.uri.authority.toLowerCase()}`);
 			return;
 		}
 

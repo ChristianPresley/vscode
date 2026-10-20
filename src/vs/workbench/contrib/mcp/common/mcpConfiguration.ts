@@ -9,6 +9,7 @@ import { Disposable } from '../../../../base/common/lifecycle.js';
 import { localize } from '../../../../nls.js';
 import { IExtensionManifest, IMcpCollectionContribution } from '../../../../platform/extensions/common/extensions.js';
 import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js';
+import { eraForProtocolVersion, SUPPORTED_MCP_PROTOCOL_VERSIONS } from '../../../../platform/mcp/common/mcpProtocolVersions.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
 import { mcpSchemaId } from '../../../services/configuration/common/configuration.js';
 import { inputsSchema } from '../../../services/configurationResolver/common/configurationResolverSchema.js';
@@ -129,6 +130,46 @@ const httpSchemaExamples = {
 	'my-mcp-server': {
 		url: 'http://localhost:3001/mcp',
 		headers: {},
+	}
+};
+
+const grpcSchemaExamples = {
+	'my-grpc-server': {
+		type: 'grpc',
+		url: 'grpcs://localhost:50051',
+		binding: 'auto',
+	}
+};
+
+/**
+ * The `protocolVersion` property shared by every server kind: an optional pin to
+ * one of the revisions VS Code can speak.
+ */
+const mcpProtocolVersionSchema: IJSONSchema = {
+	type: 'string',
+	enum: [...SUPPORTED_MCP_PROTOCOL_VERSIONS],
+	enumDescriptions: SUPPORTED_MCP_PROTOCOL_VERSIONS.map(version => eraForProtocolVersion(version) === 'modern'
+		? localize('app.mcp.json.protocolVersion.modern', "Revision {0}: stateless requests carrying their protocol metadata, `server/discover` and subscription-based notifications.", version)
+		: localize('app.mcp.json.protocolVersion.legacy', "Revision {0}: the `initialize` handshake with a stateful session.", version)),
+	markdownDescription: localize('app.mcp.json.protocolVersion', "Pins the Model Context Protocol revision used to talk to this server. By default, the newest revision both VS Code and the server support is negotiated. A pinned revision the server rejects still falls back to negotiation."),
+};
+
+const mcpOAuthSchema: IJSONSchema = {
+	type: 'object',
+	description: localize('app.mcp.json.oauth', "OAuth configuration for authenticating with the server."),
+	additionalProperties: false,
+	minProperties: 1,
+	properties: {
+		clientId: {
+			type: 'string',
+			minLength: 1,
+			markdownDescription: localize('app.mcp.json.oauth.clientId', "The OAuth client ID to use when authenticating with the server. When `enterpriseManaged` is `true`, this is the **resource** authorization server's client ID (the client trusted by the protected resource), not the IdP's. To set the matching client secret, use the *Set Client Secret* code lens above this field — secrets are stored in the OS secret store, not in this file.")
+		},
+		enterpriseManaged: {
+			type: 'boolean',
+			default: false,
+			markdownDescription: localize('app.mcp.json.oauth.enterpriseManaged', "(Preview) When set to `true`, this MCP server authenticates through the SSO issuer configured by `#mcp.enterpriseManagedAuth.idp#` using OAuth Identity Assertion Authorization Grant (ID-JAG). After a one-time sign-in, subsequent enterprise-managed servers connect silently. The IdP issuer and client credentials are read from the `#mcp.enterpriseManagedAuth.idp#` setting; the `clientId` on this server entry is passed to the resource authorization server.")
+		}
 	}
 };
 
@@ -287,6 +328,7 @@ export const mcpStdioServerSchema: IJSONSchema = {
 				]
 			}
 		},
+		protocolVersion: mcpProtocolVersionSchema,
 		...mcpDevModeProps(true),
 	}
 };
@@ -319,24 +361,79 @@ export const mcpRemoteServerSchema: IJSONSchema = {
 			description: localize('app.mcp.json.headers', "Additional headers sent to the server. These headers are not sent to a different origin, including across redirects."),
 			additionalProperties: { type: 'string' },
 		},
-		oauth: {
+		oauth: mcpOAuthSchema,
+		protocolVersion: mcpProtocolVersionSchema,
+		...mcpDevModeProps(false),
+	}
+};
+
+export const mcpGrpcServerSchema: IJSONSchema = {
+	type: 'object',
+	additionalProperties: false,
+	required: ['type', 'url'],
+	examples: [grpcSchemaExamples['my-grpc-server']],
+	properties: {
+		type: {
+			type: 'string',
+			enum: ['grpc'],
+			description: localize('app.mcp.json.type', "The type of the server.")
+		},
+		url: {
+			type: 'string',
+			format: 'uri',
+			pattern: '^grpcs?:\\/\\/.+',
+			patternErrorMessage: localize('app.mcp.json.grpc.url.pattern', "The URL must start with 'grpc://' or 'grpcs://'."),
+			markdownDescription: localize('app.mcp.json.grpc.url', "The gRPC endpoint of the server: `grpc://host:port` for plaintext HTTP/2 or `grpcs://host:port` for TLS.")
+		},
+		headers: {
 			type: 'object',
-			description: localize('app.mcp.json.oauth', "OAuth configuration for authenticating with the server."),
+			description: localize('app.mcp.json.grpc.headers', "Additional metadata sent with every call. It is not sent to a different authority than the configured URL."),
+			additionalProperties: { type: 'string' },
+		},
+		tls: {
+			type: 'object',
 			additionalProperties: false,
-			minProperties: 1,
+			markdownDescription: localize('app.mcp.json.grpc.tls', "TLS settings for `grpcs://` endpoints."),
 			properties: {
-				clientId: {
+				ca: {
 					type: 'string',
-					minLength: 1,
-					markdownDescription: localize('app.mcp.json.oauth.clientId', "The OAuth client ID to use when authenticating with the server. When `enterpriseManaged` is `true`, this is the **resource** authorization server's client ID (the client trusted by the protected resource), not the IdP's. To set the matching client secret, use the *Set Client Secret* code lens above this field — secrets are stored in the OS secret store, not in this file.")
+					description: localize('app.mcp.json.grpc.tls.ca', "Path to a PEM-encoded certificate authority bundle used to verify the server certificate, in addition to the system roots."),
+					examples: ['${workspaceFolder}/certs/ca.pem'],
 				},
-				enterpriseManaged: {
+				insecure: {
 					type: 'boolean',
 					default: false,
-					markdownDescription: localize('app.mcp.json.oauth.enterpriseManaged', "(Preview) When set to `true`, this MCP server authenticates through the SSO issuer configured by `#mcp.enterpriseManagedAuth.idp#` using OAuth Identity Assertion Authorization Grant (ID-JAG). After a one-time sign-in, subsequent enterprise-managed servers connect silently. The IdP issuer and client credentials are read from the `#mcp.enterpriseManagedAuth.idp#` setting; the `clientId` on this server entry is passed to the resource authorization server.")
-				}
+					description: localize('app.mcp.json.grpc.tls.insecure', "Skips verification of the server certificate. Only use this for local development."),
+				},
+				serverName: {
+					type: 'string',
+					description: localize('app.mcp.json.grpc.tls.serverName', "The host name presented during the TLS handshake (SNI) and checked against the server certificate, when it differs from the host in the URL."),
+				},
 			}
 		},
+		binding: {
+			type: 'string',
+			enum: ['auto', 'tunnel', 'typed'],
+			default: 'auto',
+			enumDescriptions: [
+				localize('app.mcp.json.grpc.binding.auto', "Try the JSON-RPC tunnel first and fall back to the typed service."),
+				localize('app.mcp.json.grpc.binding.tunnel', "Send JSON-RPC messages through the `mcp.zig.transport.v1.Mcp/Call` tunnel."),
+				localize('app.mcp.json.grpc.binding.typed', "Call the typed `model_context_protocol.Mcp` service methods."),
+			],
+			description: localize('app.mcp.json.grpc.binding', "The gRPC service binding the server implements."),
+		},
+		deadlineMs: {
+			type: 'number',
+			minimum: 0,
+			markdownDescription: localize('app.mcp.json.grpc.deadlineMs', "The deadline for each call in milliseconds. When unset there is no timeout, including on `tools/call`, so a tool that never returns keeps its request open until it is cancelled."),
+		},
+		keepAliveMs: {
+			type: 'number',
+			minimum: 0,
+			description: localize('app.mcp.json.grpc.keepAliveMs', "The interval between HTTP/2 keep-alive pings in milliseconds. When unset, no pings are sent."),
+		},
+		oauth: mcpOAuthSchema,
+		protocolVersion: mcpProtocolVersionSchema,
 		...mcpDevModeProps(false),
 	}
 };
@@ -357,10 +454,11 @@ export const mcpServerSchema: IJSONSchema = {
 			examples: [
 				mcpSchemaExampleServers,
 				httpSchemaExamples,
+				grpcSchemaExamples,
 			],
 			additionalProperties: {
 				oneOf: [
-					mcpStdioServerSchema, mcpRemoteServerSchema,
+					mcpStdioServerSchema, mcpRemoteServerSchema, mcpGrpcServerSchema,
 				]
 			}
 		},

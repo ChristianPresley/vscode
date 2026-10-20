@@ -21,7 +21,7 @@ import { ILabelService } from '../../../../platform/label/common/label.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IGalleryMcpServer, IMcpGalleryService, IQueryOptions, IInstallableMcpServer, IGalleryMcpServerConfiguration, mcpAccessConfig, McpAccessValue, IAllowedMcpServersService, IMcpGalleryServerResolveResult, McpGalleryResolveStatus, replaceMcpServerVariableReferences } from '../../../../platform/mcp/common/mcpManagement.js';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
-import { IMcpDevModeConfig, IMcpRemoteServerConfiguration, IMcpServerConfiguration, IMcpServerVariable, IMcpStdioServerConfiguration, McpServerType } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
+import { IMcpDevModeConfig, IMcpGrpcServerConfiguration, IMcpGrpcServerTlsConfiguration, IMcpRemoteServerConfiguration, IMcpServerConfiguration, IMcpServerVariable, IMcpStdioServerConfiguration, McpServerType } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
 import { StorageScope } from '../../../../platform/storage/common/storage.js';
 import { IUriIdentityService } from '../../../../platform/uriIdentity/common/uriIdentity.js';
@@ -32,6 +32,7 @@ import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { MCP_CONFIGURATION_KEY, WORKSPACE_STANDALONE_CONFIGURATIONS } from '../../../services/configuration/common/configuration.js';
 import { IMcpResourceScannerService } from '../../../../platform/mcp/common/mcpResourceScannerService.js';
 import { parseCopilotGlobalMcpConfiguration } from '../../../../platform/mcp/common/mcpCopilotGlobalConfiguration.js';
+import { SUPPORTED_MCP_PROTOCOL_VERSIONS } from '../../../../platform/mcp/common/mcpProtocolVersions.js';
 import { IMcpCopilotGlobalConfigurationService } from '../common/mcpCopilotGlobalConfigurationService.js';
 import { ACTIVE_GROUP, IEditorService, MODAL_GROUP } from '../../../services/editor/common/editorService.js';
 import { IWorkbenchEnvironmentService } from '../../../services/environment/common/environmentService.js';
@@ -90,7 +91,7 @@ function parseMcpInstallUriPayload(query: string): IMcpInstallUriPayload | undef
 }
 
 function sanitizeMcpServerConfiguration(payload: Record<string, unknown>): IMcpServerConfiguration | undefined {
-	const type = payload.type === McpServerType.LOCAL || payload.type === McpServerType.REMOTE
+	const type = payload.type === McpServerType.LOCAL || payload.type === McpServerType.REMOTE || payload.type === McpServerType.GRPC
 		? payload.type
 		: isString(payload.command)
 			? McpServerType.LOCAL
@@ -101,6 +102,7 @@ function sanitizeMcpServerConfiguration(payload: Record<string, unknown>): IMcpS
 		...(isString(payload.version) ? { version: payload.version } : {}),
 		...(isBoolean(payload.gallery) || isString(payload.gallery) ? { gallery: payload.gallery } : {}),
 		...(dev ? { dev } : {}),
+		...(isString(payload.protocolVersion) && SUPPORTED_MCP_PROTOCOL_VERSIONS.includes(payload.protocolVersion) ? { protocolVersion: payload.protocolVersion } : {}),
 	};
 
 	if (type === McpServerType.LOCAL) {
@@ -127,6 +129,21 @@ function sanitizeMcpServerConfiguration(payload: Record<string, unknown>): IMcpS
 	const headers = sanitizeStringRecord(payload.headers);
 	const oauth = sanitizeMcpOAuthConfiguration(payload.oauth);
 
+	if (type === McpServerType.GRPC) {
+		const tls = sanitizeMcpGrpcTlsConfiguration(payload.tls);
+		return {
+			type,
+			url: payload.url,
+			...common,
+			...(headers ? { headers } : {}),
+			...(tls ? { tls } : {}),
+			...(payload.binding === 'auto' || payload.binding === 'tunnel' || payload.binding === 'typed' ? { binding: payload.binding } : {}),
+			...(isNumber(payload.deadlineMs) && payload.deadlineMs >= 0 ? { deadlineMs: payload.deadlineMs } : {}),
+			...(isNumber(payload.keepAliveMs) && payload.keepAliveMs >= 0 ? { keepAliveMs: payload.keepAliveMs } : {}),
+			...(oauth ? { oauth } : {}),
+		} satisfies IMcpGrpcServerConfiguration;
+	}
+
 	return {
 		type,
 		url: payload.url,
@@ -135,6 +152,20 @@ function sanitizeMcpServerConfiguration(payload: Record<string, unknown>): IMcpS
 		...(headers ? { headers } : {}),
 		...(oauth ? { oauth } : {}),
 	} satisfies IMcpRemoteServerConfiguration;
+}
+
+function sanitizeMcpGrpcTlsConfiguration(value: unknown): IMcpGrpcServerTlsConfiguration | undefined {
+	if (!isObject(value)) {
+		return undefined;
+	}
+
+	const payload = value as Record<string, unknown>;
+	const tls: IMcpGrpcServerTlsConfiguration = {
+		...(isString(payload.ca) ? { ca: payload.ca } : {}),
+		...(isBoolean(payload.insecure) ? { insecure: payload.insecure } : {}),
+		...(isString(payload.serverName) ? { serverName: payload.serverName } : {}),
+	};
+	return Object.keys(tls).length ? tls : undefined;
 }
 
 function sanitizeMcpDevModeConfig(value: unknown): IMcpDevModeConfig | undefined {

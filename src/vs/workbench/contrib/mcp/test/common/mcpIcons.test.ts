@@ -8,7 +8,7 @@ import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { NullLogger } from '../../../../../platform/log/common/log.js';
 import { McpIcons, parseAndValidateMcpIcon } from '../../common/mcpIcons.js';
-import { McpServerTransportHTTP, McpServerTransportStdio, McpServerTransportType } from '../../common/mcpTypes.js';
+import { McpServerTransportGrpc, McpServerTransportHTTP, McpServerTransportStdio, McpServerTransportType } from '../../common/mcpTypes.js';
 
 const createHttpLaunch = (url: string): McpServerTransportHTTP => ({
 	type: McpServerTransportType.HTTP,
@@ -66,6 +66,20 @@ suite('MCP Icons', () => {
 
 			const stdioResult = parseAndValidateMcpIcon(icons, stdioLaunch, logger);
 			assert.strictEqual(stdioResult.length, 0);
+		});
+
+		test('accepts remote icons from the host name of a grpc server', () => {
+			const grpcLaunch: McpServerTransportGrpc = { type: McpServerTransportType.Grpc, uri: URI.parse('grpcs://example.com:50051'), headers: [] };
+			const result = parseAndValidateMcpIcon({
+				icons: [
+					{ src: 'https://example.com/icon.png', mimeType: 'image/png', sizes: ['64x64'] },
+					{ src: 'http://example.com:8080/icon.png', mimeType: 'image/png', sizes: ['64x64'] },
+					{ src: 'https://other.com/icon.png', mimeType: 'image/png', sizes: ['64x64'] },
+					{ src: 'file:///tmp/icon.png', mimeType: 'image/png', sizes: ['32x32'] },
+				]
+			}, grpcLaunch, new NullLogger());
+
+			assert.deepStrictEqual(result.map(icon => icon.src.toString(true)), ['https://example.com/icon.png', 'http://example.com:8080/icon.png']);
 		});
 
 		test('accepts file icons only for stdio transport', () => {

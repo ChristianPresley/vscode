@@ -7,7 +7,7 @@ import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { IMcpServerConfiguration, McpServerType } from '../../../../../platform/mcp/common/mcpPlatformTypes.js';
 import { McpResourceFormat } from '../../../../../platform/mcp/common/mcpWorkspaceConfiguration.js';
-import { formatMcpServerArgs, getMcpServerFormatError, McpServerFormKind, mergeMcpServerFormKeyValues, parseMcpServerArgs, toMcpServerConfiguration, toMcpServerFormState, validateMcpServerFormState } from '../../common/mcpServerConfigurationForm.js';
+import { formatMcpServerArgs, getMcpServerFormatError, getMcpServerFormCapabilities, McpServerFormKind, mergeMcpServerFormKeyValues, parseMcpServerArgs, toMcpServerConfiguration, toMcpServerFormState, validateMcpServerFormState } from '../../common/mcpServerConfigurationForm.js';
 
 suite('MCP Server Configuration Form', () => {
 
@@ -69,6 +69,93 @@ suite('MCP Server Configuration Form', () => {
 			url: 'https://example.com/sse',
 			transport: 'sse',
 			headers: { Authorization: 'Bearer ${input:token}' },
+		});
+	});
+
+	test('grpc servers round trip binding and TLS and keep fields the form does not manage', () => {
+		const original: IMcpServerConfiguration = {
+			type: McpServerType.GRPC,
+			url: 'grpcs://localhost:50051',
+			headers: { Authorization: 'Bearer ${input:token}' },
+			binding: 'tunnel',
+			tls: { ca: '/certs/ca.pem', insecure: true },
+			deadlineMs: 60000,
+			keepAliveMs: 30000,
+			oauth: { clientId: 'client' },
+			protocolVersion: '2026-07-28',
+		};
+		const state = toMcpServerFormState(original);
+		const initial = { ...state };
+		state.binding = undefined;
+		state.tlsCa = '';
+		state.tlsInsecure = false;
+		state.tlsServerName = ' mcp.internal ';
+
+		assert.deepStrictEqual({
+			initial: { kind: initial.kind, url: initial.url, binding: initial.binding, tlsCa: initial.tlsCa, tlsInsecure: initial.tlsInsecure, tlsServerName: initial.tlsServerName },
+			unchanged: toMcpServerConfiguration(toMcpServerFormState(original), original),
+			edited: toMcpServerConfiguration(state, original),
+		}, {
+			initial: { kind: McpServerFormKind.Grpc, url: 'grpcs://localhost:50051', binding: 'tunnel', tlsCa: '/certs/ca.pem', tlsInsecure: true, tlsServerName: '' },
+			unchanged: original,
+			edited: {
+				type: McpServerType.GRPC,
+				url: 'grpcs://localhost:50051',
+				headers: { Authorization: 'Bearer ${input:token}' },
+				tls: { serverName: 'mcp.internal' },
+				deadlineMs: 60000,
+				keepAliveMs: 30000,
+				oauth: { clientId: 'client' },
+				protocolVersion: '2026-07-28',
+			},
+		});
+	});
+
+	test('switching between HTTP and grpc keeps headers, OAuth and the protocol pin', () => {
+		const http: IMcpServerConfiguration = { type: McpServerType.REMOTE, url: 'https://example.com/mcp', headers: { A: '1' }, oauth: { clientId: 'client' }, protocolVersion: '2025-11-25' };
+		const toGrpc = toMcpServerFormState(http);
+		toGrpc.kind = McpServerFormKind.Grpc;
+		toGrpc.url = 'grpc://localhost:50051';
+		toGrpc.binding = 'typed';
+
+		const grpc: IMcpServerConfiguration = { type: McpServerType.GRPC, url: 'grpc://localhost:50051', binding: 'typed', tls: { insecure: true }, oauth: { clientId: 'client' } };
+		const toHttp = toMcpServerFormState(grpc);
+		toHttp.kind = McpServerFormKind.Http;
+		toHttp.url = 'https://example.com/mcp';
+
+		assert.deepStrictEqual({
+			grpc: toMcpServerConfiguration(toGrpc, http),
+			http: toMcpServerConfiguration(toHttp, grpc),
+		}, {
+			grpc: { type: McpServerType.GRPC, url: 'grpc://localhost:50051', headers: { A: '1' }, oauth: { clientId: 'client' }, protocolVersion: '2025-11-25', binding: 'typed' },
+			http: { type: McpServerType.REMOTE, url: 'https://example.com/mcp', oauth: { clientId: 'client' } },
+		});
+	});
+
+	test('validation requires a grpc:// or grpcs:// URL for grpc servers', () => {
+		const validate = (url: string) => validateMcpServerFormState(toMcpServerFormState({ type: McpServerType.GRPC, url })).url !== undefined;
+		assert.deepStrictEqual(
+			['grpc://localhost:50051', 'GRPCS://example.com', '${input:url}', 'https://example.com/mcp', 'grpc:/missing', ''].map(validate),
+			[false, false, false, true, true, true],
+		);
+	});
+
+	test('grpc is only offered, and its options only stored, by the VS Code format', () => {
+		const grpc: IMcpServerConfiguration = { type: McpServerType.GRPC, url: 'grpc://localhost:50051' };
+		const http: IMcpServerConfiguration = { type: McpServerType.REMOTE, url: 'https://example.com/mcp' };
+		assert.deepStrictEqual({
+			kinds: [McpResourceFormat.Vscode, McpResourceFormat.WorkspaceRoot, McpResourceFormat.CopilotGlobal].map(format => {
+				const capabilities = getMcpServerFormCapabilities(format);
+				return { grpc: capabilities.kinds.includes(McpServerFormKind.Grpc), grpcOptions: capabilities.grpcOptions };
+			}),
+			vscodeError: getMcpServerFormatError('server', http, grpc, McpResourceFormat.Vscode),
+			workspaceRootError: getMcpServerFormatError('server', http, grpc, McpResourceFormat.WorkspaceRoot) !== undefined,
+			copilotGlobalError: getMcpServerFormatError('server', http, grpc, McpResourceFormat.CopilotGlobal) !== undefined,
+		}, {
+			kinds: [{ grpc: true, grpcOptions: true }, { grpc: false, grpcOptions: false }, { grpc: false, grpcOptions: false }],
+			vscodeError: undefined,
+			workspaceRootError: true,
+			copilotGlobalError: true,
 		});
 	});
 

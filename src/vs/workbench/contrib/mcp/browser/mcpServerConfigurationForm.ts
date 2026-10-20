@@ -10,6 +10,7 @@ import { status } from '../../../../base/browser/ui/aria/aria.js';
 import { Button } from '../../../../base/browser/ui/button/button.js';
 import { InputBox, MessageType } from '../../../../base/browser/ui/inputbox/inputBox.js';
 import { Radio } from '../../../../base/browser/ui/radio/radio.js';
+import { Checkbox } from '../../../../base/browser/ui/toggle/toggle.js';
 import { Action } from '../../../../base/common/actions.js';
 import { Codicon } from '../../../../base/common/codicons.js';
 import { getErrorMessage } from '../../../../base/common/errors.js';
@@ -24,13 +25,13 @@ import { IContextViewService } from '../../../../platform/contextview/browser/co
 import { IKeybindingService } from '../../../../platform/keybinding/common/keybinding.js';
 import { IMcpServerConfiguration } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
-import { defaultButtonStyles, getInputBoxStyle } from '../../../../platform/theme/browser/defaultStyles.js';
+import { defaultButtonStyles, defaultCheckboxStyles, getInputBoxStyle } from '../../../../platform/theme/browser/defaultStyles.js';
 import { AccessibilityVerbositySettingId } from '../../accessibility/browser/accessibilityConfiguration.js';
 import { AccessibilityCommandId } from '../../accessibility/common/accessibilityCommands.js';
 import { settingsTextInputBorder } from '../../preferences/common/settingsEditorColorRegistry.js';
 import { McpResourceFormat } from '../../../../platform/mcp/common/mcpWorkspaceConfiguration.js';
 import { IEditableMcpServerConfiguration } from '../common/mcpTypes.js';
-import { getMcpServerFormatError, getMcpServerFormCapabilities, IMcpServerFormCapabilities, IMcpServerFormKeyValue, IMcpServerFormState, IMcpServerFormValidation, isMcpServerFormValid, McpServerFormKind, mergeMcpServerFormKeyValues, toMcpServerConfiguration, toMcpServerFormState, validateMcpServerFormState } from '../common/mcpServerConfigurationForm.js';
+import { getMcpServerFormatError, getMcpServerFormCapabilities, IMcpServerFormCapabilities, IMcpServerFormKeyValue, IMcpServerFormState, IMcpServerFormValidation, isMcpServerFormValid, McpServerFormKind, mcpServerFormGrpcBindings, mergeMcpServerFormKeyValues, toMcpServerConfiguration, toMcpServerFormState, validateMcpServerFormState } from '../common/mcpServerConfigurationForm.js';
 
 const $ = DOM.$;
 
@@ -255,7 +256,8 @@ class KeyValueList extends Disposable {
 
 /**
  * Form for editing the configuration of an installed MCP server: its type,
- * launch command or URL, environment variables and headers. Saving writes the
+ * launch command or URL, environment variables and headers, and for gRPC
+ * servers the service binding and TLS settings. Saving writes the
  * configuration back to the file the server was loaded from.
  */
 export class McpServerConfigurationForm extends Disposable {
@@ -273,6 +275,7 @@ export class McpServerConfigurationForm extends Disposable {
 	private readonly formatErrorEl: HTMLElement;
 	private readonly stdioSection: HTMLElement;
 	private readonly remoteSection: HTMLElement;
+	private readonly grpcSection: HTMLElement;
 	private readonly commandInput: InputBox;
 	private readonly argsInput: InputBox;
 	private readonly envList: KeyValueList;
@@ -280,6 +283,10 @@ export class McpServerConfigurationForm extends Disposable {
 	private readonly cwdInput: InputBox;
 	private readonly urlInput: InputBox;
 	private readonly headersList: KeyValueList;
+	private readonly bindingRadio: Radio;
+	private readonly tlsCaInput: InputBox;
+	private readonly tlsServerNameInput: InputBox;
+	private readonly tlsInsecureCheckbox: Checkbox;
 	private readonly discardButton: Button;
 	private readonly saveButton: Button;
 
@@ -382,7 +389,7 @@ export class McpServerConfigurationForm extends Disposable {
 			value => this.state && (this.state.cwd = value),
 		);
 
-		// Remote (HTTP / SSE) fields
+		// Remote (HTTP / SSE / gRPC) fields
 		this.remoteSection = DOM.append(this.element, $('.mcp-config-form-section'));
 		this.urlInput = this.appendInput(
 			this.appendField(this.remoteSection, localize('mcpForm.url', "URL")),
@@ -390,6 +397,54 @@ export class McpServerConfigurationForm extends Disposable {
 			() => this.validation.url,
 			value => this.state && (this.state.url = value),
 		);
+
+		// gRPC-only fields, shown between the URL and the headers
+		this.grpcSection = DOM.append(this.remoteSection, $('.mcp-config-form-section'));
+		const bindingField = this.appendField(this.grpcSection, localize('mcpForm.grpc.binding', "Binding"), true);
+		this.bindingRadio = this._register(new Radio({
+			className: 'segmented',
+			ariaLabel: localize('mcpForm.grpc.binding.aria', "gRPC service binding"),
+			// Labels are the `binding` values written to the file, so they are not localized.
+			items: [
+				{ text: 'auto', tooltip: localize('mcpForm.grpc.binding.auto.tooltip', "Try the JSON-RPC tunnel first and fall back to the typed service") },
+				{ text: 'tunnel', tooltip: localize('mcpForm.grpc.binding.tunnel.tooltip', "Send JSON-RPC messages through the mcp.zig.transport.v1.Mcp/Call tunnel") },
+				{ text: 'typed', tooltip: localize('mcpForm.grpc.binding.typed.tooltip', "Call the typed model_context_protocol.Mcp service methods") },
+			],
+		}));
+		bindingField.appendChild(this.bindingRadio.domNode);
+		this.appendHint(bindingField, localize('mcpForm.grpc.binding.hint', "Which gRPC service the server implements. Leave on auto unless the server only implements one of them."));
+		this._register(this.bindingRadio.onDidSelect(index => {
+			if (this.state) {
+				const binding = mcpServerFormGrpcBindings[index];
+				// Selecting the default writes nothing to the file unless the file already spells it out.
+				this.state.binding = binding === 'auto' && this.initialState?.binding !== 'auto' ? undefined : binding;
+				this.onDidChangeState();
+			}
+		}));
+
+		this.tlsCaInput = this.appendInput(
+			this.appendField(this.grpcSection, localize('mcpForm.grpc.tlsCa', "TLS Certificate Authority"), true),
+			{ placeholder: '${workspaceFolder}/certs/ca.pem', ariaLabel: localize('mcpForm.grpc.tlsCa.aria', "Path to the TLS certificate authority bundle") },
+			() => undefined,
+			value => this.state && (this.state.tlsCa = value),
+		);
+		this.tlsServerNameInput = this.appendInput(
+			this.appendField(this.grpcSection, localize('mcpForm.grpc.tlsServerName', "TLS Server Name"), true),
+			{ placeholder: 'mcp.example.com', ariaLabel: localize('mcpForm.grpc.tlsServerName.aria', "Host name checked against the TLS server certificate") },
+			() => undefined,
+			value => this.state && (this.state.tlsServerName = value),
+		);
+		const tlsInsecureField = this.appendField(this.grpcSection, localize('mcpForm.grpc.tlsInsecure', "TLS Verification"), true);
+		const tlsInsecureRow = DOM.append(tlsInsecureField, $('.mcp-config-form-checkbox'));
+		this.tlsInsecureCheckbox = this._register(new Checkbox(localize('mcpForm.grpc.tlsInsecure.aria', "Skip TLS server certificate verification"), false, defaultCheckboxStyles));
+		tlsInsecureRow.appendChild(this.tlsInsecureCheckbox.domNode);
+		DOM.append(tlsInsecureRow, $('span.mcp-config-form-checkbox-label', undefined, localize('mcpForm.grpc.tlsInsecure.label', "Skip server certificate verification (insecure)")));
+		this._register(this.tlsInsecureCheckbox.onChange(() => {
+			if (this.state) {
+				this.state.tlsInsecure = this.tlsInsecureCheckbox.checked;
+				this.onDidChangeState();
+			}
+		}));
 		const headersField = this.appendField(this.remoteSection, localize('mcpForm.headers', "Headers"), true);
 		this.headersList = this._register(new KeyValueList(headersField, {
 			namePlaceholder: 'Authorization',
@@ -511,6 +566,8 @@ export class McpServerConfigurationForm extends Disposable {
 						return { text: 'http', tooltip: localize('mcpForm.type.http.tooltip', "Connect to a remote server using Streamable HTTP, falling back to SSE") };
 					case McpServerFormKind.Sse:
 						return { text: 'sse', tooltip: localize('mcpForm.type.sse.tooltip', "Connect to a remote server using Server-Sent Events") };
+					case McpServerFormKind.Grpc:
+						return { text: 'grpc', tooltip: localize('mcpForm.type.grpc.tooltip', "Connect to a remote server over gRPC (HTTP/2)") };
 				}
 			}));
 		}
@@ -564,6 +621,10 @@ export class McpServerConfigurationForm extends Disposable {
 		this.envFileInput.value = state.envFile;
 		this.cwdInput.value = state.cwd;
 		this.urlInput.value = state.url;
+		this.bindingRadio.setActiveItem(Math.max(0, mcpServerFormGrpcBindings.indexOf(state.binding ?? 'auto')));
+		this.tlsCaInput.value = state.tlsCa;
+		this.tlsServerNameInput.value = state.tlsServerName;
+		this.tlsInsecureCheckbox.checked = state.tlsInsecure;
 		// Lists edit their rows in place; the state's rows are never shared with the initial state. A
 		// list whose rows are unchanged keeps its DOM, so a refresh does not interrupt typing in a row.
 		if (equals(this.envList.value, state.env)) {
@@ -582,8 +643,12 @@ export class McpServerConfigurationForm extends Disposable {
 
 	private updateSections(): void {
 		const isStdio = this.state?.kind === McpServerFormKind.Stdio;
+		const isGrpc = this.state?.kind === McpServerFormKind.Grpc;
 		this.stdioSection.style.display = isStdio ? '' : 'none';
 		this.remoteSection.style.display = isStdio ? 'none' : '';
+		// Binding and TLS are only stored by VS Code's own mcp.json; other files never hold a gRPC server.
+		this.grpcSection.style.display = isGrpc && this.capabilities.grpcOptions ? '' : 'none';
+		this.urlInput.setPlaceHolder(isGrpc ? 'grpcs://localhost:50051' : 'https://example.com/mcp');
 		this._onDidChangeContent.fire();
 	}
 
@@ -641,6 +706,10 @@ export class McpServerConfigurationForm extends Disposable {
 			env: mergeMcpServerFormKeyValues(initialState.env, state.env, next.env),
 			url: equals(state.url, initialState.url) ? next.url : state.url,
 			headers: mergeMcpServerFormKeyValues(initialState.headers, state.headers, next.headers),
+			binding: equals(state.binding, initialState.binding) ? next.binding : state.binding,
+			tlsCa: equals(state.tlsCa, initialState.tlsCa) ? next.tlsCa : state.tlsCa,
+			tlsInsecure: equals(state.tlsInsecure, initialState.tlsInsecure) ? next.tlsInsecure : state.tlsInsecure,
+			tlsServerName: equals(state.tlsServerName, initialState.tlsServerName) ? next.tlsServerName : state.tlsServerName,
 		};
 		this.baseline = config;
 		this.initialState = toMcpServerFormState(config);

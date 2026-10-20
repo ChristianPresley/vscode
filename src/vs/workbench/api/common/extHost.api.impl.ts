@@ -2341,6 +2341,8 @@ export function createApiFactoryAndRegisterActors(accessor: ServicesAccessor): I
 			ChatInputNotificationSeverity: extHostTypes.ChatInputNotificationSeverity,
 			McpHttpServerDefinition: extHostTypes.McpHttpServerDefinition,
 			McpHttpServerDefinition2: extHostTypes.McpHttpServerDefinition,
+			McpGrpcServerDefinition: extHostTypes.McpGrpcServerDefinition,
+			McpGrpcBinding: extHostTypes.McpGrpcBinding,
 			McpStdioServerDefinition: extHostTypes.McpStdioServerDefinition,
 			McpStdioServerDefinition2: extHostTypes.McpStdioServerDefinition,
 			McpToolAvailability: extHostTypes.McpToolAvailability,

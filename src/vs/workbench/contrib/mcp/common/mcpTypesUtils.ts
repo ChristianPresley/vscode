@@ -10,7 +10,7 @@ import { DisposableStore } from '../../../../base/common/lifecycle.js';
 import { autorun, autorunSelfDisposable, IReader } from '../../../../base/common/observable.js';
 import { ILogger } from '../../../../platform/log/common/log.js';
 import { ToolDataSource } from '../../chat/common/tools/languageModelToolsService.js';
-import { IMcpServer, IMcpServerStartOpts, IMcpService, McpConnectionState, McpServerCacheState, McpServerTransportType } from './mcpTypes.js';
+import { IMcpServer, IMcpServerStartOpts, IMcpService, McpConnectionState, McpServerCacheState, McpServerLaunch } from './mcpTypes.js';
 import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
 
@@ -110,8 +110,9 @@ export function mcpServerToSourceData(server: IMcpServer, reader?: IReader): Too
 export function canLoadMcpNetworkResourceDirectly(resource: URL, server: IMcpServer | undefined) {
 	let isResourceRequestValid = false;
 	if (resource.protocol === 'http:') {
+		// Plain HTTP is allowed only from the server's own host: by authority for HTTP servers, by host name for gRPC ones.
 		const launch = server?.connection.get()?.launchDefinition;
-		if (launch && launch.type === McpServerTransportType.HTTP && launch.uri.authority.toLowerCase() === resource.host.toLowerCase()) {
+		if (launch && McpServerLaunch.isServerNetworkAuthority(launch, resource.host)) {
 			isResourceRequestValid = true;
 		}
 	} else if (resource.protocol === 'https:') {

@@ -22,6 +22,9 @@ export function getCopilotGlobalMcpConfigurationError({ config, inputs }: IInsta
 	if (inputs !== undefined && (!Array.isArray(inputs) || inputs.length > 0)) {
 		return localize('unsupportedCopilotGlobalMcpInputs', "Interactive inputs are not supported in Copilot Global MCP configuration. Use environment variable references instead.");
 	}
+	if (isObject(config) && config.type === McpServerType.GRPC) {
+		return localize('unsupportedCopilotGlobalMcpGrpc', "gRPC servers are not supported in Copilot Global MCP configuration. Use a VS Code mcp.json file instead.");
+	}
 	if (!isObject(config) || (config.type !== McpServerType.LOCAL && config.type !== McpServerType.REMOTE)) {
 		return localize('invalidCopilotGlobalMcpServer', "The MCP server configuration is invalid.");
 	}

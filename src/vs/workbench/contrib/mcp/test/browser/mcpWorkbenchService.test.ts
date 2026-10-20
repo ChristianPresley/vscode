@@ -430,6 +430,51 @@ suite('McpWorkbenchService', () => {
 		});
 	});
 
+	test('keeps grpc settings and strips invalid ones from grpc MCP server install URIs', async () => {
+		const { service, openedEditors } = await createFixture([]);
+		const uri = URI.parse(`vscode:mcp/install?${encodeURIComponent(JSON.stringify({
+			name: 'grpc-server',
+			type: McpServerType.GRPC,
+			url: 'grpcs://localhost:50051',
+			headers: { Authorization: 'Bearer token' },
+			tls: { ca: '/certs/ca.pem', insecure: 'yes', serverName: 'mcp.internal', unknown: 1 },
+			binding: 'typed',
+			deadlineMs: -1,
+			keepAliveMs: 30000,
+			protocolVersion: '2026-07-28',
+			transport: 'sse',
+			command: '/bin/sh',
+		}))}`);
+		const invalidBinding = URI.parse(`vscode:mcp/install?${encodeURIComponent(JSON.stringify({
+			name: 'grpc-server-2',
+			type: McpServerType.GRPC,
+			url: 'grpc://localhost:50051',
+			binding: 'json',
+			protocolVersion: '1999-01-01',
+		}))}`);
+
+		const handled = [await service.handleURL(uri), await service.handleURL(invalidBinding)];
+
+		assert.deepStrictEqual({
+			handled,
+			configs: openedEditors.map(editor => editor.mcpServer.config),
+		}, {
+			handled: [true, true],
+			configs: [{
+				type: McpServerType.GRPC,
+				url: 'grpcs://localhost:50051',
+				headers: { Authorization: 'Bearer token' },
+				tls: { ca: '/certs/ca.pem', serverName: 'mcp.internal' },
+				binding: 'typed',
+				keepAliveMs: 30000,
+				protocolVersion: '2026-07-28',
+			}, {
+				type: McpServerType.GRPC,
+				url: 'grpc://localhost:50051',
+			}],
+		});
+	});
+
 	test('enables only manually configured servers found in the registry', async () => {
 		const foundLocal = createLocal('found');
 		const missingLocal = createLocal('missing');
