@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { assert, describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { CHAT_MODEL } from '../../../../platform/configuration/common/configurationService';
 import { JsonSchema } from '../../../../platform/configuration/common/jsonSchema';
 import { OpenAiFunctionTool } from '../../../../platform/networking/common/fetch';
@@ -22,21 +22,222 @@ describe('ToolSchemaNormalizer', () => {
 		}
 	}];
 
-	test('throws an invalid primitive types', () => {
-		assert.throws(() => normalizeToolSchema(CHAT_MODEL.GPT41, makeTool({
-			foo: {
-				type: 'text',
-				description: 'foo',
-			}
-		})), Error, /do not match JSON schema/);
+	/** A named tool whose parameters are given in full, so tests can set `$schema`, `$defs` and other root keywords. */
+	const namedTool = (name: string, parameters: object): OpenAiFunctionTool => ({
+		type: 'function',
+		function: { name, description: 'test', parameters },
 	});
 
-	test('fails on array without item specs', () => {
-		assert.throws(() => normalizeToolSchema(CHAT_MODEL.GPT41, makeTool({
+	/** Runs the normalizer and collects what it fixed and dropped. */
+	const normalize = (family: string, tools: OpenAiFunctionTool[]) => {
+		const fixes: string[] = [];
+		const drops: [tool: string, reason: string][] = [];
+		const result = normalizeToolSchema(family, tools, (_tool, rule) => fixes.push(rule), (tool, reason) => drops.push([tool, reason]));
+		return { result, fixes, drops, names: result?.map(t => t.function.name) };
+	};
+
+	test('drops a tool with invalid primitive types and keeps the rest', () => {
+		const { names, drops } = normalize(CHAT_MODEL.GPT41, [
+			namedTool('first', { type: 'object', properties: { foo: { type: 'string' } } }),
+			namedTool('broken', { type: 'object', properties: { foo: { type: 'text', description: 'foo' } } }),
+			namedTool('last', { type: 'object', properties: { bar: { type: 'number' } } }),
+		]);
+
+		expect(names).toEqual(['first', 'last']);
+		expect(drops).toHaveLength(1);
+		expect(drops[0][0]).toBe('broken');
+		expect(drops[0][1]).toMatch(/do not match JSON schema/);
+	});
+
+	test('returns undefined when every tool is dropped', () => {
+		const { result, drops } = normalize(CHAT_MODEL.GPT41, [
+			namedTool('broken', { type: 'object', properties: { foo: { type: 'text' } } }),
+		]);
+
+		expect(result).toBeUndefined();
+		expect(drops.map(([tool]) => tool)).toEqual(['broken']);
+	});
+
+	test('defaults array items to any when they are missing', () => {
+		const { result, fixes, drops } = normalize(CHAT_MODEL.GPT41, makeTool({
 			foo: {
 				type: 'array',
 			}
-		})), Error, /array type must have items/);
+		}));
+
+		expect(drops).toEqual([]);
+		expect((result![0].function.parameters as any).properties.foo).toEqual({ type: 'array', items: {} });
+		expect(fixes).toContain('array schema has no items; defaulting to any');
+	});
+
+	test('keeps a 2020-12 schema using $defs, $ref and prefixItems', () => {
+		const parameters = {
+			$schema: 'https://json-schema.org/draft/2020-12/schema',
+			type: 'object',
+			properties: {
+				point: { $ref: '#/$defs/point' },
+				pair: { type: 'array', prefixItems: [{ type: 'string' }, { type: 'number' }], items: false },
+			},
+			$defs: {
+				point: { type: 'object', properties: { x: { type: 'number' } }, required: ['x'] },
+			},
+		};
+		const { result, fixes, drops } = normalize(CHAT_MODEL.CLAUDE_SONNET, [
+			namedTool('modern', parameters),
+			namedTool('modernWithHash', { ...parameters, $schema: 'https://json-schema.org/draft/2020-12/schema#' }),
+		]);
+
+		expect(drops).toEqual([]);
+		expect(fixes).toEqual([]);
+		expect(result).toHaveLength(2);
+		expect(result![0].function.parameters).toEqual(parameters);
+	});
+
+	test('validates schemas that declare draft-07 against the draft-07 meta schema', () => {
+		const { names, fixes, drops } = normalize(CHAT_MODEL.GPT41, [
+			namedTool('tuple', {
+				$schema: 'http://json-schema.org/draft-07/schema#',
+				type: 'object',
+				properties: { pair: { type: 'array', items: [{ type: 'string' }, { type: 'number' }] } },
+			}),
+			namedTool('invalid', {
+				$schema: 'http://json-schema.org/draft-07/schema#',
+				type: 'object',
+				properties: { foo: { type: 'text' } },
+			}),
+		]);
+
+		expect(names).toEqual(['tuple']);
+		expect(drops).toEqual([['invalid', expect.stringMatching(/do not match JSON schema \(draft-07\)/)]]);
+		// The dialect was declared, so no 2020-12 attempt was reported.
+		expect(fixes).not.toContainEqual(expect.stringMatching(/draft-07/));
+	});
+
+	test('falls back to draft-07 for undeclared schemas that are only valid draft-07', () => {
+		const { result, fixes, drops } = normalize(CHAT_MODEL.GPT41, makeTool({
+			pair: { type: 'array', items: [{ type: 'string' }, { type: 'number' }] },
+		}));
+
+		expect(drops).toEqual([]);
+		expect(result).toHaveLength(1);
+		expect(fixes).toContainEqual(expect.stringMatching(/not valid JSON Schema 2020-12 \([\s\S]*\) but is valid draft-07/));
+	});
+
+	test('drops tools that declare an unsupported JSON Schema dialect', () => {
+		const { names, drops } = normalize(CHAT_MODEL.GPT41, [
+			namedTool('old', { $schema: 'https://json-schema.org/draft/2019-09/schema', type: 'object', properties: {} }),
+			namedTool('fine', { type: 'object', properties: {} }),
+		]);
+
+		expect(names).toEqual(['fine']);
+		expect(drops).toEqual([['old', 'unsupported JSON Schema dialect https://json-schema.org/draft/2019-09/schema']]);
+	});
+
+	test('drops tools with a remote $ref without fetching it', () => {
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('network access is not allowed in this test'));
+		try {
+			const { names, drops } = normalize(CHAT_MODEL.GPT41, [
+				namedTool('remote', {
+					$schema: 'https://json-schema.org/draft/2020-12/schema',
+					type: 'object',
+					properties: { thing: { $ref: 'https://example.com/schemas/thing.json' } },
+				}),
+				namedTool('remoteDraft07', {
+					$schema: 'http://json-schema.org/draft-07/schema#',
+					type: 'object',
+					properties: { thing: { $ref: 'thing.json#/definitions/thing' } },
+				}),
+				namedTool('local', {
+					type: 'object',
+					properties: { thing: { $ref: '#/$defs/thing' } },
+					$defs: { thing: { type: 'string' } },
+				}),
+			]);
+
+			expect(names).toEqual(['local']);
+			expect(drops).toEqual([
+				['remote', expect.stringContaining(`remote $ref 'https://example.com/schemas/thing.json'`)],
+				['remoteDraft07', expect.stringContaining(`remote $ref 'thing.json#/definitions/thing'`)],
+			]);
+			expect(fetchSpy).not.toHaveBeenCalled();
+		} finally {
+			fetchSpy.mockRestore();
+		}
+	});
+
+	test('applies GPT-4 rules to sub-schemas under 2020-12 keywords', () => {
+		const { result, fixes, drops } = normalize(CHAT_MODEL.GPT41, [namedTool('nested', {
+			type: 'object',
+			properties: {
+				pair: { type: 'array', prefixItems: [{ type: 'string', pattern: '^a' }] },
+				point: { $ref: '#/$defs/point' },
+			},
+			$defs: {
+				point: {
+					type: 'object',
+					description: 'p'.repeat(2000),
+					properties: { x: { type: 'number', minimum: 0 } },
+					required: ['x', 'missing'],
+				},
+			},
+			dependentSchemas: {
+				pair: { properties: { label: { type: 'string', maxLength: 3 } } },
+			},
+		})]);
+
+		expect(drops).toEqual([]);
+		expect(result![0].function.parameters).toEqual({
+			type: 'object',
+			properties: {
+				pair: { type: 'array', prefixItems: [{ type: 'string' }], items: {} },
+				point: { $ref: '#/$defs/point' },
+			},
+			$defs: {
+				point: {
+					type: 'object',
+					description: 'p'.repeat(1024),
+					properties: { x: { type: 'number' } },
+					required: ['x'],
+				},
+			},
+			dependentSchemas: {
+				pair: { properties: { label: { type: 'string' } } },
+			},
+		});
+		expect(fixes).toEqual(expect.arrayContaining([
+			`object has unsupported schema keyword 'pattern'`,
+			`object has unsupported schema keyword 'minimum'`,
+			`object has unsupported schema keyword 'maxLength'`,
+			'object description is too long (truncated to 1024 chars)',
+			`object has required property 'missing' that is not defined`,
+		]));
+	});
+
+	test('applies Gemini and required-property rules under unevaluated and propertyNames keywords', () => {
+		const { result, drops } = normalize(CHAT_MODEL.GEMINI_FLASH, [namedTool('nested', {
+			type: 'object',
+			properties: {},
+			propertyNames: { type: ['string', 'null'] },
+			unevaluatedProperties: {
+				type: 'object',
+				properties: { a: { type: ['number', 'null'] } },
+				required: ['a', 'missing'],
+			},
+			unevaluatedItems: { type: ['boolean', 'null'] },
+		})]);
+
+		expect(drops).toEqual([]);
+		expect(result![0].function.parameters).toEqual({
+			type: 'object',
+			properties: {},
+			propertyNames: { type: 'string', nullable: true },
+			unevaluatedProperties: {
+				type: 'object',
+				properties: { a: { type: 'number', nullable: true } },
+				required: ['a'],
+			},
+			unevaluatedItems: { type: 'boolean', nullable: true },
+		});
 	});
 
 	test('trims extra properties', () => {

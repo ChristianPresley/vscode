@@ -467,6 +467,9 @@ function getNormalizedTodoToolsSchema(endpoint: IChatEndpoint, logger: ILogger) 
 		schema,
 		(tool, rule) => {
 			logger.warn(`[BackgroundTodo] Tool ${tool} failed validation: ${rule}`);
+		},
+		(tool, reason) => {
+			logger.warn(`[BackgroundTodo] Tool ${tool} was dropped: ${reason}`);
 		}
 	);
 }

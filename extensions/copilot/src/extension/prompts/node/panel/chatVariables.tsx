@@ -533,7 +533,8 @@ export class ChatToolReferences extends PromptElement<ChatToolCallProps, void> {
 							}
 						}
 					],
-					(tool, rule) => this.logService.warn(`Tool ${tool} failed validation: ${rule}`)
+					(tool, rule) => this.logService.warn(`Tool ${tool} failed validation: ${rule}`),
+					(tool, reason) => this.logService.warn(`Tool ${tool} was dropped: ${reason}`)
 				),
 				tool_choice: {
 					type: 'function',
