@@ -4,11 +4,35 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { Emitter, Event } from '../../../base/common/event.js';
-import { Disposable, DisposableMap, DisposableStore } from '../../../base/common/lifecycle.js';
-import { IPCServer, IServerChannel } from '../../../base/parts/ipc/common/ipc.js';
-import { ILoggerService } from '../../log/common/log.js';
-import { IMcpGatewayServerDescriptor, IMcpGatewayServerInfo, IMcpGatewayService, McpGatewayToolBrokerChannelName } from '../common/mcpGateway.js';
+import { Disposable, DisposableMap, DisposableStore, toDisposable } from '../../../base/common/lifecycle.js';
+import { generateUuid } from '../../../base/common/uuid.js';
+import { IChannel, IPCServer, IServerChannel } from '../../../base/parts/ipc/common/ipc.js';
+import { ILogger, ILoggerService } from '../../log/common/log.js';
+import { IMcpGatewayInfo, IMcpGatewayInvokeContext, IMcpGatewayServerCapabilities, IMcpGatewayServerDescriptor, IMcpGatewayServerInfo, IMcpGatewayService, IMcpGatewayToolInvoker, McpGatewayToolBrokerChannelName } from '../common/mcpGateway.js';
+import { MCP } from '../common/modelContextProtocol.js';
 import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
+
+/** `onToolProgress` from the workbench's tool broker channel (see `McpGatewayToolBrokerChannel`). */
+interface IBrokerToolProgressEvent {
+	readonly callId: string;
+	readonly progress: number;
+	readonly total?: number;
+	readonly message?: string;
+}
+
+/** `onToolLog` from the workbench's tool broker channel. */
+interface IBrokerToolLogEvent {
+	readonly callId: string;
+	readonly level: MCP.LoggingLevel;
+	readonly data: unknown;
+	readonly logger?: string;
+}
+
+/** `onDidUpdateResource` from the workbench's tool broker channel. */
+interface IBrokerResourceUpdateEvent {
+	readonly serverId: string;
+	readonly uri: string;
+}
 
 /**
  * IPC channel for the MCP Gateway service, used by the remote server.
@@ -61,25 +85,18 @@ export class McpGatewayChannel<TContext> extends Disposable implements IServerCh
 				const brokerChannel = ipcChannelForContext(this._ipcServer, ctx);
 
 				// Fetch initial server list before creating the gateway (IPC is async, but the invoker interface is sync)
-				let currentServers = await brokerChannel.call<readonly IMcpGatewayServerDescriptor[]>('listServers');
-				const onDidChangeServersListener = brokerChannel.listen<readonly IMcpGatewayServerDescriptor[]>('onDidChangeServers');
+				const currentServers = await brokerChannel.call<readonly IMcpGatewayServerDescriptor[]>('listServers');
 
-				const result = await this.mcpGatewayService.createGateway(ctx, {
-					onDidChangeServers: Event.map(onDidChangeServersListener, servers => {
-						currentServers = servers;
-						return servers;
-					}),
-					onDidChangeTools: brokerChannel.listen<void>('onDidChangeTools'),
-					onDidChangeResources: brokerChannel.listen<void>('onDidChangeResources'),
-					listServers: () => currentServers,
-					listToolsForServer: serverId => brokerChannel.call<readonly MCPLegacy.Tool[]>('listToolsForServer', { serverId }),
-					callToolForServer: (serverId, name, callArgs) => brokerChannel.call<MCPLegacy.CallToolResult>('callToolForServer', { serverId, name, args: callArgs, chatSessionResource }),
-					listResourcesForServer: serverId => brokerChannel.call<readonly MCPLegacy.Resource[]>('listResourcesForServer', { serverId }),
-					readResourceForServer: (serverId, uri) => brokerChannel.call<MCPLegacy.ReadResourceResult>('readResourceForServer', { serverId, uri }),
-					listResourceTemplatesForServer: serverId => brokerChannel.call<readonly MCPLegacy.ResourceTemplate[]>('listResourceTemplatesForServer', { serverId }),
-				});
-				// Forward server change events via IPC
 				const gatewayStore = new DisposableStore();
+				let result: IMcpGatewayInfo;
+				try {
+					const invoker = this._createInvoker(ctx, brokerChannel, currentServers, chatSessionResource, gatewayStore, logger);
+					result = await this.mcpGatewayService.createGateway(ctx, invoker);
+				} catch (error) {
+					gatewayStore.dispose();
+					throw error;
+				}
+				// Forward server change events via IPC
 				gatewayStore.add(result.onDidChangeServers(servers => {
 					this._onDidChangeGatewayServers.fire({ gatewayId: result.gatewayId, servers });
 				}));
@@ -118,8 +135,76 @@ export class McpGatewayChannel<TContext> extends Disposable implements IServerCh
 
 		throw new Error(`Invalid call: ${command}`);
 	}
+
+	/**
+	 * Builds the gateway's invoker on top of the client's tool broker channel.
+	 * Progress and log notifications of tool calls arrive as broker events
+	 * keyed by a call id this side generates; the listeners live in
+	 * `gatewayStore` and route them to the in-flight call's context. They are
+	 * per gateway rather than per call because every `listen` on a routed
+	 * `IPCServer` channel keeps an emitter for the server's lifetime.
+	 */
+	private _createInvoker(ctx: TContext, brokerChannel: IChannel, initialServers: readonly IMcpGatewayServerDescriptor[], gatewayChatSessionResource: string | undefined, gatewayStore: DisposableStore, logger: ILogger | undefined): IMcpGatewayToolInvoker {
+		let currentServers = initialServers;
+		const inFlightCalls = new Map<string, IMcpGatewayInvokeContext>();
+		gatewayStore.add(brokerChannel.listen<IBrokerToolProgressEvent>('onToolProgress')(e => {
+			inFlightCalls.get(e.callId)?.onProgress?.({ progress: e.progress, total: e.total, message: e.message });
+		}));
+		gatewayStore.add(brokerChannel.listen<IBrokerToolLogEvent>('onToolLog')(e => {
+			inFlightCalls.get(e.callId)?.onLog?.(e.level, e.data, e.logger);
+		}));
+
+		const chatSessionResourceFor = (context: IMcpGatewayInvokeContext | undefined) => context?.chatSessionResource ?? gatewayChatSessionResource;
+		const isClientConnected = () => this._ipcServer.connections.some(c => c.ctx === ctx);
+
+		return {
+			onDidChangeServers: Event.map(brokerChannel.listen<readonly IMcpGatewayServerDescriptor[]>('onDidChangeServers'), servers => {
+				currentServers = servers;
+				return servers;
+			}),
+			onDidChangeTools: brokerChannel.listen<void>('onDidChangeTools'),
+			onDidChangeResources: brokerChannel.listen<void>('onDidChangeResources'),
+			onDidChangePrompts: brokerChannel.listen<void>('onDidChangePrompts'),
+			onDidUpdateResource: brokerChannel.listen<IBrokerResourceUpdateEvent>('onDidUpdateResource'),
+			listServers: () => currentServers,
+			getServerCapabilities: serverId => brokerChannel.call<IMcpGatewayServerCapabilities | undefined>('getServerCapabilities', { serverId }),
+			listToolsForServer: serverId => brokerChannel.call<readonly MCPLegacy.Tool[]>('listToolsForServer', { serverId }),
+			callToolForServer: async (serverId, name, callArgs, context) => {
+				// Without a call id the broker does not observe the call's notifications at all.
+				const callId = context?.onProgress || context?.onLog ? generateUuid() : undefined;
+				if (callId !== undefined && context) {
+					inFlightCalls.set(callId, context);
+				}
+				try {
+					return await brokerChannel.call<MCPLegacy.CallToolResult>('callToolForServer', { serverId, name, args: callArgs, chatSessionResource: chatSessionResourceFor(context), callId }, context?.token);
+				} finally {
+					if (callId !== undefined) {
+						inFlightCalls.delete(callId);
+					}
+				}
+			},
+			listResourcesForServer: serverId => brokerChannel.call<readonly MCPLegacy.Resource[]>('listResourcesForServer', { serverId }),
+			readResourceForServer: (serverId, uri, context) => brokerChannel.call<MCPLegacy.ReadResourceResult>('readResourceForServer', { serverId, uri }, context?.token),
+			listResourceTemplatesForServer: serverId => brokerChannel.call<readonly MCPLegacy.ResourceTemplate[]>('listResourceTemplatesForServer', { serverId }),
+			listPromptsForServer: serverId => brokerChannel.call<readonly MCPLegacy.Prompt[]>('listPromptsForServer', { serverId }),
+			getPromptForServer: (serverId, name, promptArgs, context) => brokerChannel.call<MCPLegacy.GetPromptResult>('getPromptForServer', { serverId, name, args: promptArgs, chatSessionResource: chatSessionResourceFor(context) }, context?.token),
+			completeForServer: (serverId, params) => brokerChannel.call<MCPLegacy.CompleteResult>('completeForServer', { serverId, params }),
+			subscribeResourceForServer: async (serverId, uri) => {
+				const subscriptionId = await brokerChannel.call<string>('subscribeResourceForServer', { serverId, uri });
+				return toDisposable(() => {
+					// A disconnected client's broker closed its subscriptions itself; a call would wait for a client that never comes.
+					if (!isClientConnected()) {
+						return;
+					}
+					brokerChannel.call<void>('unsubscribeResourceForServer', { subscriptionId }).catch(error => {
+						logger?.warn(`[McpGateway][Channel] Failed to unsubscribe resource '${uri}' on server '${serverId}' for client ${ctx}`, error);
+					});
+				});
+			},
+		};
+	}
 }
 
-function ipcChannelForContext<TContext>(ipcServer: IPCServer<TContext>, ctx: TContext) {
+function ipcChannelForContext<TContext>(ipcServer: IPCServer<TContext>, ctx: TContext): IChannel {
 	return ipcServer.getChannel(McpGatewayToolBrokerChannelName, client => client.ctx === ctx);
 }

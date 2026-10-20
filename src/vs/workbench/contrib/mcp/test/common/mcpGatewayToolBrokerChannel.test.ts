@@ -4,21 +4,28 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { CancellationToken } from '../../../../../base/common/cancellation.js';
+import { CancellationToken, CancellationTokenSource } from '../../../../../base/common/cancellation.js';
+import { CancellationError, isCancellationError } from '../../../../../base/common/errors.js';
+import { Emitter, Event } from '../../../../../base/common/event.js';
+import { Disposable, IDisposable, toDisposable } from '../../../../../base/common/lifecycle.js';
 import { observableValue } from '../../../../../base/common/observable.js';
 import { URI } from '../../../../../base/common/uri.js';
+import { generateUuid } from '../../../../../base/common/uuid.js';
 import { runWithFakedTimers } from '../../../../../base/test/common/timeTravelScheduler.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { ContributionEnablementState } from '../../../chat/common/enablement.js';
 import { NullLogService } from '../../../../../platform/log/common/log.js';
-import { IMcpGatewayServerDescriptor } from '../../../../../platform/mcp/common/mcpGateway.js';
+import { IMcpGatewayServerCapabilities, IMcpGatewayServerDescriptor } from '../../../../../platform/mcp/common/mcpGateway.js';
+import { MCP } from '../../../../../platform/mcp/common/modelContextProtocol.js';
+import { ToolProgress } from '../../../chat/common/tools/languageModelToolsService.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
-import { McpGatewayToolBrokerChannel } from '../../common/mcpGatewayToolBrokerChannel.js';
-import { IMcpIcons, IMcpServer, IMcpTool, IMcpToolCallContext, McpConnectionState, McpServerCacheState, McpToolVisibility } from '../../common/mcpTypes.js';
+import { IMcpGatewayResourceUpdateEvent, IMcpGatewayToolLogEvent, IMcpGatewayToolProgressEvent, McpGatewayToolBrokerChannel } from '../../common/mcpGatewayToolBrokerChannel.js';
+import { McpServerRequestHandler } from '../../common/mcpServerRequestHandler.js';
+import { IMcpIcons, IMcpServer, IMcpServerConnection, IMcpTool, IMcpToolCallContext, McpCapability, McpConnectionState, McpServerCacheState, McpServerDefinition, McpServerTransportType, McpToolVisibility } from '../../common/mcpTypes.js';
 import { TestMcpService } from './testMcpService.js';
 
 suite('McpGatewayToolBrokerChannel', () => {
-	ensureNoDisposablesAreLeakedInTestSuite();
+	const ds = ensureNoDisposablesAreLeakedInTestSuite();
 
 	test('lists model-visible tools for a specific server', async () => {
 		const mcpService = new TestMcpService();
@@ -352,24 +359,598 @@ suite('McpGatewayToolBrokerChannel', () => {
 		disposable.dispose();
 		channel.dispose();
 	});
+
+	test('cancels the tool call when the IPC token is cancelled', async () => {
+		const mcpService = new TestMcpService();
+		const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+		let observedToken: CancellationToken | undefined;
+		const server = createServer('collectionA', 'serverA', [
+			createTool('hang', (_args, token) => new Promise<MCPLegacy.CallToolResult>((_resolve, reject) => {
+				observedToken = token;
+				ds.add(token.onCancellationRequested(() => reject(new CancellationError())));
+			})),
+		]);
+		mcpService.servers.set([server], undefined);
+
+		const cts = ds.add(new CancellationTokenSource());
+		const call = channel.call<MCPLegacy.CallToolResult>(undefined, 'callToolForServer', { serverId: 'serverA', name: 'hang', args: {} }, cts.token);
+		assert.strictEqual(observedToken, cts.token);
+
+		cts.cancel();
+		await assert.rejects(call, err => isCancellationError(err));
+	});
+
+	test('rejects calls for unknown servers and tools', async () => {
+		const mcpService = new TestMcpService();
+		const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+		const handler = ds.add(new StubRequestHandler());
+		mcpService.servers.set([createServer('collectionA', 'serverA', [], McpServerCacheState.Live, { handler })], undefined);
+
+		await assert.rejects(channel.call(undefined, 'callToolForServer', { serverId: 'nope', name: 'x', args: {} }), /Unknown server: nope/);
+		await assert.rejects(channel.call(undefined, 'callToolForServer', { serverId: 'serverA', name: 'x', args: {} }), /Unknown tool 'x' on server 'serverA'/);
+		await assert.rejects(channel.call(undefined, 'getPromptForServer', { serverId: 'nope', name: 'p' }), /Unknown server: nope/);
+		await assert.rejects(channel.call(undefined, 'completeForServer', { serverId: 'nope', params: completeParams }), /Unknown server: nope/);
+		await assert.rejects(channel.call(undefined, 'subscribeResourceForServer', { serverId: 'nope', uri: 'file:///a' }), /Unknown server: nope/);
+		await assert.rejects(channel.call(undefined, 'noSuchCommand'), /Invalid call: noSuchCommand/);
+		assert.throws(() => channel.listen(undefined, 'noSuchEvent'), /Invalid listen: noSuchEvent/);
+	});
+
+	suite('capabilities', () => {
+		test('maps the capability bits to the gateway capabilities', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+			const full = createServer('collectionA', 'serverA', [], McpServerCacheState.Live, {
+				capabilities: McpCapability.Tools | McpCapability.ToolsListChanged | McpCapability.Prompts | McpCapability.Resources | McpCapability.ResourcesSubscribe | McpCapability.Completions,
+			});
+			const minimal = createServer('collectionB', 'serverB', [], McpServerCacheState.Live, {
+				capabilities: McpCapability.Logging | McpCapability.PromptsListChanged,
+			});
+			mcpService.servers.set([full, minimal], undefined);
+
+			const fullCapabilities = await channel.call<IMcpGatewayServerCapabilities | undefined>(undefined, 'getServerCapabilities', { serverId: 'serverA' });
+			assert.deepStrictEqual(fullCapabilities, {
+				completions: true,
+				logging: false,
+				tools: { listChanged: true },
+				prompts: { listChanged: false },
+				resources: { subscribe: true, listChanged: false },
+			});
+
+			// The listChanged bit alone does not advertise prompts.
+			const minimalCapabilities = await channel.call<IMcpGatewayServerCapabilities | undefined>(undefined, 'getServerCapabilities', { serverId: 'serverB' });
+			assert.deepStrictEqual(minimalCapabilities, { completions: false, logging: true });
+
+			const unknownServer = await channel.call<IMcpGatewayServerCapabilities | undefined>(undefined, 'getServerCapabilities', { serverId: 'nope' });
+			assert.strictEqual(unknownServer, undefined);
+		});
+
+		test('starts a server whose capabilities are not cached yet', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+			const server = createServer('collectionA', 'serverA', [], McpServerCacheState.Unknown, {
+				capabilitiesOnStart: McpCapability.Tools | McpCapability.Resources,
+			});
+			mcpService.servers.set([server], undefined);
+
+			const capabilities = await channel.call<IMcpGatewayServerCapabilities | undefined>(undefined, 'getServerCapabilities', { serverId: 'serverA' });
+			assert.strictEqual(server.startCalls, 1);
+			assert.deepStrictEqual(capabilities, {
+				completions: false,
+				logging: false,
+				tools: { listChanged: false },
+				resources: { subscribe: false, listChanged: false },
+			});
+		});
+
+		test('returns undefined when the capabilities stay unknown', () => {
+			return runWithFakedTimers({ useFakeTimers: true }, async () => {
+				const mcpService = new TestMcpService();
+				const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService(), 100));
+
+				const server = createNeverStartingServer('collectionA', 'serverA', []);
+				mcpService.servers.set([server], undefined);
+
+				const capabilities = await channel.call<IMcpGatewayServerCapabilities | undefined>(undefined, 'getServerCapabilities', { serverId: 'serverA' });
+				assert.strictEqual(capabilities, undefined);
+			});
+		});
+	});
+
+	suite('prompts', () => {
+		test('lists prompts from servers that advertise them', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+			const handlerA = ds.add(new StubRequestHandler());
+			handlerA.prompts = [{ name: 'summarize', description: 'Summarizes' }, { name: 'review' }];
+			const handlerB = ds.add(new StubRequestHandler());
+			handlerB.prompts = [{ name: 'hidden' }];
+
+			const withPrompts = createServer('collectionA', 'serverA', [], McpServerCacheState.Live, { handler: handlerA, capabilities: McpCapability.Prompts });
+			const withoutPrompts = createServer('collectionB', 'serverB', [], McpServerCacheState.Live, { handler: handlerB, capabilities: McpCapability.Tools });
+			mcpService.servers.set([withPrompts, withoutPrompts], undefined);
+
+			const promptsA = await channel.call<readonly MCPLegacy.Prompt[]>(undefined, 'listPromptsForServer', { serverId: 'serverA' });
+			assert.deepStrictEqual(promptsA.map(p => p.name), ['summarize', 'review']);
+
+			const promptsB = await channel.call<readonly MCPLegacy.Prompt[]>(undefined, 'listPromptsForServer', { serverId: 'serverB' });
+			assert.deepStrictEqual(promptsB, []);
+			assert.strictEqual(handlerB.calls.length, 0, 'a server without the capability is not asked');
+
+			const unknown = await channel.call<readonly MCPLegacy.Prompt[]>(undefined, 'listPromptsForServer', { serverId: 'nope' });
+			assert.deepStrictEqual(unknown, []);
+		});
+
+		test('returns no prompts when listing fails', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+			const handler = ds.add(new StubRequestHandler());
+			handler.failure = new Error('boom');
+			mcpService.servers.set([createServer('collectionA', 'serverA', [], McpServerCacheState.Live, { handler, capabilities: McpCapability.Prompts })], undefined);
+
+			const prompts = await channel.call<readonly MCPLegacy.Prompt[]>(undefined, 'listPromptsForServer', { serverId: 'serverA' });
+			assert.deepStrictEqual(prompts, []);
+		});
+
+		test('gets a prompt with its arguments and chat session context', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+			const handler = ds.add(new StubRequestHandler());
+			handler.promptResult = { description: 'A prompt', messages: [{ role: 'user', content: { type: 'text', text: 'Summarize {{topic}}' } }] };
+			mcpService.servers.set([createServer('collectionA', 'serverA', [], McpServerCacheState.Live, { handler, capabilities: McpCapability.Prompts })], undefined);
+
+			const sessionUri = 'vscode-chat-session://test/session-1';
+			const cts = ds.add(new CancellationTokenSource());
+			const result = await channel.call<MCPLegacy.GetPromptResult>(undefined, 'getPromptForServer', {
+				serverId: 'serverA',
+				name: 'summarize',
+				args: { topic: 'MCP' },
+				chatSessionResource: sessionUri,
+			}, cts.token);
+
+			assert.deepStrictEqual(result, handler.promptResult);
+			assert.strictEqual(handler.calls.length, 1);
+			const call = handler.calls[0];
+			assert.strictEqual(call.method, 'getPrompt');
+			assert.deepStrictEqual(call.params, { name: 'summarize', arguments: { topic: 'MCP' } });
+			assert.strictEqual(call.token, cts.token);
+			assert.strictEqual(call.context?.chatSessionResource?.toString(), URI.parse(sessionUri).toString());
+
+			// Without a chat session there is no context.
+			await channel.call<MCPLegacy.GetPromptResult>(undefined, 'getPromptForServer', { serverId: 'serverA', name: 'summarize' });
+			assert.deepStrictEqual(handler.calls[1].params, { name: 'summarize', arguments: undefined });
+			assert.strictEqual(handler.calls[1].context, undefined);
+		});
+
+		test('emits onDidChangePrompts when a prompt list changes', () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+			const server = createServer('collectionA', 'serverA', []);
+			mcpService.servers.set([server], undefined);
+
+			let events = 0;
+			ds.add(channel.listen<void>(undefined, 'onDidChangePrompts')(() => events++));
+
+			server.promptsValue.set([], undefined);
+			assert.strictEqual(events, 1);
+		});
+	});
+
+	test('completes through the server', async () => {
+		const mcpService = new TestMcpService();
+		const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+		const handler = ds.add(new StubRequestHandler());
+		handler.completeResult = { completion: { values: ['MCP', 'MCP Apps'], hasMore: false } };
+		mcpService.servers.set([createServer('collectionA', 'serverA', [], McpServerCacheState.Live, { handler, capabilities: McpCapability.Completions })], undefined);
+
+		const cts = ds.add(new CancellationTokenSource());
+		const result = await channel.call<MCPLegacy.CompleteResult>(undefined, 'completeForServer', { serverId: 'serverA', params: completeParams }, cts.token);
+
+		assert.deepStrictEqual(result, handler.completeResult);
+		assert.strictEqual(handler.calls.length, 1);
+		assert.strictEqual(handler.calls[0].method, 'complete');
+		assert.deepStrictEqual(handler.calls[0].params, completeParams);
+		assert.strictEqual(handler.calls[0].token, cts.token);
+	});
+
+	test('readResourceForServer passes the IPC token to the handler', async () => {
+		const mcpService = new TestMcpService();
+		const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+		const handler = ds.add(new StubRequestHandler());
+		mcpService.servers.set([createServer('collectionA', 'serverA', [], McpServerCacheState.Live, { handler, capabilities: McpCapability.Resources })], undefined);
+
+		const cts = ds.add(new CancellationTokenSource());
+		const result = await channel.call<MCPLegacy.ReadResourceResult>(undefined, 'readResourceForServer', { serverId: 'serverA', uri: 'file:///a.txt' }, cts.token);
+
+		assert.deepStrictEqual(result.contents.map(c => c.uri), ['file:///a.txt']);
+		assert.deepStrictEqual(handler.calls[0].params, { uri: 'file:///a.txt' });
+		assert.strictEqual(handler.calls[0].token, cts.token);
+	});
+
+	suite('resource subscriptions', () => {
+		test('keeps the handler subscription until unsubscribed and forwards updates once', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+			const handler = ds.add(new StubRequestHandler());
+			mcpService.servers.set([createServer('collectionA', 'serverA', [], McpServerCacheState.Live, { handler, capabilities: McpCapability.Resources | McpCapability.ResourcesSubscribe })], undefined);
+
+			const updates: IMcpGatewayResourceUpdateEvent[] = [];
+			ds.add(channel.listen<IMcpGatewayResourceUpdateEvent>(undefined, 'onDidUpdateResource')(e => updates.push(e)));
+
+			const first = await channel.call<string>(undefined, 'subscribeResourceForServer', { serverId: 'serverA', uri: 'file:///a' });
+			const second = await channel.call<string>(undefined, 'subscribeResourceForServer', { serverId: 'serverA', uri: 'file:///b' });
+			assert.strictEqual(typeof first, 'string');
+			assert.notStrictEqual(first, second);
+			assert.deepStrictEqual(handler.subscriptions.map(s => s.uri), ['file:///a', 'file:///b']);
+
+			// One notification reaches the client once however many subscriptions the server has.
+			handler.fireResourceUpdated('file:///a');
+			assert.deepStrictEqual(updates, [{ serverId: 'serverA', uri: 'file:///a' }]);
+
+			await channel.call(undefined, 'unsubscribeResourceForServer', { subscriptionId: first });
+			assert.deepStrictEqual(handler.subscriptions.map(s => s.disposed), [true, false]);
+
+			handler.fireResourceUpdated('file:///b');
+			assert.strictEqual(updates.length, 2);
+
+			await channel.call(undefined, 'unsubscribeResourceForServer', { subscriptionId: second });
+			assert.deepStrictEqual(handler.subscriptions.map(s => s.disposed), [true, true]);
+
+			handler.fireResourceUpdated('file:///b');
+			assert.strictEqual(updates.length, 2, 'no forwarding without subscriptions');
+
+			// Unsubscribing twice, or an id that never existed, is a no-op.
+			await channel.call(undefined, 'unsubscribeResourceForServer', { subscriptionId: second });
+			await channel.call(undefined, 'unsubscribeResourceForServer', { subscriptionId: 'nope' });
+		});
+
+		test('tags updates with the server they come from', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+			const handlerA = ds.add(new StubRequestHandler());
+			const handlerB = ds.add(new StubRequestHandler());
+			mcpService.servers.set([
+				createServer('collectionA', 'serverA', [], McpServerCacheState.Live, { handler: handlerA }),
+				createServer('collectionB', 'serverB', [], McpServerCacheState.Live, { handler: handlerB }),
+			], undefined);
+
+			const updates: IMcpGatewayResourceUpdateEvent[] = [];
+			ds.add(channel.listen<IMcpGatewayResourceUpdateEvent>(undefined, 'onDidUpdateResource')(e => updates.push(e)));
+
+			await channel.call<string>(undefined, 'subscribeResourceForServer', { serverId: 'serverA', uri: 'file:///a' });
+			await channel.call<string>(undefined, 'subscribeResourceForServer', { serverId: 'serverB', uri: 'file:///b' });
+
+			handlerB.fireResourceUpdated('file:///b');
+			handlerA.fireResourceUpdated('file:///a');
+			assert.deepStrictEqual(updates, [
+				{ serverId: 'serverB', uri: 'file:///b' },
+				{ serverId: 'serverA', uri: 'file:///a' },
+			]);
+		});
+
+		test('closes open subscriptions when the broker is disposed', async () => {
+			const mcpService = new TestMcpService();
+			const channel = new McpGatewayToolBrokerChannel(mcpService, new NullLogService());
+
+			const handler = ds.add(new StubRequestHandler());
+			mcpService.servers.set([createServer('collectionA', 'serverA', [], McpServerCacheState.Live, { handler })], undefined);
+
+			await channel.call<string>(undefined, 'subscribeResourceForServer', { serverId: 'serverA', uri: 'file:///a' });
+			assert.deepStrictEqual(handler.subscriptions.map(s => s.disposed), [false]);
+
+			channel.dispose();
+			assert.deepStrictEqual(handler.subscriptions.map(s => s.disposed), [true]);
+		});
+
+		test('releases the handler subscription when subscribing fails', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+			const handler = ds.add(new StubRequestHandler());
+			handler.failure = new Error('subscribe failed');
+			mcpService.servers.set([createServer('collectionA', 'serverA', [], McpServerCacheState.Live, { handler })], undefined);
+
+			await assert.rejects(channel.call<string>(undefined, 'subscribeResourceForServer', { serverId: 'serverA', uri: 'file:///a' }), /subscribe failed/);
+		});
+	});
+
+	suite('tool call notifications', () => {
+		test('forwards progress and logs keyed by the call id while the call is in flight', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+			const handler = ds.add(new StubRequestHandler());
+			const server = createServer('collectionA', 'serverA', [
+				createProgressTool('slow', handler, async (_args, progressToken, progress) => {
+					handler.fireProgress({ progressToken, progress: 1, total: 4, message: 'one' });
+					handler.fireProgress({ progressToken: 'another-call', progress: 9, total: 10, message: 'other' });
+					handler.fireLog({ level: 'info', data: { step: 1 }, logger: 'stub' });
+					handler.fireProgress({ progressToken, progress: 2, message: 'two' });
+					// A status message of the call itself, outside of any notification.
+					progress.report({ message: 'Round 1: answered 1 input request(s)' });
+					handler.fireLog({ level: 'warning', data: 'careful' });
+					return { content: [{ type: 'text', text: 'done' }] };
+				}),
+			], McpServerCacheState.Live, { handler });
+			mcpService.servers.set([server], undefined);
+
+			const progressEvents: IMcpGatewayToolProgressEvent[] = [];
+			const logEvents: IMcpGatewayToolLogEvent[] = [];
+			ds.add(channel.listen<IMcpGatewayToolProgressEvent>(undefined, 'onToolProgress')(e => progressEvents.push(e)));
+			ds.add(channel.listen<IMcpGatewayToolLogEvent>(undefined, 'onToolLog')(e => logEvents.push(e)));
+
+			const result = await channel.call<MCPLegacy.CallToolResult>(undefined, 'callToolForServer', { serverId: 'serverA', name: 'slow', args: {}, callId: 'call-1' });
+			assert.strictEqual((result.content[0] as MCPLegacy.TextContent).text, 'done');
+
+			assert.deepStrictEqual(progressEvents, [
+				{ callId: 'call-1', progress: 1, total: 4, message: 'one' },
+				{ callId: 'call-1', progress: 2, total: undefined, message: 'two' },
+				{ callId: 'call-1', progress: 2, message: 'Round 1: answered 1 input request(s)' },
+			]);
+			assert.deepStrictEqual(logEvents, [
+				{ callId: 'call-1', level: 'info', data: { step: 1 }, logger: 'stub' },
+				{ callId: 'call-1', level: 'warning', data: 'careful', logger: undefined },
+			]);
+
+			// Once the call finished, the server's notifications are no longer the call's.
+			handler.fireProgress({ progressToken: 'whatever', progress: 3 });
+			handler.fireLog({ level: 'error', data: 'late' });
+			assert.strictEqual(progressEvents.length, 3);
+			assert.strictEqual(logEvents.length, 2);
+		});
+
+		test('keeps concurrent calls apart', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+			const handler = ds.add(new StubRequestHandler());
+			const gates = new Map<string, { token: string; release: () => void }>();
+			const server = createServer('collectionA', 'serverA', [
+				createProgressTool('gated', handler, (args, progressToken) => new Promise<MCPLegacy.CallToolResult>(resolve => {
+					gates.set(String(args.id), { token: progressToken, release: () => resolve({ content: [{ type: 'text', text: String(args.id) }] }) });
+				})),
+			], McpServerCacheState.Live, { handler });
+			mcpService.servers.set([server], undefined);
+
+			const progressEvents: IMcpGatewayToolProgressEvent[] = [];
+			ds.add(channel.listen<IMcpGatewayToolProgressEvent>(undefined, 'onToolProgress')(e => progressEvents.push(e)));
+
+			const first = channel.call<MCPLegacy.CallToolResult>(undefined, 'callToolForServer', { serverId: 'serverA', name: 'gated', args: { id: 'a' }, callId: 'call-a' });
+			const second = channel.call<MCPLegacy.CallToolResult>(undefined, 'callToolForServer', { serverId: 'serverA', name: 'gated', args: { id: 'b' }, callId: 'call-b' });
+			await Event.toPromise(Event.filter(handler.onDidChangeGates, () => gates.size === 2));
+
+			handler.fireProgress({ progressToken: gates.get('b')!.token, progress: 1, total: 2, message: 'b first' });
+			handler.fireProgress({ progressToken: gates.get('a')!.token, progress: 5, message: 'then a' });
+			assert.deepStrictEqual(progressEvents, [
+				{ callId: 'call-b', progress: 1, total: 2, message: 'b first' },
+				{ callId: 'call-a', progress: 5, total: undefined, message: 'then a' },
+			]);
+
+			gates.get('a')!.release();
+			gates.get('b')!.release();
+			assert.deepStrictEqual((await Promise.all([first, second])).map(r => (r.content[0] as MCPLegacy.TextContent).text), ['a', 'b']);
+		});
+
+		test('does not attribute another call\'s notification to a later status message', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+			const handler = ds.add(new StubRequestHandler());
+			const gates = new Map<string, { token: string; progress: ToolProgress; release: () => void }>();
+			const server = createServer('collectionA', 'serverA', [
+				createProgressTool('gated', handler, (args, progressToken, progress) => new Promise<MCPLegacy.CallToolResult>(resolve => {
+					gates.set(String(args.id), { token: progressToken, progress, release: () => resolve({ content: [] }) });
+				})),
+			], McpServerCacheState.Live, { handler });
+			mcpService.servers.set([server], undefined);
+
+			const progressEvents: IMcpGatewayToolProgressEvent[] = [];
+			ds.add(channel.listen<IMcpGatewayToolProgressEvent>(undefined, 'onToolProgress')(e => progressEvents.push(e)));
+
+			const first = channel.call<MCPLegacy.CallToolResult>(undefined, 'callToolForServer', { serverId: 'serverA', name: 'gated', args: { id: 'a' }, callId: 'call-a' });
+			const second = channel.call<MCPLegacy.CallToolResult>(undefined, 'callToolForServer', { serverId: 'serverA', name: 'gated', args: { id: 'b' }, callId: 'call-b' });
+			await Event.toPromise(Event.filter(handler.onDidChangeGates, () => gates.size === 2));
+
+			// b's notification also reaches a's observer, which must not keep it once the delivery is over.
+			handler.fireProgress({ progressToken: gates.get('b')!.token, progress: 3, message: 'Working' });
+			await Promise.resolve();
+			gates.get('a')!.progress.report({ message: 'Working' });
+
+			assert.deepStrictEqual(progressEvents, [
+				{ callId: 'call-b', progress: 3, total: undefined, message: 'Working' },
+				{ callId: 'call-a', progress: 0, message: 'Working' },
+			]);
+
+			gates.get('a')!.release();
+			gates.get('b')!.release();
+			await Promise.all([first, second]);
+		});
+
+		test('cancels an observed call through the IPC token', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+
+			const handler = ds.add(new StubRequestHandler());
+			const server = createServer('collectionA', 'serverA', [
+				createProgressTool('hang', handler, (_args, _progressToken, _progress, token) => new Promise<MCPLegacy.CallToolResult>((_resolve, reject) => {
+					ds.add(token.onCancellationRequested(() => reject(new CancellationError())));
+				})),
+			], McpServerCacheState.Live, { handler });
+			mcpService.servers.set([server], undefined);
+
+			const cts = ds.add(new CancellationTokenSource());
+			const call = channel.call<MCPLegacy.CallToolResult>(undefined, 'callToolForServer', { serverId: 'serverA', name: 'hang', args: {}, callId: 'call-1' }, cts.token);
+			await Event.toPromise(handler.onDidChangeGates);
+			cts.cancel();
+			await assert.rejects(call, err => isCancellationError(err));
+
+			// The call's listeners are gone.
+			handler.fireLog({ level: 'info', data: 'late' });
+			assert.strictEqual(handler.loggingListeners, 0);
+		});
+	});
 });
+
+const completeParams: MCPLegacy.CompleteRequest['params'] = {
+	ref: { type: 'ref/prompt', name: 'summarize' },
+	argument: { name: 'topic', value: 'M' },
+};
+
+interface IStubHandlerCall {
+	readonly method: string;
+	readonly params: unknown;
+	readonly token: CancellationToken | undefined;
+	readonly context: IMcpToolCallContext | undefined;
+}
+
+/** The parts of `McpServerRequestHandler` the broker talks to, with the server's notifications under test control. */
+class StubRequestHandler extends Disposable {
+	private readonly _onDidReceiveProgressNotification = this._register(new Emitter<MCPLegacy.ProgressNotification>());
+	readonly onDidReceiveProgressNotification = this._onDidReceiveProgressNotification.event;
+	private readonly _onDidReceiveLoggingNotification = this._register(new Emitter<MCP.LoggingMessageNotificationParams>());
+	readonly onDidReceiveLoggingNotification = this._onDidReceiveLoggingNotification.event;
+	private readonly _onDidUpdateResource = this._register(new Emitter<MCP.ResourceUpdatedNotificationParams>());
+	readonly onDidUpdateResource = this._onDidUpdateResource.event;
+	/** Fires whenever a gated tool call of a test reached its gate. */
+	private readonly _onDidChangeGates = this._register(new Emitter<void>());
+	readonly onDidChangeGates = this._onDidChangeGates.event;
+
+	readonly calls: IStubHandlerCall[] = [];
+	readonly subscriptions: { readonly uri: string; disposed: boolean }[] = [];
+	prompts: MCPLegacy.Prompt[] = [];
+	promptResult: MCPLegacy.GetPromptResult = { messages: [] };
+	completeResult: MCPLegacy.CompleteResult = { completion: { values: [] } };
+	/** When set, every request fails with it. */
+	failure: Error | undefined;
+
+	get loggingListeners(): number {
+		return this._onDidReceiveLoggingNotification.hasListeners() ? 1 : 0;
+	}
+
+	asHandler(): McpServerRequestHandler {
+		return this as unknown as McpServerRequestHandler;
+	}
+
+	fireProgress(params: MCPLegacy.ProgressNotificationParams): void {
+		this._onDidReceiveProgressNotification.fire({ jsonrpc: MCPLegacy.JSONRPC_VERSION, method: 'notifications/progress', params });
+	}
+
+	fireLog(params: MCP.LoggingMessageNotificationParams): void {
+		this._onDidReceiveLoggingNotification.fire(params);
+	}
+
+	fireResourceUpdated(uri: string): void {
+		this._onDidUpdateResource.fire({ uri });
+	}
+
+	gateReached(): void {
+		this._onDidChangeGates.fire();
+	}
+
+	listPrompts(): Promise<MCPLegacy.Prompt[]> {
+		return this._record('listPrompts', undefined, undefined, undefined, () => this.prompts);
+	}
+
+	getPrompt(params: MCPLegacy.GetPromptRequest['params'], token?: CancellationToken, context?: IMcpToolCallContext): Promise<MCPLegacy.GetPromptResult> {
+		return this._record('getPrompt', params, token, context, () => this.promptResult);
+	}
+
+	complete(params: MCPLegacy.CompleteRequest['params'], token?: CancellationToken): Promise<MCPLegacy.CompleteResult> {
+		return this._record('complete', params, token, undefined, () => this.completeResult);
+	}
+
+	readResource(params: MCPLegacy.ReadResourceRequest['params'], token?: CancellationToken): Promise<MCPLegacy.ReadResourceResult> {
+		return this._record('readResource', params, token, undefined, () => ({ contents: [{ uri: params.uri, text: 'hello' }] }));
+	}
+
+	listResources(): Promise<MCPLegacy.Resource[]> {
+		return this._record('listResources', undefined, undefined, undefined, () => []);
+	}
+
+	listResourceTemplates(): Promise<MCPLegacy.ResourceTemplate[]> {
+		return this._record('listResourceTemplates', undefined, undefined, undefined, () => []);
+	}
+
+	subscribeResource(uri: string): IDisposable {
+		if (this.failure) {
+			throw this.failure;
+		}
+		const subscription = { uri, disposed: false };
+		this.subscriptions.push(subscription);
+		return toDisposable(() => { subscription.disposed = true; });
+	}
+
+	private _record<T>(method: string, params: unknown, token: CancellationToken | undefined, context: IMcpToolCallContext | undefined, result: () => T): Promise<T> {
+		this.calls.push({ method, params, token, context });
+		return this.failure ? Promise.reject(this.failure) : Promise.resolve(result());
+	}
+}
+
+interface IServerOptions {
+	/** Installs a live connection whose handler is this stub. */
+	readonly handler?: StubRequestHandler;
+	readonly capabilities?: McpCapability;
+	/** Capabilities the server learns when it starts. */
+	readonly capabilitiesOnStart?: McpCapability;
+}
+
+type TestServer = IMcpServer & {
+	readonly toolsValue: ReturnType<typeof observableValue<readonly IMcpTool[]>>;
+	readonly promptsValue: ReturnType<typeof observableValue<readonly never[]>>;
+	readonly startCalls: number;
+};
+
+function createDefinition(definitionId: string): McpServerDefinition {
+	return {
+		id: definitionId,
+		label: definitionId,
+		cacheNonce: 'nonce',
+		launch: { type: McpServerTransportType.Stdio, cwd: undefined, command: 'stub', args: [], env: {}, envFile: undefined, sandbox: undefined },
+	};
+}
+
+function createConnection(owner: object, definition: McpServerDefinition, handler: StubRequestHandler): IMcpServerConnection {
+	return {
+		definition,
+		state: observableValue(owner, { state: McpConnectionState.Kind.Running }),
+		handler: observableValue(owner, handler.asHandler()),
+		onPotentialSandboxBlock: Event.None,
+		launchDefinition: definition.launch,
+		start: async () => ({ state: McpConnectionState.Kind.Running }),
+		stop: async () => { },
+		dispose: () => { },
+	};
+}
 
 function createServer(
 	collectionId: string,
 	definitionId: string,
 	initialTools: readonly IMcpTool[],
 	initialCacheState: McpServerCacheState = McpServerCacheState.Live,
-): IMcpServer & { toolsValue: ReturnType<typeof observableValue<readonly IMcpTool[]>>; startCalls: number } {
+	options: IServerOptions = {},
+): TestServer {
 	const owner = {};
+	const definition = createDefinition(definitionId);
 	const tools = observableValue<readonly IMcpTool[]>(owner, initialTools);
+	const prompts = observableValue<readonly never[]>(owner, []);
 	const connectionState = observableValue<McpConnectionState>(owner, { state: McpConnectionState.Kind.Running });
 	const cacheState = observableValue<McpServerCacheState>(owner, initialCacheState);
+	const capabilities = observableValue<McpCapability | undefined>(owner, options.capabilities);
 	let startCalls = 0;
 
 	return {
 		collection: { id: collectionId, label: collectionId, order: 0 },
 		definition: { id: definitionId, label: definitionId },
-		connection: observableValue(owner, undefined),
+		connection: observableValue(owner, options.handler ? createConnection(owner, definition, options.handler) : undefined),
 		connectionState,
 		enablement: observableValue(owner, ContributionEnablementState.EnabledProfile),
 		serverMetadata: observableValue(owner, undefined),
@@ -378,17 +959,21 @@ function createServer(
 		start: async () => {
 			startCalls++;
 			cacheState.set(McpServerCacheState.Live, undefined);
+			if (options.capabilitiesOnStart !== undefined) {
+				capabilities.set(options.capabilitiesOnStart, undefined);
+			}
 			return { state: McpConnectionState.Kind.Running };
 		},
 		stop: async () => { },
 		cacheState,
 		tools,
-		prompts: observableValue(owner, []),
-		capabilities: observableValue(owner, undefined),
+		prompts,
+		capabilities,
 		resources: () => (async function* () { })(),
 		resourceTemplates: async () => [],
 		dispose: () => { },
 		toolsValue: tools,
+		promptsValue: prompts,
 		get startCalls() { return startCalls; },
 	};
 }
@@ -439,23 +1024,30 @@ function createNeverStartingServer(
 	return result;
 }
 
+function createToolDefinition(name: string): MCPLegacy.Tool {
+	return {
+		name,
+		description: `Tool ${name}`,
+		inputSchema: {
+			type: 'object',
+			properties: {
+				input: { type: 'string' },
+			},
+		},
+	};
+}
+
 function createToolWithContextCapture(
 	name: string,
 	receivedContexts: (IMcpToolCallContext | undefined)[],
 	call: (params: Record<string, unknown>) => Promise<MCPLegacy.CallToolResult>,
 	visibility: McpToolVisibility = McpToolVisibility.Model,
 ): IMcpTool {
-	const definition: MCPLegacy.Tool = {
-		name,
-		description: `Tool ${name}`,
-		inputSchema: { type: 'object', properties: { input: { type: 'string' } } },
-	};
-
 	return {
 		id: `tool_${name}`,
 		referenceName: name,
 		icons: {} as IMcpIcons,
-		definition,
+		definition: createToolDefinition(name),
 		visibility,
 		uiResourceUri: undefined,
 		call: (params: Record<string, unknown>, context, _token) => {
@@ -469,26 +1061,56 @@ function createToolWithContextCapture(
 	};
 }
 
-function createTool(name: string, call: (params: Record<string, unknown>) => Promise<MCPLegacy.CallToolResult>, visibility: McpToolVisibility = McpToolVisibility.Model): IMcpTool {
-	const definition: MCPLegacy.Tool = {
-		name,
-		description: `Tool ${name}`,
-		inputSchema: {
-			type: 'object',
-			properties: {
-				input: { type: 'string' },
-			},
-		},
-	};
-
+function createTool(name: string, call: (params: Record<string, unknown>, token: CancellationToken) => Promise<MCPLegacy.CallToolResult>, visibility: McpToolVisibility = McpToolVisibility.Model): IMcpTool {
 	return {
 		id: `tool_${name}`,
 		referenceName: name,
 		icons: {} as IMcpIcons,
-		definition,
+		definition: createToolDefinition(name),
 		visibility,
 		uiResourceUri: undefined,
-		call: (params: Record<string, unknown>, _context, _token) => call(params),
-		callWithProgress: (params: Record<string, unknown>, _progress, _context, _token = CancellationToken.None) => call(params),
+		call: (params: Record<string, unknown>, _context, token = CancellationToken.None) => call(params, token),
+		callWithProgress: (params: Record<string, unknown>, _progress, _context, token = CancellationToken.None) => call(params, token),
+	};
+}
+
+/**
+ * A tool that behaves like `McpTool` with regard to progress: it reports the
+ * server's progress notifications carrying the token of its own request.
+ * The implementation gets that token so it can fire notifications as the
+ * server would, and signals the stub's gate when it starts.
+ */
+function createProgressTool(
+	name: string,
+	handler: StubRequestHandler,
+	call: (params: Record<string, unknown>, progressToken: string, progress: ToolProgress, token: CancellationToken) => Promise<MCPLegacy.CallToolResult>,
+): IMcpTool {
+	const noProgress: ToolProgress = { report: () => { } };
+	return {
+		id: `tool_${name}`,
+		referenceName: name,
+		icons: {} as IMcpIcons,
+		definition: createToolDefinition(name),
+		visibility: McpToolVisibility.Model,
+		uiResourceUri: undefined,
+		call: (params: Record<string, unknown>, _context, token = CancellationToken.None) => call(params, generateUuid(), noProgress, token),
+		callWithProgress: async (params: Record<string, unknown>, progress, _context, token = CancellationToken.None) => {
+			const progressToken = generateUuid();
+			const listener = handler.onDidReceiveProgressNotification(e => {
+				if (e.params.progressToken === progressToken) {
+					progress.report({
+						message: e.params.message,
+						progress: e.params.total !== undefined && e.params.progress !== undefined ? e.params.progress / e.params.total : undefined,
+					});
+				}
+			});
+			try {
+				const result = call(params, progressToken, progress, token);
+				handler.gateReached();
+				return await result;
+			} finally {
+				listener.dispose();
+			}
+		},
 	};
 }
