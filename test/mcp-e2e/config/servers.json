@@ -1,0 +1,605 @@
+{
+	"$comment": "The MCP servers of the end-to-end run. runner/prepare-profile.ts writes the 'mcp' entries into the user-level mcp.json, runner/start-servers.ts starts the 'process' entries inside the test container (a 'command' with its 'port'; in front of it, or of 'upstreamPort' for an entry without a command: runner/grpc-log-proxy.ts for 'grpcLogProxy', runner/http-fault-proxy.ts for 'httpProxy', runner/oauth-fixture.ts for 'oauthFixture'), and the suite reads the expectations. {zig} and {everything} are replaced with the zig-sdk conformance server and the server-everything entry point, {tlsCa} with the CA certificate runner/test-ca.ts generates at run time. 'expectConnectError' marks a negative entry (VS Code must fail to connect; 'sharesProcessOf' names the entry whose process and logs it uses), 'ownTest' an entry that only its own test starts, 'suite': 'ui' one that only the UI suite starts (its sign-in needs a dialog answered), 'provider' one that the E2E extension defines through the API instead of mcp.json.",
+	"servers": [
+		{
+			"label": "zig-stdio",
+			"transport": "stdio",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"mcp": {
+				"type": "stdio",
+				"command": "{zig}",
+				"args": [
+					"--stdio"
+				]
+			}
+		},
+		{
+			"label": "zig-http",
+			"transport": "http",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3000/mcp"
+			},
+			"process": {
+				"$comment": "runner/http-fault-proxy.ts on 3000 (no faults) records every request VS Code sends to this server (HTTP method and the MCP headers) in servers/zig-http.http.jsonl and applies the HTTP mutations of runner/mutations.ts; the zig-sdk server listens on 3010.",
+				"command": "{zig}",
+				"args": [
+					"--port",
+					"3010"
+				],
+				"port": 3010,
+				"httpProxy": {
+					"port": 3000
+				}
+			}
+		},
+		{
+			"label": "zig-grpc-tunnel",
+			"transport": "grpc-tunnel",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"mcp": {
+				"type": "grpc",
+				"url": "grpc://127.0.0.1:50051",
+				"binding": "tunnel"
+			},
+			"process": {
+				"command": "{zig}",
+				"args": [
+					"--port",
+					"3101",
+					"--grpc-port",
+					"50051"
+				],
+				"port": 50051
+			}
+		},
+		{
+			"label": "zig-grpc-typed",
+			"transport": "grpc-typed",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"mcp": {
+				"type": "grpc",
+				"url": "grpc://127.0.0.1:50052",
+				"binding": "typed"
+			},
+			"process": {
+				"$comment": "VS Code connects to runner/grpc-log-proxy.ts on 50052, which forwards to the server on 50062 and records every call in servers/zig-grpc-typed.wire.jsonl (the server logs no requests).",
+				"command": "{zig}",
+				"args": [
+					"--port",
+					"3102",
+					"--grpc-port",
+					"50062",
+					"--grpc-typed"
+				],
+				"port": 50062,
+				"grpcLogProxy": {
+					"port": 50052
+				}
+			}
+		},
+		{
+			"label": "everything-legacy",
+			"transport": "stdio",
+			"era": "legacy",
+			"protocolVersion": "2025-11-25",
+			"family": "everything",
+			"mcp": {
+				"type": "stdio",
+				"command": "node",
+				"args": [
+					"{everything}",
+					"stdio"
+				]
+			}
+		},
+		{
+			"label": "everything-pinned",
+			"transport": "http",
+			"era": "legacy",
+			"protocolVersion": "2025-11-25",
+			"family": "everything",
+			"pinned": true,
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3300/mcp",
+				"protocolVersion": "2025-11-25"
+			},
+			"process": {
+				"command": "node",
+				"args": [
+					"{everything}",
+					"streamableHttp"
+				],
+				"env": {
+					"PORT": "3300"
+				},
+				"port": 3300
+			}
+		},
+		{
+			"label": "everything-unpinned",
+			"transport": "http",
+			"era": "legacy",
+			"protocolVersion": "2025-11-25",
+			"family": "everything",
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3301/mcp"
+			},
+			"process": {
+				"$comment": "No protocolVersion: VS Code probes with server/discover over HTTP, the 2025-11-25 server refuses it (400 without a session), and VS Code falls back to initialize.",
+				"command": "node",
+				"args": [
+					"{everything}",
+					"streamableHttp"
+				],
+				"env": {
+					"PORT": "3301"
+				},
+				"port": 3301
+			}
+		},
+		{
+			"label": "everything-sse",
+			"transport": "sse",
+			"era": "legacy",
+			"protocolVersion": "2025-11-25",
+			"family": "everything",
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3302/sse"
+			},
+			"process": {
+				"$comment": "The legacy HTTP+SSE transport of server-everything: the Streamable HTTP probe fails, VS Code falls back to the SSE GET.",
+				"command": "node",
+				"args": [
+					"{everything}",
+					"sse"
+				],
+				"env": {
+					"PORT": "3302"
+				},
+				"port": 3302
+			}
+		},
+		{
+			"label": "zig-http-faults",
+			"transport": "http",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3111/mcp"
+			},
+			"process": {
+				"$comment": "runner/http-fault-proxy.ts on 3111 in front of the zig-http server (3010) injects the 2026-07-28 error paths for named tools: -32021 (test_audio_content), an unknown resultType (test_embedded_resource), an outputSchema mismatch (test_simple_text) and match (greet), -32022 naming the revision in use (test_image_content), and tools/list split by an empty-string nextCursor.",
+				"upstreamPort": 3010,
+				"httpProxy": {
+					"port": 3111,
+					"faults": [
+						"missing-capability:test_audio_content",
+						"result-type:test_embedded_resource=bogus",
+						"output-schema-mismatch:test_simple_text",
+						"output-schema-match:greet",
+						"version-same:test_image_content",
+						"empty-cursor"
+					]
+				}
+			}
+		},
+		{
+			"label": "zig-http-renegotiate",
+			"transport": "http",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"ownTest": true,
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3113/mcp"
+			},
+			"process": {
+				"$comment": "runner/http-fault-proxy.ts on 3113: the first tools/call of greet gets -32022 offering only 2025-11-25, then the proxy serves the 2025-11-25 handshake itself and bridges the retried call to the zig-http server (3010). Started by its own test: the switch to 2025-11-25 lasts for the rest of the connection.",
+				"upstreamPort": 3010,
+				"httpProxy": {
+					"port": 3113,
+					"faults": [
+						"version-legacy:greet"
+					]
+				}
+			}
+		},
+		{
+			"label": "zig-http-pin-legacy",
+			"transport": "http",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"ownTest": true,
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3010/mcp",
+				"protocolVersion": "2025-11-25"
+			},
+			"$comment": "The zig-http server (2026-07-28 only) pinned to 2025-11-25 in mcp.json. The protocolVersion setting documents that a pinned revision the server rejects still falls back to negotiation; its own test asserts that (initialize first, then server/discover and 2026-07-28)."
+		},
+		{
+			"label": "zig-http-gw",
+			"transport": "http",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3109/mcp"
+			},
+			"process": {
+				"$comment": "The server of the gateway listen-stream test (its tool list is toggled there).",
+				"command": "{zig}",
+				"args": [
+					"--port",
+					"3109"
+				],
+				"port": 3109
+			}
+		},
+		{
+			"label": "zig-grpc-auto-typed",
+			"transport": "grpc-auto-typed",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"expectConnectError": "tunnel-unimplemented",
+			"mcp": {
+				"type": "grpc",
+				"url": "grpc://127.0.0.1:50053",
+				"binding": "auto"
+			},
+			"process": {
+				"$comment": "runner/grpc-log-proxy.ts on 50053 answers the JSON-RPC tunnel with a bare UNIMPLEMENTED (as a typed-only gRPC server does) and forwards the typed service to the server on 50063. binding auto speaks only the tunnel: VS Code must fail to connect, name \"binding\": \"typed\" as the fix, and send no typed RPC (which would succeed here).",
+				"command": "{zig}",
+				"args": [
+					"--port",
+					"3103",
+					"--grpc-port",
+					"50063",
+					"--grpc-typed"
+				],
+				"port": 50063,
+				"grpcLogProxy": {
+					"port": 50053,
+					"refuseTunnel": true
+				}
+			}
+		},
+		{
+			"label": "zig-grpcs",
+			"transport": "grpcs",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"mcp": {
+				"type": "grpc",
+				"url": "grpcs://localhost:50056",
+				"tls": {
+					"ca": "{tlsCa}"
+				}
+			},
+			"process": {
+				"$comment": "runner/grpc-log-proxy.ts terminates TLS on 50056 (server certificate for localhost from the run's throw-away CA) and forwards cleartext to the server on 50066. binding is left at its default (auto: the tunnel answers).",
+				"command": "{zig}",
+				"args": [
+					"--port",
+					"3106",
+					"--grpc-port",
+					"50066"
+				],
+				"port": 50066,
+				"grpcLogProxy": {
+					"port": 50056,
+					"tls": true
+				}
+			}
+		},
+		{
+			"label": "zig-grpcs-untrusted",
+			"transport": "grpcs",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"expectConnectError": "untrusted-certificate",
+			"sharesProcessOf": "zig-grpcs",
+			"mcp": {
+				"type": "grpc",
+				"url": "grpcs://localhost:50056"
+			}
+		},
+		{
+			"label": "zig-grpcs-wrong-name",
+			"transport": "grpcs",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"expectConnectError": "certificate-name",
+			"sharesProcessOf": "zig-grpcs",
+			"mcp": {
+				"type": "grpc",
+				"url": "grpcs://localhost:50056",
+				"tls": {
+					"ca": "{tlsCa}",
+					"serverName": "wrong-name.mcp-e2e.test"
+				}
+			}
+		},
+		{
+			"label": "zig-grpcs-sni",
+			"transport": "grpcs",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"sharesProcessOf": "zig-grpcs",
+			"mcp": {
+				"type": "grpc",
+				"url": "grpcs://127.0.0.1:50056",
+				"tls": {
+					"ca": "{tlsCa}",
+					"serverName": "localhost"
+				}
+			},
+			"$comment": "An IP URL with tls.serverName localhost: the handshake must use that SNI and verify the certificate for localhost."
+		},
+		{
+			"label": "zig-grpcs-insecure",
+			"transport": "grpcs",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"sharesProcessOf": "zig-grpcs",
+			"mcp": {
+				"type": "grpc",
+				"url": "grpcs://localhost:50056",
+				"tls": {
+					"insecure": true
+				}
+			},
+			"$comment": "No tls.ca but tls.insecure: VS Code connects without verifying the certificate and logs the warning."
+		},
+		{
+			"label": "zig-grpc-soak",
+			"transport": "grpc-tunnel",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"mcp": {
+				"type": "grpc",
+				"url": "grpc://127.0.0.1:50055",
+				"binding": "tunnel"
+			},
+			"process": {
+				"$comment": "The soak test's own server: about 1,200 calls on one HTTP/2 session through runner/grpc-log-proxy.ts on 50055, a Node http2 server. Its rapid-reset protection (nghttp2: a bucket of 1000 resets refilled at 33/s) runs without the refill here: a client that resets completed streams loses the session after 1000 calls even at the zig server's ~40 ms per call, which is slower than the default refill.",
+				"command": "{zig}",
+				"args": [
+					"--port",
+					"3105",
+					"--grpc-port",
+					"50065"
+				],
+				"port": 50065,
+				"grpcLogProxy": {
+					"port": 50055,
+					"resetLimit": {
+						"burst": 1000,
+						"rate": 0
+					}
+				}
+			}
+		},
+		{
+			"label": "zig-grpc-mismatch",
+			"transport": "grpc-tunnel",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"mcp": {
+				"type": "grpc",
+				"url": "grpc://127.0.0.1:50058",
+				"binding": "tunnel"
+			},
+			"process": {
+				"$comment": "runner/grpc-log-proxy.ts on 50058 in front of the zig-grpc-tunnel server rewrites the mirrored mcp-name metadata of the first tools/call of greet (once) and of every tools/call of test_simple_text (always), so the server answers -32020 in the trailers.",
+				"upstreamPort": 50051,
+				"grpcLogProxy": {
+					"port": 50058,
+					"mangle": [
+						"greet=wrong-name:once",
+						"test_simple_text=wrong-name"
+					]
+				}
+			}
+		},
+		{
+			"label": "zig-grpc-deadline",
+			"transport": "grpc-tunnel",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"mcp": {
+				"type": "grpc",
+				"url": "grpc://127.0.0.1:50059",
+				"binding": "tunnel",
+				"deadlineMs": 1500
+			},
+			"process": {
+				"$comment": "runner/grpc-log-proxy.ts on 50059 in front of the zig-grpc-tunnel server holds every tools/call of greet for 5 s; deadlineMs 1500 makes VS Code give up after 1.5 s (the cancellation test cancels it earlier).",
+				"upstreamPort": 50051,
+				"grpcLogProxy": {
+					"port": 50059,
+					"hold": [
+						"greet=5000"
+					]
+				}
+			}
+		},
+		{
+			"label": "zig-oauth",
+			"transport": "http",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"suite": "ui",
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3400/mcp"
+			},
+			"process": {
+				"$comment": "runner/oauth-fixture.ts: the protected resource on 3400 (its PRM at a custom path that only the challenge names), the authorization server on its own origin 3410 with the path issuer /tenant; authorized requests go to the /mcp of the server on 3107.",
+				"command": "{zig}",
+				"args": [
+					"--port",
+					"3107"
+				],
+				"port": 3107,
+				"oauthFixture": {
+					"port": 3400,
+					"asPort": 3410,
+					"asPath": "/tenant",
+					"prmPath": "/meta/zig-oauth/prm.json"
+				}
+			}
+		},
+		{
+			"label": "zig-oauth-iss-wrong",
+			"transport": "http",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"suite": "ui",
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3401/mcp"
+			},
+			"process": {
+				"$comment": "runner/oauth-fixture.ts --iss-mode wrong: the authorization response carries an iss that is not the issuer; the sign-in must fail before the token request.",
+				"upstreamPort": 3107,
+				"oauthFixture": {
+					"port": 3401,
+					"issMode": "wrong"
+				}
+			}
+		},
+		{
+			"label": "zig-oauth-iss-omit",
+			"transport": "http",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"suite": "ui",
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3402/mcp"
+			},
+			"process": {
+				"$comment": "runner/oauth-fixture.ts --iss-mode omit: no iss although the metadata announces authorization_response_iss_parameter_supported; the sign-in must fail before the token request.",
+				"upstreamPort": 3107,
+				"oauthFixture": {
+					"port": 3402,
+					"issMode": "omit"
+				}
+			}
+		},
+		{
+			"label": "zig-grpc-oauth",
+			"transport": "grpc-tunnel",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"suite": "ui",
+			"mcp": {
+				"type": "grpc",
+				"url": "grpc://127.0.0.1:50060",
+				"binding": "tunnel"
+			},
+			"process": {
+				"$comment": "runner/oauth-fixture.ts with its gRPC front on 50060 (UNAUTHENTICATED with www-authenticate without a token) in front of the zig-grpc-tunnel server; PRM and authorization server on 3404 (resource https://127.0.0.1:50060/).",
+				"upstreamPort": 50051,
+				"oauthFixture": {
+					"port": 3404,
+					"grpcPort": 50060
+				}
+			}
+		},
+		{
+			"label": "zig-grpc-api",
+			"transport": "grpc-auto",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"provider": {
+				"$comment": "Not in mcp.json: the E2E extension returns it from its McpServerDefinitionProvider as a vscode.McpGrpcServerDefinition (binding Auto), through runner/grpc-log-proxy.ts on 50057 in front of the zig-grpc-tunnel server.",
+				"url": "grpc://127.0.0.1:50057",
+				"binding": "auto"
+			},
+			"process": {
+				"$comment": "Only the proxy (the zig-grpc-tunnel server is the upstream).",
+				"upstreamPort": 50051,
+				"grpcLogProxy": {
+					"port": 50057
+				}
+			}
+		},
+		{
+			"label": "zig-grpc-api-typed",
+			"transport": "grpc-typed",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"sharesProcessOf": "zig-grpc-typed",
+			"provider": {
+				"$comment": "An API definition with McpGrpcBinding.Typed against the zig-grpc-typed proxy.",
+				"url": "grpc://127.0.0.1:50052",
+				"binding": "typed"
+			}
+		},
+		{
+			"label": "zig-grpc-api-tls",
+			"transport": "grpcs",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"sharesProcessOf": "zig-grpcs",
+			"provider": {
+				"$comment": "An API definition over TLS (tls.ca: the run's CA from MCP_E2E_TLS_DIR) against the zig-grpcs TLS proxy.",
+				"url": "grpcs://localhost:50056",
+				"tls": {
+					"ca": "{tlsCa}"
+				}
+			}
+		}
+	]
+}

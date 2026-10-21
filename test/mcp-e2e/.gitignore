@@ -1,0 +1,4 @@
+# The E2E extension is compiled inside the test container (containers/e2e-lib.sh build_extension);
+# a local `tsc -p extension/tsconfig.json` writes the same folder.
+extension/out/
+node_modules/

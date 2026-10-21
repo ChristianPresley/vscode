@@ -1,0 +1,28 @@
+{
+	"$comment": "Type checks the scripts that run with Node's type stripping (runner/, ui/). The E2E extension has its own tsconfig.json.",
+	"compilerOptions": {
+		"module": "nodenext",
+		"moduleResolution": "nodenext",
+		"target": "es2024",
+		"lib": [
+			"es2024"
+		],
+		"strict": true,
+		"noEmit": true,
+		"allowImportingTsExtensions": true,
+		"erasableSyntaxOnly": true,
+		"verbatimModuleSyntax": true,
+		"noUnusedLocals": true,
+		"skipLibCheck": true,
+		"typeRoots": [
+			"../../node_modules/@types"
+		],
+		"types": [
+			"node"
+		]
+	},
+	"include": [
+		"runner/*.ts",
+		"ui/*.ts"
+	]
+}

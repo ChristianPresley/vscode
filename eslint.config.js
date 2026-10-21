@@ -2506,6 +2506,14 @@ export default defineConfig(
 					]
 				},
 				{
+					// The MCP end-to-end suite: an extension (against the `vscode` API), node scripts and Playwright.
+					'target': 'test/mcp-e2e/**',
+					'restrictions': [
+						'test/mcp-e2e/**',
+						'*' // node modules (vscode, playwright, node built-ins)
+					]
+				},
+				{
 					// The MCP gRPC interop package runs the transpiled codec from out/ against grpc-js and protobufjs.
 					'target': 'test/mcp-grpc/**',
 					'restrictions': [

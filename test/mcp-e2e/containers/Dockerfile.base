@@ -1,0 +1,34 @@
+# vscode-mcp-build:latest - the base of the builder/runtime image of the MCP end-to-end tests
+# (Dockerfile.builder adds the packaging and e2e tools on top: vscode-mcp-build:2).
+#   wslc build -t vscode-mcp-build:latest -f Dockerfile.base <this folder>
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+		ca-certificates curl git python3 python3-pip build-essential pkg-config \
+		libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev libnss3 libatk1.0-0 \
+		libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2t64 libxss1 libxtst6 \
+		xvfb xauth fonts-dejavu-core jq unzip \
+	&& rm -rf /var/lib/apt/lists/*
+
+# Node 24 (the repo's .nvmrc) from NodeSource.
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+	&& apt-get install -y --no-install-recommends nodejs \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& node --version && npm --version
+
+# Zig for the zig-sdk conformance/gRPC peers (pinned to the version zig-sdk's CI uses). A failed
+# download fails the build: containers/build-zig-sdk.sh needs zig.
+ARG ZIG_VERSION=0.16.0
+RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz \
+	&& mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
+	&& ln -s /opt/zig/zig /usr/local/bin/zig && rm /tmp/zig.tar.xz \
+	&& zig version
+
+ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1 \
+	PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+	NPM_CONFIG_FUND=false \
+	NPM_CONFIG_AUDIT=false
+
+WORKDIR /work
+CMD ["bash"]
