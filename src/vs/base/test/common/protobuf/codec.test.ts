@@ -29,7 +29,8 @@ function concat(...chunks: Uint8Array[]): Uint8Array {
 }
 
 function assertCodecError(fn: () => unknown, reason: ProtoCodecErrorReason): void {
-	assert.throws(fn, (err: unknown) => err instanceof ProtoCodecError && err.reason === reason, `expected ProtoCodecError '${reason}'`);
+	// a function, not an arrow: the browser test runner's assert tries the validator as a class (instanceof) first
+	assert.throws(fn, function (err: unknown) { return err instanceof ProtoCodecError && err.reason === reason; }, `expected ProtoCodecError '${reason}'`);
 }
 
 const SCALAR_FIELDS: readonly IFieldDescriptor[] = [
@@ -233,7 +234,7 @@ suite('protobuf codec', () => {
 		});
 
 		test('decoded strings must be valid UTF-8', () => {
-			assert.throws(() => decodeMessage(SCALARS, bytes('7a 01 ff')), (err: unknown) => err instanceof ProtoDecodeError && err.reason === 'invalid-utf8');
+			assert.throws(() => decodeMessage(SCALARS, bytes('7a 01 ff')), function (err: unknown) { return err instanceof ProtoDecodeError && err.reason === 'invalid-utf8'; });
 		});
 
 		test('decoded bytes are copies, not views into the input', () => {
@@ -375,7 +376,7 @@ suite('protobuf codec', () => {
 		});
 
 		test('a truncated packed payload fails with a decode error', () => {
-			assert.throws(() => decodeMessage(REPEATED_SCALARS, bytes('5a 03 01 00 00')), (err: unknown) => err instanceof ProtoDecodeError && err.reason === 'truncated');
+			assert.throws(() => decodeMessage(REPEATED_SCALARS, bytes('5a 03 01 00 00')), function (err: unknown) { return err instanceof ProtoDecodeError && err.reason === 'truncated'; });
 		});
 	});
 

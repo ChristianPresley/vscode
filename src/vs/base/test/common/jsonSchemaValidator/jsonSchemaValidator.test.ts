@@ -811,9 +811,12 @@ suite('JSON Schema Validator', () => {
 
 			test('a repeated pattern is analyzed once, and schemas of usual patterns stay within the budget', () => {
 				// 4000 copies of the slowest pattern: about 48 s without the budget, all of it analyzing the same pattern again.
+				// The run count decides; the time bound only catches that 48 s, since CI browsers are slower than this machine.
 				const started = Date.now();
+				const runs = getPatternAnalysisRunCount();
 				const repeated = compile(schemaOf(Array.from({ length: 4000 }, () => heavy(0))));
-				assert.ok(Date.now() - started < 1500, `took ${Date.now() - started} ms`);
+				assert.ok(getPatternAnalysisRunCount() - runs <= 1, `${getPatternAnalysisRunCount() - runs} analyses`);
+				assert.ok(Date.now() - started < 15_000, `took ${Date.now() - started} ms`);
 				assert.deepStrictEqual(repeated.warnings, []);
 				assertInvalid(repeated, { p3999: '0:x' }, 'pattern');
 				const usual = compile(schemaOf(Array.from({ length: 4000 }, (_, i) => `^${i}\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$`)));

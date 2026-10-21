@@ -26,7 +26,8 @@ function readAll(input: Uint8Array): IProtoField[] {
 }
 
 function assertDecodeError(fn: () => unknown, reason: ProtoDecodeErrorReason): void {
-	assert.throws(fn, (err: unknown) => err instanceof ProtoDecodeError && err.reason === reason, `expected ProtoDecodeError '${reason}'`);
+	// a function, not an arrow: the browser test runner's assert tries the validator as a class (instanceof) first
+	assert.throws(fn, function (err: unknown) { return err instanceof ProtoDecodeError && err.reason === reason; }, `expected ProtoDecodeError '${reason}'`);
 }
 
 suite('protobuf wire', () => {

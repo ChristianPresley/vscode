@@ -38,7 +38,8 @@ function expectParams(method: string, params: Record<string, unknown>, expected:
 }
 
 function assertUnexpressible(fn: () => unknown, kind: McpUnexpressibleKind, reason: string): void {
-	assert.throws(fn, (err: unknown) => {
+	// a function, not an arrow: the browser test runner's assert tries the validator as a class (instanceof) first
+	assert.throws(fn, function (err: unknown) {
 		assert.ok(err instanceof McpUnexpressibleError, `expected McpUnexpressibleError, got ${String(err)}`);
 		assert.strictEqual(err.kind, kind, `kind of '${err.reason}'`);
 		assert.ok(err.reason.includes(reason), `reason '${err.reason}' includes '${reason}'`);
@@ -324,7 +325,7 @@ suite('MCP - gRPC typed binding', () => {
 		});
 
 		test('malformed protobuf is a decode error, not a conversion error', () => {
-			assert.throws(() => decodeTypedRequest(rpcOf('tools/list'), Uint8Array.of(0x0a, 0x05)), (err: unknown) => err instanceof ProtoDecodeError && err.reason === 'truncated');
+			assert.throws(() => decodeTypedRequest(rpcOf('tools/list'), Uint8Array.of(0x0a, 0x05)), function (err: unknown) { return err instanceof ProtoDecodeError && err.reason === 'truncated'; });
 		});
 
 		test('a choice with two members gives invalid', () => {

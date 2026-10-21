@@ -26,7 +26,8 @@ suite('gRPC length-prefixed messages', () => {
 	}
 
 	function assertReason(fn: () => void, reason: GrpcFramingError['reason']) {
-		assert.throws(fn, (error: unknown) => error instanceof GrpcFramingError && error.reason === reason);
+		// a function, not an arrow: the browser test runner's assert tries the validator as a class (instanceof) first
+		assert.throws(fn, function (error: unknown) { return error instanceof GrpcFramingError && error.reason === reason; });
 	}
 
 	test('encodes a 5-byte prefix with the compressed flag and big-endian length', () => {

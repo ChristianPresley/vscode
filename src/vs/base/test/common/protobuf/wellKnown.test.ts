@@ -19,7 +19,8 @@ function bytes(hexString: string): Uint8Array {
 }
 
 function assertCodecError(fn: () => unknown, reason: ProtoCodecErrorReason): void {
-	assert.throws(fn, (err: unknown) => err instanceof ProtoCodecError && err.reason === reason, `expected ProtoCodecError '${reason}'`);
+	// a function, not an arrow: the browser test runner's assert tries the validator as a class (instanceof) first
+	assert.throws(fn, function (err: unknown) { return err instanceof ProtoCodecError && err.reason === reason; }, `expected ProtoCodecError '${reason}'`);
 }
 
 function roundTripStruct(json: Record<string, unknown>): Record<string, unknown> {
