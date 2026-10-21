@@ -149,8 +149,13 @@ export function grpcTests(h: E2eHarness): ITestCase[] {
 			fn: async ctx => {
 				await h.requireServer('zig-grpc-typed');
 				await h.requireServer('zig-grpcs');
-				const typed = h.wireLog('zig-grpc-typed').filter(e => e.event === 'call');
-				const tls = h.wireLog('zig-grpcs').filter(e => e.event === 'call');
+				// One tool call on each, so that the tool call RPCs are on the wire whatever else ran.
+				await expectToolText(h, ctx, 'zig-grpc-typed', 'greet', { name: 'deadline-default' }, ['Hello, deadline-default!']);
+				await expectToolText(h, ctx, 'zig-grpcs', 'test_simple_text', {}, ['This is a simple text response']);
+				const calls = (label: string) => h.wireLog(label).filter(e => e.event === 'call');
+				await waitFor('the tool calls in the wire logs', 10_000, () => calls('zig-grpc-typed').some(e => e.path === TYPED_CALL_TOOL) && calls('zig-grpcs').some(e => e.jsonRpcMethods?.includes('tools/call')) ? true : undefined, 250);
+				const typed = calls('zig-grpc-typed');
+				const tls = calls('zig-grpcs');
 				const deadline = (e: IWireEvent) => e.metadata?.['grpc-timeout'];
 				const listTools = typed.filter(e => e.path === TYPED_LIST_TOOLS);
 				const callTool = typed.filter(e => e.path === TYPED_CALL_TOOL);
@@ -161,12 +166,12 @@ export function grpcTests(h: E2eHarness): ITestCase[] {
 					toolsCall: [...new Set(byMethod('tools/call').map(deadline))], listen: [...new Set(byMethod('subscriptions/listen').map(deadline))],
 				};
 				assert(listTools.length && listTools.every(e => deadline(e) === '1M'), `typed ListTools deadlines: ${JSON.stringify(listTools.map(deadline))}`);
-				assert(callTool.every(e => deadline(e) === undefined), `typed CallTool deadlines: ${JSON.stringify(callTool.map(deadline))}`);
+				assert(callTool.length && callTool.every(e => deadline(e) === undefined), `typed CallTool deadlines: ${JSON.stringify(callTool.map(deadline))}`);
 				for (const method of ['server/discover', 'tools/list']) {
 					assert(byMethod(method).length && byMethod(method).every(e => deadline(e) === '1M'), `${method} over the tunnel: ${JSON.stringify(byMethod(method).map(deadline))}`);
 				}
 				for (const method of ['tools/call', 'subscriptions/listen']) {
-					assert(byMethod(method).every(e => deadline(e) === undefined), `${method} over the tunnel carried a deadline: ${JSON.stringify(byMethod(method).map(deadline))}`);
+					assert(byMethod(method).length && byMethod(method).every(e => deadline(e) === undefined), `${method} over the tunnel carried a deadline: ${JSON.stringify(byMethod(method).map(deadline))}`);
 				}
 				assert(byMethod('subscriptions/listen').length > 0, 'no subscriptions/listen reached zig-grpcs');
 			},

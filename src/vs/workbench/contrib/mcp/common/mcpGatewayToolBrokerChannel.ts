@@ -370,7 +370,7 @@ export class McpGatewayToolBrokerChannel extends Disposable implements IServerCh
 		}
 		const tools = server.tools.get()
 			.filter(t => t.visibility & McpToolVisibility.Model)
-			.map(t => t.definition);
+			.map(t => toGatewayTool(t.definition));
 		this._logService.debug(`[McpGateway][ToolBroker] listToolsForServer '${serverId}': ${tools.length} tool(s)`);
 		return tools;
 	}
@@ -653,6 +653,21 @@ export class McpGatewayToolBrokerChannel extends Disposable implements IServerCh
 			return false;
 		}
 	}
+}
+
+const INTERNAL_TOOL_FIELDS = ['_icons', 'serverToolName', 'visibility', 'uiResourceUri'] as const;
+
+/**
+ * The tool as the gateway publishes it: without the fields VS Code adds to the tools it
+ * validates (`_icons`, `serverToolName`, `visibility`, `uiResourceUri`), which are not part
+ * of MCP and which the typed gRPC binding refuses.
+ */
+export function toGatewayTool(definition: MCPLegacy.Tool): MCPLegacy.Tool {
+	const tool: Record<string, unknown> = { ...definition };
+	for (const key of INTERNAL_TOOL_FIELDS) {
+		delete tool[key];
+	}
+	return tool as unknown as MCPLegacy.Tool;
 }
 
 function toToolCallContext(chatSessionResource: string | undefined): IMcpToolCallContext | undefined {

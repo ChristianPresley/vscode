@@ -19,7 +19,7 @@ import { INotificationService } from '../../../../../platform/notification/commo
 import { TestNotificationService } from '../../../../../platform/notification/test/common/testNotificationService.js';
 import { IStorageService, StorageScope } from '../../../../../platform/storage/common/storage.js';
 import { TestStorageService } from '../../../../test/common/workbenchTestServices.js';
-import { ChatMessageRole, IChatMessage, IChatResponsePart, ILanguageModelChatMetadata, ILanguageModelChatRequestOptions, ILanguageModelChatResponse, ILanguageModelsService } from '../../../chat/common/languageModels.js';
+import { ChatMessageRole, IChatMessage, IChatResponsePart, ILanguageModelChatMetadata, ILanguageModelChatRequestOptions, ILanguageModelChatResponse, ILanguageModelChatSelector, ILanguageModelsService } from '../../../chat/common/languageModels.js';
 import { NullLanguageModelsService } from '../../../chat/test/common/languageModels.js';
 import { mcpServerSamplingSection } from '../../common/mcpConfiguration.js';
 import { McpSamplingService } from '../../common/mcpSamplingService.js';
@@ -27,6 +27,7 @@ import { IMcpServer, ISamplingOptions, McpError } from '../../common/mcpTypes.js
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 
 const TEST_MODEL = 'test-model';
+const LAZY_MODEL = 'lazy/model';
 
 /** Mirrors `vscode.LanguageModelChatToolMode`, which the service forwards numerically. */
 const enum ToolMode {
@@ -63,7 +64,18 @@ class RecordingLanguageModelsService extends NullLanguageModelsService {
 	}
 
 	override lookupLanguageModel(identifier: string): ILanguageModelChatMetadata | undefined {
-		return identifier === TEST_MODEL ? this._metadata : undefined;
+		return identifier === TEST_MODEL || (identifier === LAZY_MODEL && this.lazyVendorResolved) ? this._metadata : undefined;
+	}
+
+	/** Whether the models of the vendor `lazy` were resolved: like a vendor no chat has asked for yet, its model is unknown until then. */
+	lazyVendorResolved = false;
+
+	override async selectLanguageModels(selector: ILanguageModelChatSelector): Promise<string[]> {
+		if (selector.vendor === 'lazy') {
+			this.lazyVendorResolved = true;
+			return [LAZY_MODEL];
+		}
+		return [];
 	}
 
 	override async sendChatRequest(modelId: string, _from: ExtensionIdentifier | undefined, messages: IChatMessage[], options: ILanguageModelChatRequestOptions, _token: CancellationToken): Promise<ILanguageModelChatResponse> {
@@ -104,10 +116,11 @@ suite('MCP - Sampling Service', () => {
 	} as unknown as IMcpServer;
 
 	let languageModels: RecordingLanguageModelsService;
+	let configuration: TestConfigurationService;
 	let service: McpSamplingService;
 
 	setup(() => {
-		const configuration = new TestConfigurationService();
+		configuration = new TestConfigurationService();
 		// Pre-approve the server so no allow prompt is shown, and pin the model.
 		configuration.setUserConfiguration(mcpServerSamplingSection, {
 			'Test Collection: Test Server': { allowedOutsideChat: true, allowedModels: [TEST_MODEL] },
@@ -369,6 +382,19 @@ suite('MCP - Sampling Service', () => {
 
 			assert.deepStrictEqual(result.content, { type: 'tool_use', id: 'call_1', name: 'get_weather', input: { city: 'Paris' } });
 			assert.strictEqual(result.stopReason, 'toolUse');
+		});
+	});
+
+	suite('model resolution', () => {
+		test('a configured model of a vendor that was not resolved yet is resolved, not reported missing', async () => {
+			configuration.setUserConfiguration(mcpServerSamplingSection, {
+				'Test Collection: Test Server': { allowedDuringChat: true, allowedModels: [LAZY_MODEL] },
+			});
+			languageModels.scriptedParts = [{ type: 'text', value: 'ok' }];
+			const { sample: result } = await service.sample({ server, isDuringToolCall: true, params: { messages: [userText('hi')], maxTokens: 100 } }, CancellationToken.None);
+			assert.strictEqual(languageModels.lazyVendorResolved, true);
+			assert.strictEqual(result.model, LAZY_MODEL);
+			assert.deepStrictEqual(languageModels.requests.map(r => r.modelId), [LAZY_MODEL]);
 		});
 	});
 });

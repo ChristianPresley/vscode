@@ -50,6 +50,20 @@ suite('McpGatewayToolBrokerChannel', () => {
 		channel.dispose();
 	});
 
+	test('lists tools without the fields VS Code adds to validated tools', async () => {
+		const mcpService = new TestMcpService();
+		const channel = new McpGatewayToolBrokerChannel(mcpService, new NullLogService());
+		const tool = createTool('mcp_serverA_echo', async () => ({ content: [{ type: 'text', text: 'A' }] }));
+		// What McpServer._getValidatedTools stores as the definition of a tool.
+		const definition = { ...createToolDefinition('mcp_serverA_echo'), serverToolName: 'echo', _icons: [], visibility: McpToolVisibility.Model, uiResourceUri: undefined };
+		mcpService.servers.set([createServer('collectionA', 'serverA', [{ ...tool, definition }])], undefined);
+
+		const tools = await channel.call<readonly MCPLegacy.Tool[]>(undefined, 'listToolsForServer', { serverId: 'serverA' });
+		assert.deepStrictEqual(tools, [createToolDefinition('mcp_serverA_echo')]);
+
+		channel.dispose();
+	});
+
 	test('routes tool calls to specific server', async () => {
 		const mcpService = new TestMcpService();
 		const channel = new McpGatewayToolBrokerChannel(mcpService, new NullLogService());

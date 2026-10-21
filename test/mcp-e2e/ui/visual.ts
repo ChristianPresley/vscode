@@ -126,10 +126,10 @@ async function visibleText(page: Page, selector: string): Promise<string> {
 
 /**
  * The row texts (one line per row) of the virtualized lists in `container` (only the rows in view
- * exist in the DOM), read while scrolling with the mouse wheel over the first row that contains
+ * exist in the DOM), read while scrolling the list (from its top) that holds the first row containing
  * `anchor` (default: the first row); scrolls back to the top afterwards.
  */
-async function listTextScrolled(page: Page, container: string, anchor?: string, maxSteps = 10): Promise<string> {
+async function listTextScrolled(page: Page, container: string, anchor?: string, maxSteps = 40): Promise<string> {
 	const rows = page.locator(`${container} .monaco-list-row`);
 	const anchorRow = anchor ? rows.filter({ hasText: anchor }).first() : rows.first();
 	if (!await anchorRow.count()) {
@@ -137,9 +137,11 @@ async function listTextScrolled(page: Page, container: string, anchor?: string, 
 	}
 	// One entry per row (its lines joined), so that the parts of a row stay together.
 	const seen = new Set<string>();
+	const list = scrollableOf(anchorRow);
 	try {
-		await anchorRow.hover({ timeout: 3000 });
-		for (let i = 0; i < maxSteps; i++) {
+		await wheelList(list, -1_000_000);
+		let unchanged = 0;
+		for (let i = 0; i < maxSteps && unchanged < 2; i++) {
 			const before = seen.size;
 			const n = await rows.count();
 			for (let r = 0; r < n; r++) {
@@ -148,30 +150,53 @@ async function listTextScrolled(page: Page, container: string, anchor?: string, 
 					seen.add((await row.innerText()).replace(/\u00a0/g, ' ').replace(/\s*\n\s*/g, ' '));
 				}
 			}
-			if (i > 0 && seen.size === before) {
-				break;
-			}
-			await page.mouse.wheel(0, 300);
-			await sleep(300);
+			unchanged = seen.size === before ? unchanged + 1 : 0;
+			await wheelList(list, 200);
 		}
-		await page.mouse.wheel(0, -20_000);
-		await sleep(300);
+		await wheelList(list, -1_000_000);
 	} catch {
-		// a list that cannot be hovered: what was read so far
+		// a list that cannot be scrolled: what was read so far
 	}
 	return [...seen].join('\n');
 }
 
-/** The row in `container` that contains `text`, scrolled into the DOM (the lists are virtualized). */
-async function rowWithText(page: Page, container: string, text: string, maxSteps = 10): Promise<Locator> {
+/** The scrollable element of the monaco list that contains `row`. */
+function scrollableOf(row: Locator): Locator {
+	return row.locator('xpath=ancestor::div[contains(concat(" ", normalize-space(@class), " "), " monaco-scrollable-element ")][1]');
+}
+
+/**
+ * Scrolls a monaco list by `deltaY` pixels with a wheel event dispatched on its scrollable
+ * element: the mouse wheel of Playwright scrolls whatever is under the pointer, and Chromium
+ * splits a large delta, so neither reliably reaches the list (seen in run dbg-1: 01 never got past
+ * the first rows, and 05b found everything-legacy out of view).
+ */
+async function wheelList(list: Locator, deltaY: number): Promise<void> {
+	await list.evaluate((el, dy) => {
+		// Runs in the page (the runner's tsconfig has no DOM types).
+		const wheel = (globalThis as unknown as { WheelEvent: new (type: string, init: object) => unknown }).WheelEvent;
+		(el as unknown as { dispatchEvent(event: unknown): boolean }).dispatchEvent(new wheel('wheel', { deltaY: dy, deltaMode: 0, bubbles: true, cancelable: true }));
+	}, deltaY);
+	await sleep(250);
+}
+
+/** Whether `row` lies inside the visible box of `list`. */
+async function inView(row: Locator, list: Locator): Promise<boolean> {
+	const [r, l] = await Promise.all([row.boundingBox(), list.boundingBox()]);
+	return !!r && !!l && r.y >= l.y - 1 && r.y + r.height <= l.y + l.height + 1;
+}
+
+/** The row in `container` that contains `text`, scrolled into view (the lists are virtualized). */
+async function rowWithText(page: Page, container: string, text: string, maxSteps = 40): Promise<Locator> {
 	const rows = page.locator(`${container} .monaco-list-row`);
 	const row = rows.filter({ hasText: text }).first();
-	if (!await row.count()) {
-		await rows.first().hover({ timeout: 3000 }).catch(() => undefined);
-		for (let i = 0; i < maxSteps && !await row.count(); i++) {
-			await page.mouse.wheel(0, 300);
-			await sleep(300);
-		}
+	if (!await rows.count()) {
+		return row;
+	}
+	const list = scrollableOf(rows.first());
+	await wheelList(list, -1_000_000);
+	for (let i = 0; i < maxSteps && !(await row.count() && await inView(row, list)); i++) {
+		await wheelList(list, await row.count() ? 40 : 200);
 	}
 	return row;
 }
@@ -472,11 +497,15 @@ async function screenshotsPart(page: Page): Promise<void> {
 		const rows = (await listTextScrolled(page, '.quick-input-widget')).split('\n');
 		// The state of each server by its row: Running for every server the suite starts, not running
 		// for the ones only their own tests (or the OAuth scenarios, later) start.
-		const rowOf = (label: string) => rows.find(r => new RegExp(`(^|[\\s(])${escapeRegExp(label)}($|[\\s,)·])`).test(r));
+		// A row reads "<label><State> <source>" ("zig-stdioRunning", "zig-grpc-apiRunning E2E gRPC
+		// provider"): the label is followed by the capitalized state, never by a character of a
+		// longer label ("zig-grpcs" must not match "zig-grpcs-sni").
+		const rowOf = (label: string) => rows.find(r => new RegExp(`^${escapeRegExp(label)}(?![-a-z0-9_.])`).test(r.trim()));
 		const checks: Record<string, boolean> = {};
 		for (const server of configuredServers()) {
 			const row = rowOf(server.label);
-			checks[server.startsWithOthers ? `${server.label} Running` : `${server.label} not running`] = !!row && (server.startsWithOthers ? /\bRunning\b/i.test(row) : !/\bRunning\b/i.test(row));
+			const running = !!row && /^Running\b/.test(row.trim().slice(server.label.length));
+			checks[server.startsWithOthers ? `${server.label} Running` : `${server.label} not running`] = !!row && running === server.startsWithOthers;
 		}
 		await shot(page, '02-servers-quickpick-state.png', 'MCP: List Servers',
 			'The MCP: List Servers quick pick shows every server with its state: each server the suite starts Running; zig-oauth, zig-oauth-iss-*, zig-grpc-oauth (started by the OAuth scenarios after this screenshot), the negative entries and the ones only their own API tests start not running.',

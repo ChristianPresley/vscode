@@ -253,6 +253,13 @@ export class McpSamplingService extends Disposable implements IMcpSamplingServic
 		}
 
 		// 2. Get the configured models, or the default free model(s)
+		// The models are looked up among the resolved ones; a vendor whose models nobody has asked
+		// for since startup (no chat opened yet) is resolved first, so that a configured model of it
+		// is found instead of asking the user to pick models again.
+		const unresolvedVendors = new Set(config.allowedModels?.filter(m => !this._languageModelsService.lookupLanguageModel(m) && m.includes('/')).map(m => m.slice(0, m.indexOf('/'))));
+		if (unresolvedVendors.size) {
+			await Promise.all([...unresolvedVendors].map(vendor => this._languageModelsService.selectLanguageModels({ vendor }).catch(() => undefined)));
+		}
 		const foundModelIds = config.allowedModels?.filter(m => !!this._languageModelsService.lookupLanguageModel(m)) || this._getDefaultModels();
 		if (!foundModelIds.length) {
 			return ModelMatch.NoMatchingModel;
