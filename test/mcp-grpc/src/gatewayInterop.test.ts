@@ -11,8 +11,9 @@
  *
  * - @grpc/grpc-js calls all eight typed RPCs (with routing metadata) and the
  *   tunnel (discover, list, call, listen) with the vendored proto files,
- * - the zig-sdk example client (`grpc_client`, tunnel only, calls `add`) runs
- *   against the default route when `MCP_ZIG_GRPC_CLIENT` names its binary,
+ * - the zig-sdk example client (`grpc_client` of zig-sdk 0.6.0, tunnel only,
+ *   called with `--tool add`) runs against the default route when
+ *   `MCP_ZIG_GRPC_CLIENT` names its binary,
  * - curl makes a raw HTTP/2 prior-knowledge tunnel call, as in the zig-sdk
  *   CI, when it has HTTP/2 (the request message is over 2^14 bytes, so its
  *   length is a three-byte varint), and the trailers must say
@@ -257,12 +258,13 @@ test('grpc-js calls the tunnel: discover, list, call with progress, listen', { s
 });
 
 test('the zig-sdk example client calls add on the default route', { skip: (!ENABLED || !ZIG_CLIENT) && 'set MCP_GATEWAY_GRPC_INTEROP=1 and MCP_ZIG_GRPC_CLIENT to the grpc_client binary' }, () => {
-	const result = spawnSync(ZIG_CLIENT!, ['127.0.0.1', String(gateway!.port)], { encoding: 'utf8', timeout: 60_000 });
+	// zig-sdk 0.6.0: the tool and its arguments are options (the default tool is test_simple_text).
+	const result = spawnSync(ZIG_CLIENT!, ['127.0.0.1', String(gateway!.port), '--tool', 'add', '--args', '{"a":40,"b":2}'], { encoding: 'utf8', timeout: 60_000 });
 	const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
 	assert.strictEqual(result.status, 0, output);
 	assert.match(output, /server: mcp-conformance-test-server 1\.0\.0/);
 	assert.match(output, /tool: add/);
-	assert.match(output, /add\(40, 2\) = 42/);
+	assert.match(output, /add: 42/);
 });
 
 /** Whether `curl` exists and speaks HTTP/2. */

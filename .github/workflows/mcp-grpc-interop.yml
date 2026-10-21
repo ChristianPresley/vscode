@@ -322,7 +322,7 @@ jobs:
           MCP_GATEWAY_GRPC_INTEROP: 1
 
   # The zig-sdk example client (`grpc_client`: tunnel only, discovers, lists
-  # and calls `add`) against the gateway's default route, built from a pinned
+  # and calls `add` with --tool add) against the gateway's default route, built from a pinned
   # tag. Not required for PR gating.
   gateway-zig-interop:
     name: gateway gRPC listener (zig-sdk client)
