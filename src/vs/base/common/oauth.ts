@@ -1354,6 +1354,23 @@ export function issuerMatches(issuer: string, authorizationServer: string, toler
 	return false;
 }
 
+/**
+ * The issuer comparison for an authorization server identifier that went
+ * through a `URI`, which spells a bare origin with a trailing slash whether
+ * or not it was published with one: for a bare origin both spellings are the
+ * identifier (`trailing-slash`); one with a path or a query must match
+ * exactly (RFC 8414 section 3.3).
+ */
+export function issuerToleranceForIdentifier(identifier: string): 'exact' | 'trailing-slash' {
+	let url: URL;
+	try {
+		url = new URL(identifier);
+	} catch {
+		return 'exact';
+	}
+	return url.pathname === '/' && url.search === '' && url.hash === '' ? 'trailing-slash' : 'exact';
+}
+
 /** Helper to try parsing the response as authorization server metadata */
 async function tryParseAuthServerMetadata(response: CommonResponse): Promise<IAuthorizationServerMetadata | undefined> {
 	if (response.status !== 200) {

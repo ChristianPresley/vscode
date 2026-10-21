@@ -3,7 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { fetchAuthorizationServerMetadata } from '../../../../../../base/common/oauth.js';
+import { fetchAuthorizationServerMetadata, IAuthorizationServerMetadata, issuerMatches, issuerToleranceForIdentifier, OAuthIssuerMismatchError } from '../../../../../../base/common/oauth.js';
+import { assertSecureOAuthEndpoint } from '../../../../../../base/common/oauthClient.js';
 import { SequencerByKey } from '../../../../../../base/common/async.js';
 import { CancellationError, isCancellationError } from '../../../../../../base/common/errors.js';
 import { match } from '../../../../../../base/common/glob.js';
@@ -1096,6 +1097,29 @@ function getMcpAuthenticationOperations(authenticationService: IAuthenticationSe
 	return operations;
 }
 
+/**
+ * The rules of the MCP transport's authorization discovery (`OAuthClient`) for the metadata a
+ * dynamic provider is created from: its `issuer` is the authorization server (RFC 8414 section
+ * 3.3; for a bare origin with or without its trailing slash, which a `URI` adds), and the
+ * endpoints that receive credentials are HTTPS or loopback. The registration endpoint is checked
+ * where the provider registers, before anything is sent there.
+ */
+function validateMcpAuthorizationServerMetadata(identifier: string, metadata: IAuthorizationServerMetadata, discoveryUrl: string): void {
+	if (!issuerMatches(metadata.issuer, identifier, issuerToleranceForIdentifier(identifier))) {
+		throw new OAuthIssuerMismatchError(identifier, metadata.issuer, discoveryUrl);
+	}
+	const endpoints: Array<[string | undefined, string]> = [
+		[metadata.authorization_endpoint, 'authorization endpoint'],
+		[metadata.token_endpoint, 'token endpoint'],
+		[metadata.device_authorization_endpoint, 'device authorization endpoint'],
+	];
+	for (const [endpoint, what] of endpoints) {
+		if (endpoint !== undefined) {
+			assertSecureOAuthEndpoint(endpoint, what);
+		}
+	}
+}
+
 function isGitHubMcpResource(resource: ProtectedResourceMetadata): boolean {
 	return resource.resource_name === 'GitHub MCP Server';
 }
@@ -1146,7 +1170,11 @@ async function getOrCreateProviderForMcpResource(
 	}
 
 	try {
-		const { metadata } = await authorizationServerMetadataFetcher(authorizationServer.toString(true));
+		const identifier = authorizationServer.toString(true);
+		// Metadata fetched in cleartext could name any endpoints: the authorization server follows the endpoint rule too.
+		assertSecureOAuthEndpoint(identifier, 'authorization server');
+		const { metadata, discoveryUrl } = await authorizationServerMetadataFetcher(identifier);
+		validateMcpAuthorizationServerMetadata(identifier, metadata, discoveryUrl);
 		const provider = await authenticationService.createDynamicAuthenticationProvider(authorizationServer, metadata, protectedResource, clientId, clientSecret);
 		return provider?.id;
 	} catch (err) {

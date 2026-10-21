@@ -9,7 +9,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/tes
 import { URI } from '../../../../../base/common/uri.js';
 import { AuthenticationAccessService } from '../../browser/authenticationAccessService.js';
 import { AuthenticationService } from '../../browser/authenticationService.js';
-import { AuthenticationProviderInformation, AuthenticationSessionsChangeEvent, IAuthenticationProvider } from '../../common/authentication.js';
+import { AuthenticationProviderInformation, AuthenticationSessionsChangeEvent, IAuthenticationProvider, IDynamicAuthenticationProviderOptions } from '../../common/authentication.js';
 import { TestEnvironmentService } from '../../../../test/browser/workbenchTestServices.js';
 import { TestExtensionService, TestProductService, TestStorageService } from '../../../../test/common/workbenchTestServices.js';
 import { NullLogService } from '../../../../../platform/log/common/log.js';
@@ -128,6 +128,23 @@ suite('AuthenticationService', () => {
 
 			// Assert that the retrieved provider is the same as the registered provider
 			assert.deepEqual(retrievedProvider, provider);
+		});
+
+		test('createDynamicAuthenticationProvider hands the PKCE policy to the host delegate', async () => {
+			const received: Array<IDynamicAuthenticationProviderOptions | undefined> = [];
+			disposables.add(authenticationService.registerAuthenticationProviderHostDelegate({
+				priority: 1,
+				create: async (authorizationServer, _serverMetadata, _resource, _clientId, _clientSecret, options) => {
+					received.push(options);
+					const provider = createProvider({ id: `${authorizationServer.toString(true)}#${received.length}` });
+					authenticationService.registerAuthenticationProvider(provider.id, provider);
+					return provider.id;
+				},
+			}));
+			const metadata = { issuer: 'https://as.example', response_types_supported: ['code'] };
+			const strict = await authenticationService.createDynamicAuthenticationProvider(URI.parse('https://as.example'), metadata, undefined, undefined, undefined, { requireAdvertisedPkce: true });
+			const lenient = await authenticationService.createDynamicAuthenticationProvider(URI.parse('https://as.example'), metadata, undefined);
+			assert.deepStrictEqual({ received, dynamic: [strict, lenient].map(p => p && authenticationService.isDynamicAuthenticationProvider(p.id)) }, { received: [{ requireAdvertisedPkce: true }, undefined], dynamic: [true, true] });
 		});
 
 		test('getOrActivateProviderIdForServer - should return undefined when no provider matches the authorization server', async () => {

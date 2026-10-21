@@ -6,6 +6,7 @@
 import { IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata } from '../../../base/common/oauth.js';
 import { IOAuthClientOptions, IOAuthClientStorage, IOAuthFetch, IOAuthRegistrationOptions, OAuthAuthorizeStrategy, OAuthClient, OAuthLogLevel, selectScopes } from '../../../base/common/oauthClient.js';
 import { IMcpRemoteServerOAuthConfiguration } from '../../../platform/mcp/common/mcpPlatformTypes.js';
+import { WORKBENCH_ONLY_SESSION_OPTION_PREFIX } from '../../services/authentication/common/authentication.js';
 
 /**
  * The one rule set of VS Code's MCP authorization clients. The extension-host
@@ -32,6 +33,23 @@ export interface IMcpOAuthServerPolicy {
 	/** The issuer pre-registered credentials are bound to, when configured. */
 	readonly authorizationServer?: string;
 }
+
+/**
+ * The session option with which the workbench hands a server's `oauth.allowInsecureHttp` to the
+ * enterprise-managed (XAA) provider, whose resource authorization server endpoints then follow the
+ * same rule as the transport's discovery, and to a dynamic provider, which may then register anew
+ * or use a device authorization endpoint over plain HTTP for that request. Extensions cannot set
+ * it: workbench-only options are removed from their requests.
+ */
+export const MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION = `${WORKBENCH_ONLY_SESSION_OPTION_PREFIX}McpOAuthAllowInsecureHttp`;
+
+/**
+ * The session option with which the workbench asks a dynamic provider to refuse, for that request,
+ * an authorization server that does not advertise PKCE `S256` (the rule for mcp.json servers): a
+ * provider is shared with callers whose rule may differ. Workbench-only, like
+ * {@link MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION}.
+ */
+export const MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION = `${WORKBENCH_ONLY_SESSION_OPTION_PREFIX}McpOAuthRequireAdvertisedPkce`;
 
 /** Resolves the policy of a server: its `oauth` escape hatches over the defaults (PKCE required, HTTPS or loopback only). */
 export function resolveMcpOAuthPolicy(config: IMcpRemoteServerOAuthConfiguration | undefined, defaults: Partial<IMcpOAuthServerPolicy> = {}): IMcpOAuthServerPolicy {
@@ -113,41 +131,19 @@ export function selectMcpAuthorizationScopes(input: IMcpAuthorizationScopesInput
 	return [];
 }
 
-/** A client secret as stored for a pre-registered client, bound to the issuer it was first used with. */
-export interface IMcpStoredClientSecret {
-	readonly clientSecret?: string;
-	/** The issuer the credentials were bound to; `undefined` until their first successful use. */
-	readonly issuer?: string;
-}
-
 /**
- * Reads a stored client secret: `{ clientSecret, issuer }` JSON, or (as written
- * by older versions and the *Set Client Secret* code lens) the bare secret,
- * which is not bound to an issuer yet.
+ * The scopes earlier versions requested where {@link selectMcpAuthorizationScopes}
+ * now requests none: a server with protected resource metadata that declares
+ * no `scopes_supported` and did not challenge for scopes used to get the
+ * authorization server's `scopes_supported`, and its sessions were stored
+ * with them. `undefined` for every other server.
  */
-export function parseStoredClientSecret(value: string | undefined): IMcpStoredClientSecret | undefined {
-	if (value === undefined || value.length === 0) {
+export function previousMcpAuthorizationFallbackScopes(input: IMcpAuthorizationScopesInput): string[] | undefined {
+	if (!input.resourceMetadata || input.challengeScopes?.length || input.resourceMetadata.scopes_supported !== undefined || !input.serverMetadata.scopes_supported?.length) {
 		return undefined;
 	}
-	if (value.startsWith('{')) {
-		try {
-			const parsed: unknown = JSON.parse(value);
-			if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-				const record = parsed as { readonly clientSecret?: unknown; readonly issuer?: unknown };
-				const issuer = typeof record.issuer === 'string' ? record.issuer : undefined;
-				const clientSecret = typeof record.clientSecret === 'string' ? record.clientSecret : undefined;
-				if (Object.prototype.hasOwnProperty.call(parsed, 'issuer') || Object.prototype.hasOwnProperty.call(parsed, 'clientSecret')) {
-					return { clientSecret, issuer };
-				}
-			}
-		} catch {
-			// a bare secret that happens to start with a brace
-		}
-	}
-	return { clientSecret: value };
+	return [...input.serverMetadata.scopes_supported];
 }
 
-/** The stored form of {@link IMcpStoredClientSecret}. */
-export function serializeStoredClientSecret(secret: IMcpStoredClientSecret): string {
-	return JSON.stringify({ clientSecret: secret.clientSecret, issuer: secret.issuer });
-}
+/** How long one authorization metadata request (protected resource or authorization server metadata) may take. */
+export const MCP_OAUTH_METADATA_TIMEOUT_MS = 30_000;

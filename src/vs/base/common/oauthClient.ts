@@ -250,6 +250,8 @@ export interface IOAuthAcquireTokenRequest {
 export interface IOAuthAuthorizationCodeGrantRequest {
 	readonly serverMetadata: IAuthorizationServerMetadata;
 	readonly resource: string;
+	/** The `resource` value to send; {@link resourceIndicatorFor} of `resource` by default. */
+	readonly resourceIndicator?: string;
 	readonly registration: IOAuthRegistration;
 	readonly scopes?: readonly string[];
 }
@@ -257,6 +259,8 @@ export interface IOAuthAuthorizationCodeGrantRequest {
 export interface IOAuthRefreshRequest {
 	readonly serverMetadata: IAuthorizationServerMetadata;
 	readonly resource: string;
+	/** The `resource` value to send; {@link resourceIndicatorFor} of `resource` by default. */
+	readonly resourceIndicator?: string;
 	readonly registration: IOAuthRegistration;
 	readonly refreshToken: string;
 	/** The scopes of the token being refreshed, recorded when the server does not echo them. */
@@ -308,6 +312,52 @@ export function selectScopes(input: ISelectScopesInput): string[] | undefined {
 		selected.push(OFFLINE_ACCESS_SCOPE);
 	}
 	return selected.length > 0 ? selected : undefined;
+}
+
+/**
+ * The RFC 8707 `resource` value of the authorization and token requests for
+ * the resource whose canonical URI is `key`. The MCP authorization
+ * specification aligns the canonical server URI with the `resource` of the
+ * protected resource metadata (RFC 9728), so the `resource` the metadata
+ * publishes is sent as written when it names this resource (`key` or its
+ * origin), less any fragment (RFC 8707 section 2: the indicator MUST NOT
+ * include one). Without metadata it is `key`, but a bare origin goes without
+ * the trailing slash a URL parser adds (`https://mcp.example.com`, the form
+ * the specification recommends). Stored records and request limits stay keyed
+ * by `key`.
+ */
+export function resourceIndicatorFor(key: string, prmResource?: string): string {
+	const url = new URL(key);
+	if (prmResource !== undefined) {
+		try {
+			const named = canonicalResourceUri(prmResource);
+			if (named === key || named === canonicalResourceUri(url.origin)) {
+				// The fragment starts at the first `#` of a string that parses as a URL.
+				const hash = prmResource.indexOf('#');
+				return hash === -1 ? prmResource : prmResource.substring(0, hash);
+			}
+		} catch {
+			// Not a URL: the metadata does not name this resource.
+		}
+	}
+	return url.pathname === '/' && url.search === '' && key.endsWith('/') ? key.slice(0, -1) : key;
+}
+
+/**
+ * The endpoint rule of the authorization flow: a URL that receives
+ * credentials or client metadata, or that names the endpoints which do (an
+ * issuer), is HTTPS or loopback, unless plain HTTP is explicitly allowed
+ * (`allowInsecureHttp`, a development escape hatch).
+ */
+export function isSecureOAuthEndpoint(url: string, allowInsecureHttp = false): boolean {
+	return url.startsWith('https://') || allowInsecureHttp || isLoopbackUrl(url);
+}
+
+/** Throws an `insecure_endpoint` {@link OAuthClientError} for a URL that breaks the rule of {@link isSecureOAuthEndpoint}. */
+export function assertSecureOAuthEndpoint(url: string, what: string, allowInsecureHttp = false): void {
+	if (!isSecureOAuthEndpoint(url, allowInsecureHttp)) {
+		throw new OAuthClientError('insecure_endpoint', `The ${what} ${url} is not served over HTTPS`);
+	}
 }
 
 /** Extracts the first `Bearer` challenge of a `WWW-Authenticate` header. */
@@ -454,8 +504,10 @@ export class OAuthClient extends Disposable {
 	 * `resource_metadata`, then the path-based and root well-known protected
 	 * resource metadata (RFC 9728), then the selected authorization server's
 	 * metadata in the specification's discovery order with exact issuer
-	 * validation. Endpoints must be HTTPS (or loopback) and PKCE `S256` must
-	 * be advertised unless configured otherwise.
+	 * validation. The authorization server and its authorization and token
+	 * endpoints must be HTTPS (or loopback) and PKCE `S256` must be advertised
+	 * unless configured otherwise. A registration endpoint is checked only
+	 * where a client registers there.
 	 */
 	async discover(resource: string, wwwAuthenticate?: string, token: CancellationToken = CancellationToken.None): Promise<IOAuthDiscovery> {
 		const key = canonicalResourceUri(resource);
@@ -473,6 +525,8 @@ export class OAuthClient extends Disposable {
 			}
 			const record = await this.storage.get(key);
 			const authorizationServer = record && servers.includes(record.issuer) ? record.issuer : servers[0];
+			// Metadata fetched in cleartext could name any endpoints: the issuer follows the endpoint rule too.
+			this.assertSecureEndpoint(authorizationServer, 'authorization server');
 			const serverMetadata = await this.fetchServerMetadata(authorizationServer, signal);
 			this.validateServerMetadata(serverMetadata);
 			this.log('info', `discovered authorization server ${serverMetadata.issuer} for ${key} via ${prm.url}`);
@@ -487,6 +541,7 @@ export class OAuthClient extends Disposable {
 			throw new OAuthClientError('discovery_failed', `No protected resource metadata was found for ${key}`);
 		}
 		const origin = new URL(key).origin;
+		this.assertSecureEndpoint(origin, 'authorization server');
 		let serverMetadata: IAuthorizationServerMetadata;
 		let legacyDefaults = false;
 		try {
@@ -589,6 +644,17 @@ export class OAuthClient extends Disposable {
 		}
 	}
 
+	/**
+	 * The authorization and token endpoints are used by every flow, so they are
+	 * checked here. The registration endpoint is not: it is used only when a
+	 * client registers dynamically, and a client that is pre-registered or uses
+	 * a Client ID Metadata Document never contacts it, so it is checked where
+	 * it is used (here {@link selectRegistration}; the extension host's dynamic
+	 * authentication providers check it before they register). The same holds
+	 * for the device authorization endpoint, which only the extension host's
+	 * device code flow uses: it checks it, by the same rule, before its first
+	 * request.
+	 */
 	private validateServerMetadata(metadata: IAuthorizationServerMetadata): void {
 		if (!metadata.authorization_endpoint || !metadata.token_endpoint) {
 			throw new OAuthClientError('discovery_failed', `The authorization server ${metadata.issuer} does not publish an authorization and a token endpoint`);
@@ -601,10 +667,7 @@ export class OAuthClient extends Disposable {
 	}
 
 	private assertSecureEndpoint(url: string, what: string): void {
-		if (url.startsWith('https://') || this.options.allowInsecureHttp || isLoopbackUrl(url)) {
-			return;
-		}
-		throw new OAuthClientError('insecure_endpoint', `The ${what} ${url} is not served over HTTPS`);
+		assertSecureOAuthEndpoint(url, what, this.options.allowInsecureHttp);
 	}
 
 	private metadataFetcher(signal: AbortSignal): NonNullable<IFetchAuthorizationServerMetadataOptions['fetch']> {
@@ -635,6 +698,7 @@ export class OAuthClient extends Disposable {
 	 */
 	async acquireToken(request: IOAuthAcquireTokenRequest, token: CancellationToken = CancellationToken.None): Promise<IOAuthAuthorization> {
 		const key = canonicalResourceUri(request.resource);
+		const resourceIndicator = resourceIndicatorFor(key, request.resourceMetadata?.resource);
 		const { serverMetadata } = request;
 		let record = await this.reconcileIssuer(key, await this.storage.get(key), serverMetadata.issuer);
 		const scopes = selectScopes({
@@ -651,7 +715,7 @@ export class OAuthClient extends Disposable {
 			// A refresh never widens the grant, so it only helps when the scopes are known to be held.
 			if (record.refreshToken && this.scopesCovered(scopes, record.scopes, false)) {
 				try {
-					const refreshed = await this.refresh({ serverMetadata, resource: key, registration: this.registrationOf(record), refreshToken: record.refreshToken, scopes: record.scopes }, token);
+					const refreshed = await this.refresh({ serverMetadata, resource: key, resourceIndicator, registration: this.registrationOf(record), refreshToken: record.refreshToken, scopes: record.scopes }, token);
 					record = await this.persist(key, { ...record, ...refreshed });
 					return this.toAuthorization(record);
 				} catch (error) {
@@ -672,7 +736,7 @@ export class OAuthClient extends Disposable {
 				fromRecord = false;
 			}
 			try {
-				const result = await this.authorizationCodeGrant({ serverMetadata, resource: key, registration, scopes }, token);
+				const result = await this.authorizationCodeGrant({ serverMetadata, resource: key, resourceIndicator, registration, scopes }, token);
 				record = await this.persist(key, {
 					issuer: serverMetadata.issuer,
 					registrationKind: registration.kind,
@@ -712,6 +776,7 @@ export class OAuthClient extends Disposable {
 	 */
 	async authorizationCodeGrant(request: IOAuthAuthorizationCodeGrantRequest, token: CancellationToken = CancellationToken.None): Promise<IOAuthTokenResult> {
 		const key = canonicalResourceUri(request.resource);
+		const resourceIndicator = request.resourceIndicator ?? resourceIndicatorFor(key);
 		const { serverMetadata, registration } = request;
 		this.validateServerMetadata(serverMetadata);
 		const authorizationEndpoint = serverMetadata.authorization_endpoint!;
@@ -736,7 +801,7 @@ export class OAuthClient extends Disposable {
 			url.searchParams.set('code_challenge', pkce.challenge);
 			url.searchParams.set('code_challenge_method', 'S256');
 			url.searchParams.set('state', state);
-			url.searchParams.set('resource', key);
+			url.searchParams.set('resource', resourceIndicator);
 			if (request.scopes && request.scopes.length > 0) {
 				url.searchParams.set('scope', request.scopes.join(' '));
 			}
@@ -776,7 +841,7 @@ export class OAuthClient extends Disposable {
 				code: params.code,
 				redirect_uri: redirectUri,
 				code_verifier: pkce.verifier,
-				resource: key,
+				resource: resourceIndicator,
 			}, request.scopes, signal);
 		} finally {
 			store.dispose();
@@ -795,7 +860,7 @@ export class OAuthClient extends Disposable {
 		try {
 			const signal = CancellationToken.toAbortSignal(token, store);
 			this.log('info', `refreshing the token for ${key} at ${request.serverMetadata.issuer}`);
-			const result = await this.tokenRequest(tokenEndpoint, request.registration, { grant_type: 'refresh_token', refresh_token: request.refreshToken, resource: key }, request.scopes, signal);
+			const result = await this.tokenRequest(tokenEndpoint, request.registration, { grant_type: 'refresh_token', refresh_token: request.refreshToken, resource: request.resourceIndicator ?? resourceIndicatorFor(key) }, request.scopes, signal);
 			return { ...result, refreshToken: result.refreshToken ?? request.refreshToken };
 		} finally {
 			store.dispose();
@@ -855,8 +920,15 @@ export class OAuthClient extends Disposable {
 			}
 			return { kind: 'cimd', clientId: clientMetadataUrl, tokenEndpointAuthMethod: 'none' };
 		}
-		if (serverMetadata.registration_endpoint && dynamic !== false) {
-			this.assertSecureEndpoint(serverMetadata.registration_endpoint, 'registration endpoint');
+		const registrationEndpoint = dynamic !== false ? serverMetadata.registration_endpoint : undefined;
+		if (registrationEndpoint && !isSecureOAuthEndpoint(registrationEndpoint, this.options.allowInsecureHttp)) {
+			// As the extension host's providers do: a registration endpoint the client may not post its
+			// metadata to is skipped for the configured prompt; without one it is an `insecure_endpoint` error.
+			if (!prompt) {
+				this.assertSecureEndpoint(registrationEndpoint, 'registration endpoint');
+			}
+			this.log('warn', `the registration endpoint ${registrationEndpoint} is not served over HTTPS, asking for credentials`);
+		} else if (registrationEndpoint) {
 			const store = new DisposableStore();
 			try {
 				const signal = CancellationToken.toAbortSignal(token, store);

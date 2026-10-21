@@ -102,10 +102,36 @@ suite('LoopbackAuthServer - authorization response', () => {
 		const forged = await respond(() => 'code=the-code&state=someone-elses');
 		assert.deepStrictEqual([ok, denied, forged].map(r => ({ status: r.status, location: r.location, result: r.result })), [
 			{ status: 302, location: '/done', result: { code: 'the+code', state: ok.state, iss: 'https://as.example/', error: undefined, errorDescription: undefined } },
-			{ status: 302, location: `/done?error=${encodeURIComponent('Nope not today')}`, result: { code: undefined, state: denied.state, iss: 'https://as.example', error: 'access_denied', errorDescription: 'Nope not today' } },
-			// The caller rejects the mismatching state; the browser is told so.
-			{ status: 302, location: `/done?error=${encodeURIComponent('State does not match.')}`, result: { code: 'the-code', state: 'someone-elses', iss: undefined, error: undefined, errorDescription: undefined } },
+			// The browser learns only that sign-in did not complete: the issuer is not validated yet.
+			{ status: 302, location: '/done?error=1', result: { code: undefined, state: denied.state, iss: 'https://as.example', error: 'access_denied', errorDescription: 'Nope not today' } },
+			// The caller rejects the mismatching state.
+			{ status: 302, location: '/done?error=1', result: { code: 'the-code', state: 'someone-elses', iss: undefined, error: undefined, errorDescription: undefined } },
 		]);
+	});
+
+	test('the page never shows what the authorization server sent, only a generic failure message', async () => {
+		const server = new LoopbackAuthServer(new NullLogger(), URI.parse('vscode://dynamicauthprovider/as.example/redirect'), 'Test');
+		await server.start();
+		try {
+			const origin = server.redirectUri.replace(/\/$/, '');
+			const redirect = await fetch(`${server.redirectUri}?error=access_denied&error_description=${encodeURIComponent('<b>Call 555-0100 to unlock</b>')}&error_uri=${encodeURIComponent('https://evil.example/help')}&state=${encodeURIComponent(server.state)}&iss=${encodeURIComponent('https://evil.example')}`, { redirect: 'manual' });
+			await redirect.text();
+			const failedPage = await (await fetch(`${origin}${redirect.headers.get('location')}`)).text();
+			// A crafted page URL cannot inject text either.
+			const craftedPage = await (await fetch(`${origin}/done?error=${encodeURIComponent('Call 555-0100 to unlock')}`)).text();
+			const successPage = await (await fetch(`${origin}/done`)).text();
+			const shows = (html: string) => ({
+				authorizationServerText: ['555-0100', 'access_denied', 'evil.example'].some(text => html.includes(text)),
+				genericFailure: html.includes('Sign-in did not complete. Return to Test for details.') && html.includes('<body class="error">'),
+			});
+			assert.deepStrictEqual([shows(failedPage), shows(craftedPage), shows(successPage)], [
+				{ authorizationServerText: false, genericFailure: true },
+				{ authorizationServerText: false, genericFailure: true },
+				{ authorizationServerText: false, genericFailure: false },
+			]);
+		} finally {
+			await server.stop();
+		}
 	});
 
 	test('ignores a request that is neither a code nor an error', async () => {

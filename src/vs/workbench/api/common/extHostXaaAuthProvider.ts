@@ -5,8 +5,10 @@
 
 import type * as vscode from 'vscode';
 import { stringHash } from '../../../base/common/hash.js';
-import { buildIdJagExchangeBody, buildResourceRedemptionBody, fetchAuthorizationServerMetadata, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationTokenResponse, isAuthorizationTokenResponse } from '../../../base/common/oauth.js';
+import { buildIdJagExchangeBody, buildResourceRedemptionBody, fetchAuthorizationServerMetadata, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationTokenResponse, isLoopbackUrl, OAuthClientError, OAuthIssuerMismatchError } from '../../../base/common/oauth.js';
+import { localize } from '../../../nls.js';
 import { DynamicAuthProvider } from './extHostAuthentication.js';
+import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION } from './mcpOAuthClientFactory.js';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Ctor<T> = new (...args: any[]) => T;
@@ -52,6 +54,24 @@ export function isExpired(entry: { token: { expires_in?: number }; created_at: n
 }
 
 /**
+ * The endpoint rule of the transport's authorization discovery (`createAuthMetadata`, through
+ * the OAuth client's server metadata validation): a URL that receives credentials is HTTPS or
+ * loopback, unless the server's `oauth.allowInsecureHttp` allows plain HTTP; anything else is a
+ * terminal `insecure_endpoint` {@link OAuthClientError}.
+ */
+function assertSecureEndpoint(url: string, what: string, allowInsecureHttp: boolean): void {
+	if (url.startsWith('https://') || isLoopbackUrl(url) || (allowInsecureHttp && url.startsWith('http://'))) {
+		return;
+	}
+	throw new OAuthClientError('insecure_endpoint', localize('xaaInsecureEndpoint', "The {0} '{1}' is not served over HTTPS; the resource client credentials are not sent there.", what, url));
+}
+
+/** Whether the workbench asked for the server's `oauth.allowInsecureHttp` ({@link MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION}). */
+function allowsInsecureHttp(options: vscode.AuthenticationProviderSessionOptions): boolean {
+	return (options as Record<string, unknown>)[MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION] === true;
+}
+
+/**
  * (Preview) Mixin that turns a {@link DynamicAuthProvider} subclass into a
  * Cross App Access (XAA) / enterprise-managed authentication provider, per
  * `draft-ietf-oauth-identity-assertion-authz-grant`.
@@ -60,19 +80,21 @@ export function isExpired(entry: { token: { expires_in?: number }; created_at: n
  * the org-configured issuer, using the pre-registered client credentials. On
  * top of that:
  *
- *   1. `createSession` ensures an IdP session exists (delegated to the base
+ *   1. It discovers the resource's authorization server metadata (the audience
+ *      URL) first: an audience or token endpoint that is refused (issuer
+ *      mismatch, plain HTTP) ends the sign-in before the IdP is involved.
+ *   2. `createSession` ensures an IdP session exists (delegated to the base
  *      class with {@link IDP_SCOPES}).
- *   2. It POSTs to the IdP token endpoint with `grant_type=token-exchange`,
+ *   3. It POSTs to the IdP token endpoint with `grant_type=token-exchange`,
  *      `subject_token=<id_token>`, `subject_token_type=id_token`,
  *      `requested_token_type=id-jag`, `audience=<resource AS>`,
  *      `resource=<resource indicator>`, `scope=<requested scopes>` to mint an
  *      ID-JAG.
- *   3. It discovers the resource's authorization server metadata (the audience
- *      URL) and POSTs the ID-JAG to its token endpoint with
- *      `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`,
+ *   4. It POSTs the ID-JAG to the resource authorization server's token
+ *      endpoint with `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`,
  *      `assertion=<id-jag>`, `resource=<resource indicator>`,
  *      `scope=<requested scopes>` to obtain a resource-scoped access token.
- *   4. The resource-scoped token is cached in-memory per `(resource, scopes)`
+ *   5. The resource-scoped token is cached in-memory per `(resource, scopes)`
  *      and returned as the session's access token.
  *
  * The resource indicator is read from `options.resource` (RFC 8707) and the
@@ -161,6 +183,10 @@ export function XaaifyAuthProvider<TBase extends Ctor<DynamicAuthProvider>>(Base
 				throw new Error('Enterprise-managed authentication requires `options.resource` (the resource indicator / MCP server URL) but none was provided.');
 			}
 
+			// The resource authorization server first: the user does not sign in to the IdP, and nothing
+			// is sent to it, for an audience whose metadata or token endpoint is refused.
+			const resourceTokenEndpoint = await this._discoverResourceTokenEndpoint(audience, allowsInsecureHttp(options));
+
 			// Ensure IdP session via the base class (may interact). Don't pass the XAA options through —
 			// the IdP login leg is unrelated to the resource/audience, and the base provider would
 			// otherwise look for cached tokens scoped by a foreign audience.
@@ -169,7 +195,7 @@ export function XaaifyAuthProvider<TBase extends Ctor<DynamicAuthProvider>>(Base
 				throw new Error('IdP session is missing an id_token; the issuer must support OpenID Connect and the `openid` scope.');
 			}
 
-			const minted = await this._mintResourceToken(idpSession, scopes, audience, resource, options, /* silent */ false);
+			const minted = await this._mintResourceToken(idpSession, scopes, audience, resource, options, /* silent */ false, resourceTokenEndpoint);
 			if (!minted) {
 				// `silent=false` only returns undefined if the mint logic itself decided to bail.
 				// Today the only such path is missing resource client_secret, which prompts the user;
@@ -182,10 +208,12 @@ export function XaaifyAuthProvider<TBase extends Ctor<DynamicAuthProvider>>(Base
 		}
 
 		/**
-		 * Mints a resource-scoped access token by running legs 2-4 of the XAA flow:
+		 * Mints a resource-scoped access token by running the token legs of the XAA flow:
+		 *   1. Discover the resource AS token endpoint (unless `resourceTokenEndpoint` was
+		 *      discovered already); a refused audience or endpoint ends the mint before the IdP
+		 *      is contacted
 		 *   2. Exchange IdP id_token → ID-JAG (RFC 8693 token exchange at issuer)
-		 *   3. Discover the resource AS token endpoint
-		 *   4. Redeem the ID-JAG at the resource AS for an access token (RFC 7523 jwt-bearer grant)
+		 *   3. Redeem the ID-JAG at the resource AS for an access token (RFC 7523 jwt-bearer grant)
 		 *
 		 * When `silent` is true, this method MUST NOT prompt the user. If the resource AS uses a
 		 * distinct client_id (xaa.dev's "{client}-at-{resource}" pattern) and no client_secret can
@@ -200,12 +228,13 @@ export function XaaifyAuthProvider<TBase extends Ctor<DynamicAuthProvider>>(Base
 			resource: string,
 			options: vscode.AuthenticationProviderSessionOptions,
 			silent: boolean,
+			resourceTokenEndpoint?: string,
 		): Promise<IResourceCacheEntry | undefined> {
+			// Leg 1: resource AS token endpoint, before anything is sent to the IdP
+			resourceTokenEndpoint ??= await this._discoverResourceTokenEndpoint(audience, allowsInsecureHttp(options));
+
 			// Leg 2: id_token → ID-JAG
 			const jag = await this._exchangeForIdJag(idpSession.idToken!, audience, resource, scopes);
-
-			// Leg 3: resource AS token endpoint
-			const resourceTokenEndpoint = await this._discoverResourceTokenEndpoint(audience);
 
 			// Leg 4 prep: resolve the resource client_id.
 			// Per draft-ietf-oauth-identity-assertion-authz-grant section 3.2, the ID-JAG carries a
@@ -313,7 +342,7 @@ export function XaaifyAuthProvider<TBase extends Ctor<DynamicAuthProvider>>(Base
 			}
 			const body = buildIdJagExchangeBody(this._clientId, this._clientSecret, idToken, audience, resource, scopes);
 			this._logger.trace(`[XAA] POST ${tokenEndpoint} (ID-JAG exchange) audience=${audience} resource=${resource} scope=${scopes.join(' ')}`);
-			const response = await fetch(tokenEndpoint, {
+			const response = await this._fetch(tokenEndpoint, {
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/x-www-form-urlencoded',
@@ -334,10 +363,35 @@ export function XaaifyAuthProvider<TBase extends Ctor<DynamicAuthProvider>>(Base
 			return issued;
 		}
 
-		private async _discoverResourceTokenEndpoint(audience: string): Promise<string> {
-			const { metadata, errors } = await fetchAuthorizationServerMetadata(audience);
-			if (!metadata?.token_endpoint) {
-				throw new Error(`Failed to discover resource authorization server metadata for '${audience}': ${errors.map(e => e.message).join('; ') || 'no token_endpoint in metadata'}`);
+		/**
+		 * The token endpoint of the resource's authorization server. The resource client's
+		 * credentials go there, so only metadata whose `issuer` is exactly the audience is used
+		 * (RFC 8414 section 3.3); a document naming another issuer fails the sign-in. The audience
+		 * (whose metadata names the endpoint) and the endpoint must be HTTPS or loopback, as for
+		 * the transport's own discovery, unless the server's `oauth.allowInsecureHttp` allows plain HTTP.
+		 */
+		private async _discoverResourceTokenEndpoint(audience: string, allowInsecureHttp: boolean): Promise<string> {
+			assertSecureEndpoint(audience, localize('xaaResourceAuthorizationServer', "resource authorization server"), allowInsecureHttp);
+			let metadata: IAuthorizationServerMetadata;
+			try {
+				({ metadata } = await fetchAuthorizationServerMetadata(audience, { fetch: this._fetch, validateIssuer: true, issuerTolerance: 'exact' }));
+			} catch (error) {
+				const errors: unknown[] = error instanceof AggregateError ? error.errors : [error];
+				const mismatch = errors.find((e): e is OAuthIssuerMismatchError => e instanceof OAuthIssuerMismatchError);
+				if (mismatch) {
+					this._logger.error(`[XAA] Rejecting the resource authorization server metadata: ${mismatch.message}`);
+					throw mismatch;
+				}
+				throw new Error(`Failed to discover resource authorization server metadata for '${audience}': ${errors.map(e => e instanceof Error ? e.message : String(e)).join('; ')}`);
+			}
+			if (!metadata.token_endpoint) {
+				throw new Error(`Failed to discover resource authorization server metadata for '${audience}': no token_endpoint in metadata`);
+			}
+			try {
+				assertSecureEndpoint(metadata.token_endpoint, localize('xaaResourceTokenEndpoint', "resource token endpoint"), allowInsecureHttp);
+			} catch (error) {
+				this._logger.error(`[XAA] Rejecting the resource authorization server metadata of '${audience}': token_endpoint ${metadata.token_endpoint} is not HTTPS or loopback`);
+				throw error;
 			}
 			return metadata.token_endpoint;
 		}
@@ -345,7 +399,7 @@ export function XaaifyAuthProvider<TBase extends Ctor<DynamicAuthProvider>>(Base
 		private async _redeemAtResource(tokenEndpoint: string, idJag: string, resource: string, scopes: string[], resourceClientId: string, resourceClientSecret: string | undefined): Promise<IAuthorizationTokenResponse> {
 			const body = buildResourceRedemptionBody(resourceClientId, resourceClientSecret, idJag, resource, scopes);
 			this._logger.trace(`[XAA] POST ${tokenEndpoint} (ID-JAG redemption) client_id=${resourceClientId} resource=${resource} scope=${scopes.join(' ')}`);
-			const response = await fetch(tokenEndpoint, {
+			const response = await this._fetch(tokenEndpoint, {
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/x-www-form-urlencoded',

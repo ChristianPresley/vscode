@@ -8,7 +8,7 @@ import { decodeBase64 } from '../../common/buffer.js';
 import { CancellationTokenSource } from '../../common/cancellation.js';
 import { isCancellationError } from '../../common/errors.js';
 import { IAuthorizationServerMetadata, OAuthClientError, OAuthClientErrorCode } from '../../common/oauth.js';
-import { createHeadlessRedirectAuthorize, InMemoryOAuthClientStorage, IOAuthClientOptions, IOAuthClientRecord, IOAuthFetch, OAuthClient, parseBearerChallenge, redact, selectScopes } from '../../common/oauthClient.js';
+import { createHeadlessRedirectAuthorize, InMemoryOAuthClientStorage, IOAuthClientOptions, IOAuthClientRecord, IOAuthFetch, OAuthClient, parseBearerChallenge, redact, resourceIndicatorFor, selectScopes } from '../../common/oauthClient.js';
 import { bearerChallenge, createAuthorizationServerFixture, createFixtureRouter, createOAuthFixture, createResourceServerFixture, IFixtureResponse, IOAuthAuthorizationServerFixtureOptions } from './oauthClientFixture.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from './utils.js';
 
@@ -171,15 +171,20 @@ suite('OAuthClient', () => {
 		},
 		{
 			name: 'auth/metadata-var2', revisions: BOTH,
-			checks: ['authorization-server-metadata', 'authorization-server-metadata-wrong-path', 'client-registration', 'authorization-request', 'token-request'],
+			checks: ['authorization-server-metadata', 'authorization-server-metadata-wrong-path', 'client-registration', 'authorization-request', 'token-request', 'resource-parameter-matches-prm'],
 			run: async () => {
 				const fixture = createOAuthFixture({ as: { issuer: 'https://as.example.test/tenant1', trapRootMetadata: true }, rs: { prmLocation: 'root', prmInWwwAuthenticate: false } });
-				const { client } = createClient(fixture);
+				const { client, storage } = createClient(fixture);
 				assert.strictEqual((await call(client, fixture)).status, 200);
 				assert.deepStrictEqual(fixture.rs.prmRequests, ['/.well-known/oauth-protected-resource/mcp', '/.well-known/oauth-protected-resource'], 'path-based before root');
 				assert.deepStrictEqual(fixture.as.metadataRequests, ['/.well-known/oauth-authorization-server/tenant1'], 'path insertion for an issuer with a path');
 				assert.deepStrictEqual(fixture.as.violations, []);
-				assert.strictEqual(fixture.as.authorizationRequests[0].query.resource, fixture.resource, 'the resource indicator stays the MCP server URL although the metadata was found at the root');
+				// The root metadata names the bare origin: it is sent exactly as published, without the slash a URL parser adds.
+				const published = fixture.rs.metadata().resource;
+				assert.strictEqual(published, new URL(fixture.resource).origin);
+				assert.strictEqual(fixture.as.authorizationRequests[0].query.resource, published, 'the authorization request names the resource of the metadata');
+				assert.strictEqual(fixture.as.tokenRequests[0].body.resource, published, 'the token request names the resource of the metadata');
+				assert.ok(await storage.get(fixture.resource), 'the record stays keyed by the MCP server URL');
 			},
 		},
 		{
@@ -611,6 +616,70 @@ suite('OAuthClient', () => {
 			assert.ok(loopback.as.authorizationEndpoint.startsWith('http://localhost:3000/'));
 		});
 
+		test('a plain-HTTP authorization server fails discovery before anything is sent there, unless explicitly allowed', async () => {
+			// A plain-HTTP issuer whose metadata names HTTPS endpoints: whoever answers in cleartext picks the endpoints.
+			const withPlainIssuer = (): ReturnType<typeof createOAuthFixture> => {
+				const fixture = createOAuthFixture({ rs: { authorizationServers: ['http://as.example.test'] } });
+				fixture.router.handle('http://as.example.test', request => request.url.pathname === '/.well-known/oauth-authorization-server'
+					? { status: 200, body: { ...fixture.as.metadata(), issuer: 'http://as.example.test' } }
+					: undefined);
+				return fixture;
+			};
+			const refused = withPlainIssuer();
+			const error = await expectClientError(call(createClient(refused).client, refused), 'insecure_endpoint');
+			const allowed = withPlainIssuer();
+			const discovery = await createClient(allowed, { allowInsecureHttp: true }).client.discover(allowed.resource);
+			assert.deepStrictEqual({
+				message: error.message.includes('http://as.example.test') ? 'named' : 'unnamed',
+				cleartextRequests: refused.requests.filter(r => r.url.startsWith('http://as.example.test')).length,
+				registrations: refused.as.registrations.length,
+				allowed: `${discovery.serverMetadata.issuer} ${discovery.serverMetadata.registration_endpoint}`,
+			}, { message: 'named', cleartextRequests: 0, registrations: 0, allowed: 'http://as.example.test https://as.example.test/register' });
+		});
+
+		test('a plain-HTTP registration endpoint is refused only when the client registers there: discovery, pre-registered and client ID metadata document clients are unaffected', async () => {
+			// HTTPS authorization and token endpoints, but client metadata (and the secret in the response) would travel in cleartext.
+			const withPlainRegistration = (as: IOAuthAuthorizationServerFixtureOptions = {}): ReturnType<typeof createOAuthFixture> => {
+				const fixture = createOAuthFixture({ as: { clientIdMetadataDocumentSupported: false, ...as } });
+				fixture.router.handle(new URL(fixture.issuer).origin, request => request.url.pathname === '/.well-known/oauth-authorization-server'
+					? { status: 200, body: { ...fixture.as.metadata(), registration_endpoint: 'http://as.example.test/register' } }
+					: undefined);
+				return fixture;
+			};
+			const cleartext = (fixture: ReturnType<typeof createOAuthFixture>) => fixture.requests.filter(r => r.url.startsWith('http://')).length;
+			const outcomes: Record<string, string> = {};
+
+			const discovered = withPlainRegistration();
+			const discovery = await createClient(discovered).client.discover(discovered.resource);
+			outcomes.discovery = `${discovery.serverMetadata.issuer} ${discovery.serverMetadata.registration_endpoint}, ${cleartext(discovered)} cleartext requests`;
+
+			const preRegistered = withPlainRegistration({ clients: { 'pre-registered-client': { tokenEndpointAuthMethod: 'none' } }, requireKnownClient: true });
+			const status = (await call(createClient(preRegistered, { registration: { preRegistered: { clientId: 'pre-registered-client' } } }).client, preRegistered)).status;
+			outcomes.preRegistered = `${status}, ${cleartext(preRegistered)} cleartext requests, ${preRegistered.as.registrations.length} registrations`;
+
+			const cimd = withPlainRegistration({ clientIdMetadataDocumentSupported: true });
+			outcomes.cimd = `${(await call(createClient(cimd).client, cimd)).status}, ${cleartext(cimd)} cleartext requests, ${cimd.as.authorizationRequests[0]?.query.client_id}`;
+
+			const dynamic = withPlainRegistration();
+			const error = await expectClientError(call(createClient(dynamic).client, dynamic), 'insecure_endpoint', 'dynamic registration');
+			outcomes.dynamic = `${error.message.includes('http://as.example.test/register') ? 'named' : 'unnamed'}, ${cleartext(dynamic)} cleartext requests, ${dynamic.as.authorizationRequests.length} authorization requests`;
+
+			// With a configured prompt the client asks for credentials instead, as the extension host's providers do.
+			const prompted = withPlainRegistration({ clients: { 'typed-client': { tokenEndpointAuthMethod: 'none' } }, requireKnownClient: true });
+			let asked = 0;
+			const promptingClient = createClient(prompted, { registration: { prompt: async () => { asked++; return { clientId: 'typed-client' }; } } });
+			const promptedStatus = (await call(promptingClient.client, prompted)).status;
+			outcomes.prompted = `${promptedStatus}, asked ${asked}, ${cleartext(prompted)} cleartext requests, ${prompted.as.registrations.length} registrations, ${promptingClient.log.filter(line => line.startsWith('warn: the registration endpoint http://as.example.test/register is not served over HTTPS')).length} warning`;
+
+			assert.deepStrictEqual(outcomes, {
+				discovery: 'https://as.example.test http://as.example.test/register, 0 cleartext requests',
+				preRegistered: '200, 0 cleartext requests, 0 registrations',
+				cimd: `200, 0 cleartext requests, ${CIMD_URL}`,
+				dynamic: 'named, 0 cleartext requests, 0 authorization requests',
+				prompted: '200, asked 1, 0 cleartext requests, 0 registrations, 1 warning',
+			});
+		});
+
 		function escalatingResource(): ReturnType<typeof createOAuthFixture> {
 			let challenges = 0;
 			return createOAuthFixture({
@@ -797,6 +866,59 @@ suite('OAuthClient', () => {
 			assert.notStrictEqual(second.accessToken, first.accessToken);
 			assert.notStrictEqual(second.refreshToken, first.refreshToken, 'the rotated refresh token is stored');
 			assert.strictEqual(second.clientId, first.clientId, 'the registration is kept');
+		});
+
+		test('the resource indicator is the protected resource metadata\'s resource as published, else the server URL without the slash of a bare origin; records stay keyed by the canonical URI', async () => {
+			const sent = (fixture: ReturnType<typeof createOAuthFixture>) => [...fixture.as.authorizationRequests.map(r => `authorize ${r.query.resource}`), ...fixture.as.tokenRequests.map(r => `${r.body.grant_type} ${r.body.resource}`)];
+			const outcomes: Record<string, unknown> = {};
+
+			// A bare-origin server whose root metadata names the origin without a slash, or with one.
+			for (const prmResource of ['https://mcp.example.test', 'https://mcp.example.test/']) {
+				const fixture = createOAuthFixture({ rs: { resource: 'https://mcp.example.test', prmLocation: 'root', prmResource } });
+				const { client, storage } = createClient(fixture);
+				assert.strictEqual((await call(client, fixture)).status, 200);
+				outcomes[`published ${prmResource}`] = { sent: sent(fixture), stored: (await storage.get('https://mcp.example.test/')) !== undefined };
+			}
+
+			// Metadata that spells the host in capitals: sent as written.
+			const capitals = createOAuthFixture({ rs: { prmResource: 'https://MCP.example.test/mcp' } });
+			assert.strictEqual((await call(createClient(capitals).client, capitals)).status, 200);
+			outcomes.capitals = sent(capitals);
+
+			// Metadata whose resource carries a fragment: sent as written but without it (RFC 8707 section 2).
+			const fragment = createOAuthFixture({ rs: { prmResource: 'https://MCP.example.test/mcp#tools' } });
+			assert.strictEqual((await call(createClient(fragment).client, fragment)).status, 200);
+			outcomes.fragment = sent(fragment);
+			outcomes.fragmentHelper = [
+				resourceIndicatorFor('https://mcp.example.test/mcp', 'https://mcp.example.test/mcp#tools'),
+				resourceIndicatorFor('https://mcp.example.test/', 'https://mcp.example.test#tools'),
+				resourceIndicatorFor('https://mcp.example.test/', 'https://mcp.example.test/#'),
+				resourceIndicatorFor('https://mcp.example.test/mcp?x=1', 'https://mcp.example.test/mcp?x=1#a#b'),
+			];
+
+			// No metadata: the canonical URI, slash-less for a bare origin, in the grant and in the refresh.
+			let now = 1_000_000;
+			const noMetadata = createOAuthFixture({ as: { tokenLifetimeSeconds: 100 } });
+			const bare = createClient(noMetadata, { now: () => now, refreshMarginSeconds: 60 });
+			await bare.client.acquireToken({ serverMetadata: noMetadata.as.metadata(), resource: 'https://mcp.example.test' });
+			now += 50_000;
+			await bare.client.acquireToken({ serverMetadata: noMetadata.as.metadata(), resource: 'https://mcp.example.test/' });
+			outcomes.noMetadata = { sent: sent(noMetadata), stored: (await bare.storage.get('https://mcp.example.test/'))?.authorizationRequests };
+
+			// Metadata naming another resource (from a caller) is not used.
+			const foreign = createOAuthFixture();
+			await createClient(foreign).client.acquireToken({ serverMetadata: foreign.as.metadata(), resourceMetadata: { resource: 'https://other.example.test/mcp', authorization_servers: [foreign.issuer] }, resource: foreign.resource });
+			outcomes.foreign = sent(foreign);
+
+			assert.deepStrictEqual(outcomes, {
+				'published https://mcp.example.test': { sent: ['authorize https://mcp.example.test', 'authorization_code https://mcp.example.test'], stored: true },
+				'published https://mcp.example.test/': { sent: ['authorize https://mcp.example.test/', 'authorization_code https://mcp.example.test/'], stored: true },
+				capitals: ['authorize https://MCP.example.test/mcp', 'authorization_code https://MCP.example.test/mcp'],
+				fragment: ['authorize https://MCP.example.test/mcp', 'authorization_code https://MCP.example.test/mcp'],
+				fragmentHelper: ['https://mcp.example.test/mcp', 'https://mcp.example.test', 'https://mcp.example.test/', 'https://mcp.example.test/mcp?x=1'],
+				noMetadata: { sent: ['authorize https://mcp.example.test', 'authorization_code https://mcp.example.test', 'refresh_token https://mcp.example.test'], stored: 1 },
+				foreign: [`authorize ${foreign.resource}`, `authorization_code ${foreign.resource}`],
+			});
 		});
 
 		function rejectingResource(as: IOAuthAuthorizationServerFixtureOptions = {}): ReturnType<typeof createOAuthFixture> {
