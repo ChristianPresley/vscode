@@ -7,7 +7,7 @@ import * as proxyAgent from '@vscode/proxy-agent';
 import assert from 'assert';
 import * as fs from 'fs';
 import * as http2 from 'http2';
-import { createRequire } from 'node:module';
+import { createRequire } from 'module'; // not 'node:module': the Electron unit-test renderer maps built-ins by their unprefixed names
 import * as net from 'net';
 import * as os from 'os';
 import * as tls from 'tls';

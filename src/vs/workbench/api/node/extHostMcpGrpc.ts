@@ -5,7 +5,7 @@
 
 import * as proxyAgent from '@vscode/proxy-agent';
 import { readFile } from 'fs/promises';
-import { createRequire } from 'node:module';
+import { createRequire } from 'module'; // not 'node:module': the Electron unit-test renderer maps built-ins by their unprefixed names
 import { homedir } from 'os';
 import type * as netType from 'net';
 import type * as tlsType from 'tls';
