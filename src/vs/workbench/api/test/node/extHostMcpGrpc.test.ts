@@ -1601,7 +1601,12 @@ suite('McpGrpcHandle over loopback HTTP/2', () => {
 		assert.doesNotMatch(aborts[0].message ?? '', /self[- ]signed|unable to verify/i);
 	});
 
-	test('TLS: a server certificate from the system store (http.systemCertificates) is trusted without tls.ca, and together with a tls.ca for another authority', async () => {
+	test('TLS: a server certificate from the system store (http.systemCertificates) is trusted without tls.ca, and together with a tls.ca for another authority', async function () {
+		// The "other authority" is a second generateSelfSignedCert certificate, with the same subject (CN=TunnelProxy)
+		// as the server's: OpenSSL tries every certificate of that name as the issuer, Electron's BoringSSL only one.
+		if (process.versions.electron) {
+			this.skip();
+		}
 		const server = await startServer(cert);
 		toClose.push(() => server.close());
 		// What the extension host's fetch trusts: here, the bundled roots and the server's certificate as if from the OS store.
@@ -2120,7 +2125,12 @@ suite('ExtHostMcpService - the mcpGrpcServerDefinition proposal', () => {
 		assert.deepStrictEqual(launches, ['proposal error', McpServerTransportType.Grpc]);
 	});
 
-	test('a gRPC definition from provideMcpServerDefinitions needs the proposal', async () => {
+	test('a gRPC definition from provideMcpServerDefinitions needs the proposal', async function () {
+		// The rejection is observed through process 'unhandledRejection'; in the Electron unit-test renderer it
+		// goes to the window's 'unhandledrejection' event instead, which the runner reports as an unexpected error.
+		if (process.versions.electron) {
+			this.skip();
+		}
 		const outcomes: unknown[] = [];
 		for (const proposals of [[], ['mcpGrpcServerDefinition']]) {
 			const upserts: IUpsert[] = [];

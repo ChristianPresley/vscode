@@ -469,7 +469,11 @@ suite('MCP - GatewayDispatcher - Tasks extension', () => {
 		assert.strictEqual(textOf(bridged), 'Deleted b.txt', 'the input round is bridged as a server request');
 	});
 
-	test('a running task keeps nothing of the request that created it: its context, notify, stream and token can go', async () => {
+	test('a running task keeps nothing of the request that created it: its context, notify, stream and token can go', async function () {
+		// The Electron unit-test renderer has neither `gc` nor an in-process V8 inspector to force a collection.
+		if (process.versions.electron && typeof (globalThis as { gc?: unknown }).gc !== 'function') {
+			this.skip();
+		}
 		const release = new DeferredPromise<void>();
 		const bodyContexts: IMcpGatewayInvokeContext[] = [];
 		const invoker: IMcpGatewayTaskCapableInvoker = {
