@@ -281,16 +281,28 @@ export function apiTests(h: E2eHarness): ITestCase[] {
 		return grpcGateway;
 	};
 
-	/** Every server lists the tools of its family: not just some tools (a schema regression drops single ones). */
-	const assertRequiredTools = (labels: readonly string[]) => {
-		const missing: string[] = [];
-		for (const label of labels) {
+	/**
+	 * Every server lists the tools of its family: not just some tools (a schema regression drops
+	 * single ones). A server may add tools after the first tools/list and announce them with
+	 * notifications/tools/list_changed (server-everything registers trigger-sampling-request once it
+	 * has handled notifications/initialized, which can come after its answer to the first
+	 * tools/list: runs final-r2 and final-r3), so a missing tool is waited for up to 15 s, and the
+	 * tools that came late are recorded in the details.
+	 */
+	const assertRequiredTools = async (ctx: { details: Record<string, unknown> }, labels: readonly string[]) => {
+		const missingNow = () => labels.flatMap(label => {
 			const names = new Set(mcpToolsOf(label).map(mcpToolNameOf));
-			for (const tool of REQUIRED_TOOLS[h.server(label).family]) {
-				if (!names.has(tool)) {
-					missing.push(`${label}: ${tool}`);
-				}
-			}
+			return REQUIRED_TOOLS[h.server(label).family].filter(tool => !names.has(tool)).map(tool => `${label}: ${tool}`);
+		});
+		const late = missingNow();
+		const deadline = Date.now() + 15_000;
+		let missing = late;
+		while (missing.length && Date.now() < deadline) {
+			await sleep(250);
+			missing = missingNow();
+		}
+		if (late.length) {
+			ctx.details.lateTools = late.filter(t => !missing.includes(t));
 		}
 		assert(!missing.length, `tools missing from servers that started: ${JSON.stringify(missing)}`);
 	};
@@ -320,7 +332,7 @@ export function apiTests(h: E2eHarness): ITestCase[] {
 				ctx.details.outcomes = outcomes;
 				const broken = outcomes.filter(o => !h.server(o.label).grpc && (o.error || o.tools === 0));
 				assert(!broken.length, `servers without tools: ${JSON.stringify(broken)}`);
-				assertRequiredTools(outcomes.filter(o => !h.server(o.label).grpc).map(o => o.label));
+				await assertRequiredTools(ctx, outcomes.filter(o => !h.server(o.label).grpc).map(o => o.label));
 			},
 		},
 		{
@@ -331,7 +343,7 @@ export function apiTests(h: E2eHarness): ITestCase[] {
 				ctx.details.outcomes = outcomes;
 				const broken = outcomes.filter(o => o.error || o.tools === 0);
 				assert(!broken.length, `gRPC servers without tools: ${JSON.stringify(broken)}`);
-				assertRequiredTools(outcomes.map(o => o.label));
+				await assertRequiredTools(ctx, outcomes.map(o => o.label));
 			},
 		},
 

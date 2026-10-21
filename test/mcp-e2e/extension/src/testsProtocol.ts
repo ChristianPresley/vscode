@@ -6,7 +6,7 @@
 import * as vscode from 'vscode';
 import { mcpToolNameOf, mcpToolsOf } from './agent';
 import { definitionIdOf } from './config';
-import { E2eHarness } from './harness';
+import { E2eHarness, sleep } from './harness';
 import { canonicalJson, IHttpProxyEvent, ILoggedMessage, loggedMessages, responseTo, sentMethods, taskResultText, taskRunOf, taskStatusOf } from './mcpLog';
 import { assert, ITestCase } from './runner';
 import { errorText, expectToolText, invokeMcpTool, isCancellation, mutated, NEGOTIATED } from './testHelpers';
@@ -25,11 +25,24 @@ function requestsOf(events: readonly IHttpProxyEvent[]): IHttpProxyEvent[] {
 	return events.filter(e => e.event === 'request');
 }
 
-/** The log line VS Code writes, or a failure that shows the last error and state lines. */
-function logLine(log: string, pattern: RegExp, what: string): string {
-	const line = log.split('\n').find(l => pattern.test(l));
-	assert(line, `VS Code's MCP log has no line for ${what} (${pattern}); its last error and state lines: ${JSON.stringify(log.split('\n').filter(l => /\[(error|warning)\]|Connection state/.test(l)).slice(-5))}`);
-	return line.slice(0, 500);
+/**
+ * The line VS Code writes into the MCP log of `label` (after offset `from`), or a failure that
+ * shows the last error and state lines. The log file is flushed asynchronously: the line can
+ * land after the call that wrote it has settled (runs final-r1 and final-r3: the -32022 line was
+ * logged in the same millisecond as the answer, but the file had nothing yet 4 ms later), so it is
+ * polled for up to `timeoutMs`.
+ */
+async function logLine(h: E2eHarness, label: string, from: number, pattern: RegExp, what: string, timeoutMs = 10_000): Promise<string> {
+	const deadline = Date.now() + timeoutMs;
+	for (; ;) {
+		const log = h.serverLog(label).slice(from);
+		const line = log.split('\n').find(l => pattern.test(l));
+		if (line) {
+			return line.slice(0, 500);
+		}
+		assert(Date.now() < deadline, `VS Code's MCP log has no line for ${what} (${pattern}) within ${timeoutMs} ms; its last error and state lines: ${JSON.stringify(log.split('\n').filter(l => /\[(error|warning)\]|Connection state/.test(l)).slice(-5))}`);
+		await sleep(200);
+	}
 }
 
 function progressTest(h: E2eHarness, label: string): ITestCase {
@@ -97,8 +110,8 @@ export function protocolTests(h: E2eHarness): ITestCase[] {
 			fn: async ctx => {
 				const label = 'everything-sse';
 				await expectToolText(h, ctx, label, 'echo', { message: 'sse-legacy-ok' }, ['Echo: sse-legacy-ok']);
+				ctx.details.fallback = await logLine(h, label, 0, /\d{3} status sending message to \S+, will attempt to fall back to legacy SSE/, 'the fallback to legacy SSE');
 				const log = h.serverLog(label);
-				ctx.details.fallback = logLine(log, /\d{3} status sending message to \S+, will attempt to fall back to legacy SSE/, 'the fallback to legacy SSE');
 				const negotiated = NEGOTIATED.exec(log);
 				ctx.details.negotiated = negotiated?.[0];
 				assert(negotiated?.[1] === '2025-11-25' && negotiated[2] === 'legacy', `${label} negotiated ${negotiated?.[0]}`);
@@ -114,7 +127,7 @@ export function protocolTests(h: E2eHarness): ITestCase[] {
 				const call = await invokeMcpTool(h, ctx, FAULTS, 'test_audio_content', {});
 				assert(call.error !== undefined, `invokeTool resolved: ${JSON.stringify(call.text.slice(0, 200))}`);
 				assert(/does not declare for tools\/call: elicitation\.url/.test(errorText(call.error)), `invokeTool rejected with ${errorText(call.error)}`);
-				ctx.details.logLine = logLine(h.serverLog(FAULTS).slice(from), /The server requires client capabilities this client does not declare for tools\/call: elicitation\.url \(-32021: /, 'the -32021 error');
+				ctx.details.logLine = await logLine(h, FAULTS, from, /The server requires client capabilities this client does not declare for tools\/call: elicitation\.url \(-32021: /, 'the -32021 error');
 				assert(requestsOf(h.httpLog(FAULTS)).some(e => e.fault === 'missing-capability:test_audio_content' && e.status === 400), 'the proxy did not inject the -32021 answer');
 			},
 		},
@@ -147,8 +160,7 @@ export function protocolTests(h: E2eHarness): ITestCase[] {
 				const call = await invokeMcpTool(h, ctx, FAULTS, 'test_image_content', {});
 				assert(call.error !== undefined, `invokeTool resolved: ${JSON.stringify(call.text.slice(0, 200))}`);
 				assert(/-32022/.test(errorText(call.error)), `invokeTool rejected with ${errorText(call.error)}`);
-				const log = h.serverLog(FAULTS).slice(from);
-				ctx.details.logLine = logLine(log, /The server rejected tools\/call for the protocol revision 2026-07-28 \(-32022: .*\); it supports 2026-07-28/, 'the -32022 rejection');
+				ctx.details.logLine = await logLine(h, FAULTS, from, /The server rejected tools\/call for the protocol revision 2026-07-28 \(-32022: .*\); it supports 2026-07-28/, 'the -32022 rejection');
 				const methods = sentMethods(h.serverLog(FAULTS), from);
 				assert(!methods.includes('server/discover') && !methods.includes('initialize'), `VS Code renegotiated after a -32022 that offered only the revision in use: ${JSON.stringify(methods)}`);
 				await expectToolText(h, ctx, FAULTS, 'test_image_content', {}, ['image/png']);
@@ -185,7 +197,7 @@ export function protocolTests(h: E2eHarness): ITestCase[] {
 				const from = h.serverLog(RENEGOTIATE).length;
 				const httpFrom = h.httpLog(RENEGOTIATE).length;
 				await expectToolText(h, ctx, RENEGOTIATE, 'greet', { name: 'renegotiate' }, ['Hello, renegotiate!'], { require: false });
-				ctx.details.logLine = logLine(h.serverLog(RENEGOTIATE).slice(from), /The server only speaks MCP 2025-11-25; switching to the legacy handshake/, 'the switch to 2025-11-25');
+				ctx.details.logLine = await logLine(h, RENEGOTIATE, from, /The server only speaks MCP 2025-11-25; switching to the legacy handshake/, 'the switch to 2025-11-25');
 				const requests = requestsOf(h.httpLog(RENEGOTIATE).slice(httpFrom));
 				ctx.details.requests = requests.map(e => `${e.messages?.map(m => m.method).join(',')} ${e.status} ${e.fault ?? e.bridged ?? ''}`);
 				const fault = requests.findIndex(e => e.fault === 'version-legacy:greet');
