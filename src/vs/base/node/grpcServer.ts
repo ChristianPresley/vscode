@@ -19,10 +19,12 @@ import { Disposable, IDisposable, toDisposable } from '../common/lifecycle.js';
  * validation order of a call (`POST` else HTTP 405, an `application/grpc`
  * content type else HTTP 415, an unknown path or a compressed encoding
  * UNIMPLEMENTED, a refused `:authority` PERMISSION_DENIED, a malformed
- * `grpc-timeout` INVALID_ARGUMENT), the deadline, cancellation by
- * `RST_STREAM` or a lost connection, trailers-only responses and the
- * `RST_STREAM(NO_ERROR)` after a response that came before the end of the
- * request. Handlers see one {@link IGrpcServerCall} per stream.
+ * `grpc-timeout` INVALID_ARGUMENT), the deadline, the request-read timeout,
+ * the bound on what a call buffers for a client that does not read,
+ * cancellation by `RST_STREAM` or a lost connection, trailers-only
+ * responses and the `RST_STREAM(NO_ERROR)` after a response that came
+ * before the end of the request. Handlers see one {@link IGrpcServerCall}
+ * per stream.
  */
 
 export type GrpcServerLogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error';
@@ -40,6 +42,21 @@ export interface IGrpcServerOptions {
 	readonly idleTimeoutMs?: number;
 	/** How long {@link GrpcServer.close} lets open streams finish after GOAWAY before it drops the connections; defaults to 1 s. */
 	readonly shutdownGraceMs?: number;
+	/**
+	 * How long a call may take, from its headers, to deliver its complete
+	 * request message; defaults to 30 s, 0 waits forever. A call that is late
+	 * ends with DEADLINE_EXCEEDED. Independent of `grpc-timeout` and of the
+	 * idle timeout (which only counts connections without streams).
+	 */
+	readonly requestReadTimeoutMs?: number;
+	/**
+	 * The most response bytes one call keeps queued for a client that does
+	 * not read them (HTTP/2 flow control holds them back); defaults to
+	 * 16 MiB. A message that would queue more resets the stream with
+	 * `ENHANCE_YOUR_CALM`, which clients report as RESOURCE_EXHAUSTED, and
+	 * cancels the call.
+	 */
+	readonly maxBufferedSendBytes?: number;
 	/** The content type of responses; defaults to `application/grpc+proto`. */
 	readonly contentType?: string;
 	/**
@@ -84,7 +101,8 @@ export interface IGrpcServerCall {
 	/**
 	 * Sends one response message; the response headers go out with the
 	 * first. Returns false when the call has ended (or ends now, because the
-	 * message is over the send limit).
+	 * message is over the send limit, or because the client does not read
+	 * and the call's send buffer is full).
 	 */
 	sendMessage(payload: Uint8Array): boolean;
 	/**
@@ -103,6 +121,13 @@ const DEFAULT_MAX_CONCURRENT_STREAMS = 256;
 const DEFAULT_MAX_HEADER_LIST_BYTES = 8 * 1024;
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_SHUTDOWN_GRACE_MS = 1000;
+const DEFAULT_REQUEST_READ_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_BUFFERED_SEND_BYTES = 16 * 1024 * 1024;
+/**
+ * The longest delay a timer can wait (2^31-1 ms, about 24.8 days); Node
+ * fires a longer one after 1 ms.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 /** The connection-level receive window. */
 const LOCAL_WINDOW_SIZE = 4 * 1024 * 1024;
 /** The receive window of each stream. */
@@ -172,6 +197,8 @@ interface IResolvedServerOptions {
 	readonly maxHeaderListBytes: number;
 	readonly idleTimeoutMs: number;
 	readonly shutdownGraceMs: number;
+	readonly requestReadTimeoutMs: number;
+	readonly maxBufferedSendBytes: number;
 	readonly contentType: string;
 }
 
@@ -199,6 +226,8 @@ class GrpcServerCall implements IGrpcServerCall {
 	private headersSent = false;
 	private ended = false;
 	private deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+	/** Runs from the headers until the request message is complete ({@link IGrpcServerOptions.requestReadTimeoutMs}). */
+	private requestTimer: ReturnType<typeof setTimeout> | undefined;
 	private pendingTrailers: http2.OutgoingHttpHeaders | undefined;
 
 	constructor(
@@ -217,6 +246,17 @@ class GrpcServerCall implements IGrpcServerCall {
 		stream.on('end', () => this.onEnd());
 		stream.on('close', () => this.onClose());
 		stream.on('wantTrailers', () => this.onWantTrailers());
+
+		const readTimeoutMs = Math.min(options.requestReadTimeoutMs, MAX_TIMER_DELAY_MS);
+		if (readTimeoutMs > 0) {
+			this.requestTimer = setTimeout(() => {
+				this.requestTimer = undefined;
+				if (!this.ended && this.request === undefined) {
+					this.log('debug', `[grpc] ${this.path}: no complete request message within ${readTimeoutMs}ms`);
+					this.finish(GrpcStatus.DEADLINE_EXCEEDED, `The request message did not arrive within ${readTimeoutMs} ms`, undefined, 'cancelled');
+				}
+			}, readTimeoutMs);
+		}
 	}
 
 	get token(): CancellationToken {
@@ -227,9 +267,17 @@ class GrpcServerCall implements IGrpcServerCall {
 		return this.ended;
 	}
 
-	/** Starts the deadline of the call (from `grpc-timeout`). */
+	/**
+	 * Starts the deadline of the call (from `grpc-timeout`). A deadline
+	 * further away than a timer can wait (`3000000S`, the saturated
+	 * `99999999H`) is no deadline in practice: none is armed.
+	 */
 	armDeadline(timeoutMs: number): void {
 		this.timeoutMs = timeoutMs;
+		if (timeoutMs > MAX_TIMER_DELAY_MS) {
+			this.log('trace', `[grpc] ${this.path}: a deadline of ${timeoutMs}ms is beyond what a timer can wait, the call runs without one`);
+			return;
+		}
 		this.deadlineTimer = setTimeout(() => {
 			this.deadlineTimer = undefined;
 			if (!this.ended) {
@@ -258,12 +306,21 @@ class GrpcServerCall implements IGrpcServerCall {
 			this.finish(GrpcStatus.RESOURCE_EXHAUSTED, `Response message too large: ${payload.byteLength} bytes exceeds the limit of ${this.options.maxSendMessageBytes} bytes`, undefined, 'cancelled');
 			return false;
 		}
+		const framed = encodeLengthPrefixedMessage(payload);
+		const queued = this.stream.writableLength;
+		if (queued > 0 && queued + framed.byteLength > this.options.maxBufferedSendBytes) {
+			// Flow control holds the responses back: the client does not read (a listen
+			// stream would otherwise buffer without bound). Trailers would queue behind
+			// the data, so the stream is reset; clients report RESOURCE_EXHAUSTED.
+			this.log('warn', `[grpc] ${this.path}: the client does not read its responses (${queued} bytes queued, limit ${this.options.maxBufferedSendBytes} bytes); resetting the stream`);
+			this.reset(NGHTTP2_ENHANCE_YOUR_CALM);
+			return false;
+		}
 		try {
 			if (!this.headersSent) {
 				this.headersSent = true;
 				this.stream.respond({ ':status': 200, 'content-type': this.options.contentType }, { waitForTrailers: true });
 			}
-			const framed = encodeLengthPrefixedMessage(payload);
 			this.stream.write(Buffer.from(framed.buffer, framed.byteOffset, framed.byteLength));
 			return true;
 		} catch (error) {
@@ -283,7 +340,7 @@ class GrpcServerCall implements IGrpcServerCall {
 			return;
 		}
 		this.ended = true;
-		this.clearDeadline();
+		this.clearTimers();
 		try {
 			this.headersSent = true;
 			this.stream.respond({ ':status': httpStatus, ...headers }, { endStream: true });
@@ -294,12 +351,29 @@ class GrpcServerCall implements IGrpcServerCall {
 		this.settle('cancelled');
 	}
 
+	/** Ends the call with `RST_STREAM(code)` instead of a status (nothing more can reach the client) and cancels it. */
+	private reset(code: number): void {
+		if (this.ended) {
+			return;
+		}
+		this.ended = true;
+		this.clearTimers();
+		if (!this.stream.destroyed && !this.stream.closed) {
+			try {
+				this.stream.close(code);
+			} catch (error) {
+				this.log('debug', `[grpc] ${this.path}: could not reset the stream: ${errorMessage(error)}`);
+			}
+		}
+		this.settle('cancelled');
+	}
+
 	private finish(status: GrpcStatus, message: string | undefined, extra: Readonly<Record<string, string>> | undefined, outcome: CallOutcome): void {
 		if (this.ended) {
 			return;
 		}
 		this.ended = true;
-		this.clearDeadline();
+		this.clearTimers();
 		const statusHeaders: http2.OutgoingHttpHeaders = { 'grpc-status': String(status) };
 		if (message !== undefined && message.length > 0) {
 			statusHeaders['grpc-message'] = encodeGrpcMessage(truncateUtf8(message, GRPC_MESSAGE_MAX_BYTES));
@@ -347,16 +421,27 @@ class GrpcServerCall implements IGrpcServerCall {
 	 * RFC 9113 section 8.1: after a complete response, a request that has
 	 * not ended is stopped with `RST_STREAM(NO_ERROR)`; the client keeps
 	 * the response.
+	 *
+	 * The check runs on the next turn of the event loop: a handler usually
+	 * answers from the `data` event of the request message, before nghttp2
+	 * has processed the END_STREAM flag of the same DATA frame (and before
+	 * `end`), so checking at once would reset nearly every completed call,
+	 * which counts against the rapid-reset protection of clients
+	 * (CVE-2023-44487). An RST_STREAM submitted in the same tick would also
+	 * discard trailers just submitted (the client would see the messages but
+	 * no status).
 	 */
 	private resetAfterEarlyResponse(): void {
-		if (this.requestEnded || this.stream.destroyed || this.stream.closed) {
-			return;
-		}
-		try {
-			this.stream.close(NGHTTP2_NO_ERROR);
-		} catch (error) {
-			this.log('debug', `[grpc] ${this.path}: could not reset the stream: ${errorMessage(error)}`);
-		}
+		setImmediate(() => {
+			if (this.requestEnded || this.stream.destroyed || this.stream.closed) {
+				return;
+			}
+			try {
+				this.stream.close(NGHTTP2_NO_ERROR);
+			} catch (error) {
+				this.log('debug', `[grpc] ${this.path}: could not reset the stream: ${errorMessage(error)}`);
+			}
+		});
 	}
 
 	/** Releases the waiters, cancels the token when the handler did not end the call, and frees the token. */
@@ -376,10 +461,18 @@ class GrpcServerCall implements IGrpcServerCall {
 		}
 	}
 
-	private clearDeadline(): void {
+	private clearTimers(): void {
 		if (this.deadlineTimer !== undefined) {
 			clearTimeout(this.deadlineTimer);
 			this.deadlineTimer = undefined;
+		}
+		this.clearRequestTimer();
+	}
+
+	private clearRequestTimer(): void {
+		if (this.requestTimer !== undefined) {
+			clearTimeout(this.requestTimer);
+			this.requestTimer = undefined;
 		}
 	}
 
@@ -400,6 +493,7 @@ class GrpcServerCall implements IGrpcServerCall {
 				return;
 			}
 			this.request = message;
+			this.clearRequestTimer();
 			this.resolveRequest(message);
 		}
 	}
@@ -421,7 +515,7 @@ class GrpcServerCall implements IGrpcServerCall {
 	}
 
 	private onClose(): void {
-		this.clearDeadline();
+		this.clearTimers();
 		if (!this.ended) {
 			// RST_STREAM from the client, or the connection went away.
 			this.ended = true;
@@ -551,6 +645,8 @@ export class GrpcServer extends Disposable {
 			maxHeaderListBytes: options.maxHeaderListBytes ?? DEFAULT_MAX_HEADER_LIST_BYTES,
 			idleTimeoutMs: options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
 			shutdownGraceMs: options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS,
+			requestReadTimeoutMs: options.requestReadTimeoutMs ?? DEFAULT_REQUEST_READ_TIMEOUT_MS,
+			maxBufferedSendBytes: options.maxBufferedSendBytes ?? DEFAULT_MAX_BUFFERED_SEND_BYTES,
 			contentType: options.contentType ?? DEFAULT_CONTENT_TYPE,
 		};
 		this.logFn = options.log ?? (() => { });

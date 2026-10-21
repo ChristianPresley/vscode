@@ -6,11 +6,13 @@
 import assert from 'assert';
 import * as http2 from 'http2';
 import { DeferredPromise, timeout } from '../../common/async.js';
+import { Emitter, Event } from '../../common/event.js';
 import { encodeLengthPrefixedMessage } from '../../common/grpc/lpm.js';
 import { GrpcStatus, decodeGrpcMessage } from '../../common/grpc/status.js';
 import { GrpcChannel, GrpcCallError, IGrpcCall } from '../../node/grpcChannel.js';
 import { GrpcCallHandler, GrpcServer, IGrpcServerCall, IGrpcServerOptions, truncateUtf8 } from '../../node/grpcServer.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../common/utils.js';
+import { Http2FrameType, startHttp2FrameProxy } from './http2FrameProxy.js';
 
 const { NGHTTP2_NO_ERROR, NGHTTP2_ENHANCE_YOUR_CALM } = http2.constants;
 const PATH = '/test.Service/Echo';
@@ -251,6 +253,48 @@ suite('GrpcServer', () => {
 		assert.strictEqual(called, 2);
 	});
 
+	test('2,000 sequential calls on one channel, answered with messages or trailers-only: no RST_STREAM in either direction, one connection', async function () {
+		this.timeout(60_000);
+		const { server, port } = await startServer(async call => {
+			const request = await call.readRequest();
+			if (!request) {
+				return;
+			}
+			if (fromBytes(request) === 'message') {
+				call.sendMessage(request);
+				call.end(GrpcStatus.OK);
+			} else {
+				// An error before any message, or the empty answer to a notification: a trailers-only response.
+				call.end(fromBytes(request) === 'error' ? GrpcStatus.NOT_FOUND : GrpcStatus.OK, 'trailers only');
+			}
+		});
+		const proxy = await startHttp2FrameProxy(port);
+		try {
+			const channel = store.add(new GrpcChannel({ authority: `127.0.0.1:${proxy.port}`, secure: false }));
+			const kinds = ['message', 'error', 'empty'];
+			const failures: string[] = [];
+			for (let i = 0; i < 2000 && failures.length === 0; i++) {
+				const kind = kinds[i % kinds.length];
+				const call = channel.call(PATH, {}, text(kind));
+				await collect(call).catch(() => undefined);
+				const trailers = await call.trailers;
+				if (trailers.status !== (kind === 'error' ? GrpcStatus.NOT_FOUND : GrpcStatus.OK)) {
+					failures.push(`call ${i} (${kind}): ${trailers.status} ${trailers.message}`);
+				}
+			}
+			await timeout(20); // a deferred reset would have gone out by now
+			const resets = (frames: readonly { type: number }[]) => frames.filter(f => f.type === Http2FrameType.RstStream).length;
+			assert.deepStrictEqual({
+				failures,
+				connections: server.connectionCount,
+				resetsFromClient: resets(proxy.fromClient),
+				resetsFromServer: resets(proxy.fromServer),
+			}, { failures: [], connections: 1, resetsFromClient: 0, resetsFromServer: 0 });
+		} finally {
+			await proxy.close();
+		}
+	});
+
 	test('a response message over the send limit is RESOURCE_EXHAUSTED', async () => {
 		let sent: boolean | undefined;
 		const { port } = await startServer(async call => {
@@ -291,6 +335,111 @@ suite('GrpcServer', () => {
 
 		const invalid = await rawCall(port, { headers: { 'grpc-timeout': 'soon' }, body: framed(text('x')) });
 		assert.strictEqual(statusOf(invalid), String(GrpcStatus.INVALID_ARGUMENT));
+	});
+
+	test('a grpc-timeout beyond what a timer can wait arms no deadline (3000000S, 99999999H)', async () => {
+		const seen: (number | undefined)[] = [];
+		const handlers: Promise<void>[] = [];
+		const { port } = await startServer(call => {
+			const handler = (async () => {
+				await call.readRequest();
+				seen.push(call.timeoutMs);
+				call.sendMessage(text('first'));
+				// Node fires a timer over 2^31-1 ms after 1 ms: the call would be over by now.
+				await timeout(50);
+				if (!call.isEnded) {
+					call.sendMessage(text('second'));
+					call.end(GrpcStatus.OK);
+				}
+			})();
+			handlers.push(handler);
+			return handler;
+		});
+		for (const value of ['3000000S', '99999999H']) {
+			const outcome = await rawCall(port, { headers: { 'grpc-timeout': value }, body: framed(text('x')) });
+			assert.strictEqual(statusOf(outcome), String(GrpcStatus.OK), value);
+			assert.strictEqual(outcome.body.byteLength, (5 + 5) + (5 + 6), 'both messages');
+		}
+		assert.deepStrictEqual(seen, [3_000_000_000, 99_999_999 * 3_600_000]);
+		// A deadline a timer can wait still applies.
+		const short = await rawCall(port, { headers: { 'grpc-timeout': '20m' }, body: framed(text('x')) });
+		assert.strictEqual(statusOf(short), String(GrpcStatus.DEADLINE_EXCEEDED));
+		await Promise.all(handlers);
+	});
+
+	test('a call that does not deliver its request message in time is DEADLINE_EXCEEDED', async () => {
+		const read: (string | undefined)[] = [];
+		let cancelled = 0;
+		const { port } = await startServer(async call => {
+			store.add(call.token.onCancellationRequested(() => cancelled++));
+			const request = await call.readRequest();
+			read.push(request === undefined ? undefined : fromBytes(request));
+			if (request) {
+				// The message is in: the request-read timer no longer runs, even though the request stays open.
+				await timeout(150);
+				call.sendMessage(text('late but fine'));
+				call.end(GrpcStatus.OK);
+			}
+		}, { requestReadTimeoutMs: 50 });
+
+		const noBody = await rawCall(port, { keepOpen: true });
+		assert.strictEqual(statusOf(noBody), String(GrpcStatus.DEADLINE_EXCEEDED));
+		assert.match(decodeGrpcMessage(String(noBody.headers['grpc-message'])), /did not arrive within 50 ms/);
+		assert.strictEqual(noBody.rstCode, NGHTTP2_NO_ERROR, 'the open request is reset with NO_ERROR after the response');
+
+		const partial = await rawCall(port, { body: framed(text('abc')).subarray(0, 6), keepOpen: true });
+		assert.strictEqual(statusOf(partial), String(GrpcStatus.DEADLINE_EXCEEDED));
+		assert.deepStrictEqual(read, [undefined, undefined]);
+		assert.strictEqual(cancelled, 2);
+
+		const complete = await rawCall(port, { body: framed(text('in time')), keepOpen: true });
+		assert.strictEqual(statusOf(complete), String(GrpcStatus.OK));
+		assert.strictEqual(complete.body.subarray(5).toString(), 'late but fine');
+		assert.deepStrictEqual(read, [undefined, undefined, 'in time']);
+		assert.strictEqual(cancelled, 2);
+	});
+
+	test('a client that stops reading gets its stream reset once the send buffer is full; one that reads gets everything', async () => {
+		const chunk = new Uint8Array(32 * 1024).fill(0x61);
+		const results: { sent: number; ended: boolean; cancelled: boolean }[] = [];
+		const done = new Emitter<void>();
+		store.add(done);
+		const { port } = await startServer(async call => {
+			await call.readRequest();
+			let sent = 0;
+			while (sent < 20 && call.sendMessage(chunk)) {
+				sent++;
+				await timeout(5);
+			}
+			if (!call.isEnded) {
+				call.end(GrpcStatus.OK);
+			}
+			results.push({ sent, ended: call.isEnded, cancelled: call.token.isCancellationRequested });
+			done.fire();
+		}, { maxBufferedSendBytes: 256 * 1024 });
+
+		// The client reads nothing: HTTP/2 flow control stops the server after the stream window (64 KiB).
+		const session = http2.connect(`http://127.0.0.1:${port}`);
+		try {
+			const stalled = session.request({ ':method': 'POST', ':path': PATH, 'content-type': 'application/grpc', 'te': 'trailers' });
+			stalled.on('error', () => { /* reported by rstCode */ });
+			stalled.end(framed(text('x')));
+			const finished = Event.toPromise(done.event);
+			const rstCode = await new Promise<number>(resolve => stalled.once('close', () => resolve(stalled.rstCode ?? -1)));
+			await finished;
+			assert.strictEqual(rstCode, NGHTTP2_ENHANCE_YOUR_CALM, 'clients report RESOURCE_EXHAUSTED');
+			assert.ok(results[0].sent < 20 && results[0].sent >= 2, `stopped after the buffer filled: ${results[0].sent} messages`);
+			assert.deepStrictEqual([results[0].ended, results[0].cancelled], [true, true]);
+		} finally {
+			session.close();
+		}
+
+		const finished = Event.toPromise(done.event);
+		const reading = await rawCall(port, { body: framed(text('x')) });
+		await finished;
+		assert.strictEqual(statusOf(reading), String(GrpcStatus.OK));
+		assert.strictEqual(reading.body.byteLength, 20 * (5 + chunk.byteLength));
+		assert.deepStrictEqual(results[1], { sent: 20, ended: true, cancelled: false });
 	});
 
 	test('RST_STREAM from the client cancels the call', async () => {
