@@ -4,8 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { decodeBase64 } from '../../common/buffer.js';
-import { buildClientAuthentication, canonicalResourceUri, createPkcePair, fetchAuthorizationServerMetadata, fetchDynamicRegistration, IAuthorizationServerMetadata, isLoopbackUrl, issuerMatches, isValidClientMetadataUrl, OAuthClientError, OAuthIssuerMismatchError, parseAuthorizationRedirect, pkceSupported, selectRegistrationAuthMethod, selectTokenEndpointAuthMethod, validateIssuerParameter } from '../../common/oauth.js';
+import { decodeBase64, encodeBase64, VSBuffer } from '../../common/buffer.js';
+import { buildClientAuthentication, canonicalResourceUri, createPkcePair, encodeRandomBase64Url, fetchAuthorizationServerMetadata, fetchDynamicRegistration, IAuthorizationServerMetadata, isLoopbackUrl, issuerMatches, isValidClientMetadataUrl, OAuthClientError, OAuthIssuerMismatchError, parseAuthorizationRedirect, pkceSupported, selectRegistrationAuthMethod, selectTokenEndpointAuthMethod, validateIssuerParameter } from '../../common/oauth.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from './utils.js';
 
 suite('OAuth - 2026-07-28 protocol helpers', () => {
@@ -171,6 +171,14 @@ suite('OAuth - 2026-07-28 protocol helpers', () => {
 			const expected = await sha256(new TextEncoder().encode(pair.verifier));
 			const expectedChallenge = btoa(String.fromCharCode(...expected)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 			assert.strictEqual(pair.challenge, expectedChallenge);
+		});
+
+		test('encodeRandomBase64Url gives the base64url VSBuffer encoding without padding, for every length', () => {
+			for (let length = 0; length <= 40; length++) {
+				// Bytes that produce '+', '/' and padding in plain base64.
+				const bytes = new Uint8Array(length).map((_, i) => (i * 61 + 0xfb) % 256);
+				assert.strictEqual(encodeRandomBase64Url(bytes), encodeBase64(VSBuffer.wrap(bytes), false, true), `length ${length}`);
+			}
 		});
 	});
 });

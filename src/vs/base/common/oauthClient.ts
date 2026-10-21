@@ -4,7 +4,6 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { raceCancellationError } from './async.js';
-import { encodeBase64, VSBuffer } from './buffer.js';
 import { CancellationToken } from './cancellation.js';
 import { CancellationError, isCancellationError } from './errors.js';
 import { Emitter, Event } from './event.js';
@@ -14,6 +13,7 @@ import {
 	buildClientAuthentication,
 	canonicalResourceUri,
 	createPkcePair,
+	encodeRandomBase64Url,
 	fetchAuthorizationServerMetadata,
 	fetchDynamicRegistration,
 	getDefaultMetadataForUrl,
@@ -792,7 +792,7 @@ export class OAuthClient extends Disposable {
 		try {
 			const signal = CancellationToken.toAbortSignal(token, store);
 			const pkce = await createPkcePair(this.random, this.sha256);
-			const state = encodeBase64(VSBuffer.wrap(this.random(16)), false, true);
+			const state = encodeRandomBase64Url(this.random(16));
 			const redirectUri = this.options.redirectUris[0];
 			const url = new URL(authorizationEndpoint);
 			url.searchParams.set('response_type', 'code');

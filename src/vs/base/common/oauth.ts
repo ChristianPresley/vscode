@@ -1696,13 +1696,23 @@ export function pkceSupported(metadata: IAuthorizationServerMetadata): boolean {
 }
 
 /**
+ * Base64url without padding (RFC 4648 section 5) of random bytes, such as a
+ * PKCE verifier or an OAuth `state`. The bytes are encoded directly rather
+ * than wrapped in a VSBuffer, whose integer readers static analysis would
+ * otherwise treat as consumers of the random values.
+ */
+export function encodeRandomBase64Url(bytes: Uint8Array): string {
+	return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
  * Creates a PKCE verifier/challenge pair (RFC 7636): a 32-byte random
  * verifier and its `S256` challenge, both base64url without padding. The
  * randomness and hash primitives are injected so the helper stays
  * environment-neutral.
  */
 export async function createPkcePair(random: (bytes: number) => Uint8Array, sha256: (data: Uint8Array) => Promise<Uint8Array>): Promise<{ verifier: string; challenge: string }> {
-	const verifier = encodeBase64(VSBuffer.wrap(random(32)), false, true);
+	const verifier = encodeRandomBase64Url(random(32));
 	const digest = await sha256(new TextEncoder().encode(verifier));
 	const challenge = encodeBase64(VSBuffer.wrap(digest), false, true);
 	return { verifier, challenge };
