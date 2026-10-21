@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import type * as http from 'http';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { URI } from '../../../../base/common/uri.js';
 import { NullLogger } from '../../../../platform/log/common/log.js';
@@ -82,15 +83,31 @@ function appUriForAuthority(authority: string): URI {
 suite('LoopbackAuthServer - authorization response', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
 
+	/**
+	 * GETs a URL without following a redirect, as the browser's request reaches the server. Node's http rather
+	 * than fetch: in the Electron unit-test renderer a manual-redirect fetch hides the status and the headers.
+	 */
+	async function get(url: string): Promise<{ status: number; location: string | null; body: string }> {
+		const { get: httpGet } = await import('http');
+		return new Promise((resolve, reject) => {
+			// A fresh connection each time: a kept-alive one may belong to a server an earlier test stopped.
+			httpGet(url, { agent: false }, (res: http.IncomingMessage) => {
+				let body = '';
+				res.setEncoding('utf8');
+				res.on('data', chunk => body += chunk);
+				res.on('end', () => resolve({ status: res.statusCode ?? 0, location: res.headers.location ?? null, body }));
+			}).on('error', reject);
+		});
+	}
+
 	/** Starts a server, sends it one redirect and reports the browser's answer and what the caller would receive. */
 	async function respond(query: (state: string) => string): Promise<{ status: number; location: string | null; result: unknown; state: string }> {
 		const server = new LoopbackAuthServer(new NullLogger(), URI.parse('vscode://dynamicauthprovider/as.example/redirect'), 'Test');
 		await server.start();
 		try {
-			const response = await fetch(`${server.redirectUri}?${query(server.state)}`, { redirect: 'manual' });
-			await response.text();
+			const response = await get(`${server.redirectUri}?${query(server.state)}`);
 			const result = await Promise.race([server.waitForOAuthResponse(), new Promise(resolve => setTimeout(() => resolve('pending'), 50))]);
-			return { status: response.status, location: response.headers.get('location'), result, state: server.state };
+			return { status: response.status, location: response.location, result, state: server.state };
 		} finally {
 			await server.stop();
 		}
@@ -114,12 +131,11 @@ suite('LoopbackAuthServer - authorization response', () => {
 		await server.start();
 		try {
 			const origin = server.redirectUri.replace(/\/$/, '');
-			const redirect = await fetch(`${server.redirectUri}?error=access_denied&error_description=${encodeURIComponent('<b>Call 555-0100 to unlock</b>')}&error_uri=${encodeURIComponent('https://evil.example/help')}&state=${encodeURIComponent(server.state)}&iss=${encodeURIComponent('https://evil.example')}`, { redirect: 'manual' });
-			await redirect.text();
-			const failedPage = await (await fetch(`${origin}${redirect.headers.get('location')}`)).text();
+			const redirect = await get(`${server.redirectUri}?error=access_denied&error_description=${encodeURIComponent('<b>Call 555-0100 to unlock</b>')}&error_uri=${encodeURIComponent('https://evil.example/help')}&state=${encodeURIComponent(server.state)}&iss=${encodeURIComponent('https://evil.example')}`);
+			const failedPage = (await get(`${origin}${redirect.location}`)).body;
 			// A crafted page URL cannot inject text either.
-			const craftedPage = await (await fetch(`${origin}/done?error=${encodeURIComponent('Call 555-0100 to unlock')}`)).text();
-			const successPage = await (await fetch(`${origin}/done`)).text();
+			const craftedPage = (await get(`${origin}/done?error=${encodeURIComponent('Call 555-0100 to unlock')}`)).body;
+			const successPage = (await get(`${origin}/done`)).body;
 			const shows = (html: string) => ({
 				authorizationServerText: ['555-0100', 'access_denied', 'evil.example'].some(text => html.includes(text)),
 				genericFailure: html.includes('Sign-in did not complete. Return to Test for details.') && html.includes('<body class="error">'),
