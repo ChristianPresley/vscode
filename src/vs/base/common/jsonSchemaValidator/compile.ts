@@ -4,13 +4,23 @@
  *--------------------------------------------------------------------------------------------*/
 
 import type { IJsonSchemaCompileError, IJsonSchemaCompileOptions, JsonSchemaCompileErrorCode, JsonSchemaDialect } from './index.js';
-import { escapePointerToken, hasOwn, IKeywordCompileContext, isJsonObject, ISchemaDocument, ISchemaResource, JsonObject, parseKeywords, SchemaNode, unescapePointerToken } from './keywords.js';
+import { escapePointerToken, hasOwn, IGuardedPattern, IKeywordCompileContext, isJsonObject, ISchemaDocument, ISchemaResource, JsonObject, parseKeywords, SchemaNode, unescapePointerToken } from './keywords.js';
+import { analyzeRegexCost, estimateRegexCost, IRegexCost, MAX_DEGREE, regexStepBound } from './regexCost.js';
 
 export const DEFAULT_MAX_DEPTH = 32;
 export const DEFAULT_MAX_SUBSCHEMAS = 4096;
 export const DEFAULT_MAX_REF_HOPS = 64;
 export const DEFAULT_MAX_PATTERN_LENGTH = 4096;
 export const DEFAULT_EVAL_BUDGET = 100_000;
+/**
+ * The work the backtracking analysis of the patterns of one compilation may
+ * take (in the units of `analyzeRegexCost`, 10 to 50 ns each): about 0.1 s at
+ * most. 4096 distinct patterns of the usual kind (a semver, a date, a UUID)
+ * take about a million; one adversarial pattern of 4096 characters up to about
+ * 850 000 (the heaviest known: 2040 distinct characters, each with `*`), so a
+ * schema of a single pattern is always analyzed.
+ */
+export const DEFAULT_PATTERN_ANALYSIS_BUDGET = 2_000_000;
 
 /** Synthetic retrieval URI of the root schema; only used to resolve relative references. */
 const ROOT_DOCUMENT_URI = 'vscode-json-schema:///root';
@@ -35,19 +45,26 @@ export function dialectOfSchemaUri(uri: string): JsonSchemaDialect | undefined {
 export interface IDialectDetection {
 	readonly dialect?: JsonSchemaDialect;
 	readonly error?: IJsonSchemaCompileError;
+	/** Set when an unsupported `$schema` is tolerated (`unsupportedDialect: 'warn'`) and the default dialect is used instead. */
+	readonly warning?: IJsonSchemaCompileError;
 }
 
 /** Determines the dialect of a schema document from `$schema`, falling back to the configured default. */
 export function detectDialect(schema: unknown, options: IJsonSchemaCompileOptions | undefined, pathPrefix = ''): IDialectDetection {
+	const defaultDialect = options?.dialect ?? '2020-12';
 	if (isJsonObject(schema) && schema.$schema !== undefined) {
 		const value = schema.$schema;
 		const dialect = typeof value === 'string' ? dialectOfSchemaUri(value) : undefined;
 		if (!dialect) {
-			return { error: { code: 'unsupported-dialect', path: pathPrefix + '/$schema', message: `Unsupported JSON Schema dialect '${String(value)}'; supported are '${DIALECT_2020_12_URI}' and '${DIALECT_DRAFT_07_URI}#'` } };
+			const problem = { code: 'unsupported-dialect' as const, path: pathPrefix + '/$schema', message: `Unsupported JSON Schema dialect '${String(value)}'; supported are '${DIALECT_2020_12_URI}' and '${DIALECT_DRAFT_07_URI}#'` };
+			if (options?.unsupportedDialect === 'warn') {
+				return { dialect: defaultDialect, warning: { ...problem, message: `${problem.message}; validating as ${defaultDialect}` } };
+			}
+			return { error: problem };
 		}
 		return { dialect };
 	}
-	return { dialect: options?.dialect ?? '2020-12' };
+	return { dialect: defaultDialect };
 }
 
 //#endregion
@@ -99,14 +116,55 @@ function normalizeUri(uri: string): string {
 
 //#region Regular expression guard
 
+/** What the scan knows about the body of a group (at any depth). */
+interface IRegexGroupScan {
+	/** It contains an alternation (`|`). */
+	alternation: boolean;
+	/** It contains an unbounded quantifier (`*`, `+`, `{n,}`). */
+	unbounded: boolean;
+	/**
+	 * How many ways its bounded quantifiers can split a match (the product of
+	 * their numbers of repetition counts); 1 when its length is fixed.
+	 */
+	choices: number;
+}
+
 /**
- * Scans an ECMAScript pattern for constructs that are rejected regardless of
- * whether `RegExp` accepts them: back-references, lookbehind assertions and
- * nested unbounded quantifiers (e.g. `(a+)+`), which can cause catastrophic backtracking.
+ * The most ways a repeated group of varying, bounded length may split a
+ * match (e.g. `(\d{1,3}\.){3}` has 3^3 = 27); backtracking tries them all at
+ * every position.
+ */
+const MAX_REPEATED_GROUP_CHOICES = 256;
+
+/** The deepest nesting of groups (lookarounds included) the guard accepts; the cost analysis recurses into each. */
+const MAX_GROUP_NESTING = 64;
+
+/**
+ * Scans an ECMAScript pattern for constructs that are never compiled, whether
+ * or not `RegExp` accepts them: back-references, lookbehind assertions,
+ * groups nested more than {@link MAX_GROUP_NESTING} deep, and repetitions
+ * whose backtracking can explode. A single `RegExp.test` cannot
+ * be interrupted (no time budget reaches into it), so the guard refuses the
+ * repetitions it cannot prove linear rather than only those it can prove
+ * harmful: a repeated group with an alternation (e.g. `(a|a)*`, `(a|b){2}`),
+ * a repeated group of unbounded length (e.g. `(a+)+`, `(a*){2}`), a group of
+ * varying length repeated without bound (e.g. `(ab?)*`), and one repeated so
+ * often that it can split a match in more than
+ * {@link MAX_REPEATED_GROUP_CHOICES} ways (e.g. `(a{1,2}){9}`). A pattern
+ * with such a construct is not asserted. What the guard accepts can still
+ * backtrack polynomially (e.g. `a*a*`, `a*.{99999}`, or a long sequence tried
+ * at every position): {@link patternInputLimit} bounds the steps of one test
+ * of such a pattern and limits the strings it is tested on accordingly.
  */
 export function findUnsafeRegexConstruct(source: string): string | undefined {
-	const frames: { unbounded: boolean }[] = [{ unbounded: false }];
-	let lastClosedGroup: { unbounded: boolean } | undefined;
+	const newFrame = (): IRegexGroupScan => ({ alternation: false, unbounded: false, choices: 1 });
+	const frames: IRegexGroupScan[] = [newFrame()];
+	/** The group that just closed; the choices it adds to its parent depend on the quantifier that may follow. */
+	let lastClosedGroup: IRegexGroupScan | undefined;
+	const addLastClosedGroup = (choices = lastClosedGroup?.choices ?? 1) => {
+		frames[frames.length - 1].choices *= choices;
+		lastClosedGroup = undefined;
+	};
 	let inClass = false;
 	let i = 0;
 	while (i < source.length) {
@@ -131,50 +189,72 @@ export function findUnsafeRegexConstruct(source: string): string | undefined {
 				return 'named back-references are not supported';
 			}
 			i += 2;
-			lastClosedGroup = undefined;
+			addLastClosedGroup();
 			continue;
 		}
 		if (ch === '[') {
 			inClass = true;
 			i++;
-			lastClosedGroup = undefined;
+			addLastClosedGroup();
+			continue;
+		}
+		if (ch === '|') {
+			addLastClosedGroup();
+			frames[frames.length - 1].alternation = true;
+			i++;
 			continue;
 		}
 		if (ch === '(') {
 			if (source.startsWith('(?<=', i) || source.startsWith('(?<!', i)) {
 				return 'lookbehind assertions are not supported';
 			}
-			frames.push({ unbounded: false });
-			i++;
-			lastClosedGroup = undefined;
+			addLastClosedGroup();
+			frames.push(newFrame());
+			if (frames.length > MAX_GROUP_NESTING + 1) {
+				return `groups nested more than ${MAX_GROUP_NESTING} deep are not supported`;
+			}
+			// Skip the group prefix, whose `?` is not a quantifier: `(?:`, `(?=`, `(?!`, `(?<name>`, `(?ims-ims:`.
+			if (source[i + 1] !== '?') {
+				i++;
+			} else if (source[i + 2] === ':' || source[i + 2] === '=' || source[i + 2] === '!') {
+				i += 3;
+			} else {
+				const end = source.indexOf(source[i + 2] === '<' ? '>' : ':', i + 2);
+				i = end < 0 ? source.length : end + 1;
+			}
 			continue;
 		}
 		if (ch === ')') {
 			if (frames.length === 1) {
 				return undefined; // unbalanced; RegExp reports the syntax error
 			}
+			addLastClosedGroup();
 			const closed = frames.pop()!;
-			if (closed.unbounded) {
-				frames[frames.length - 1].unbounded = true;
-			}
+			const parent = frames[frames.length - 1];
+			parent.alternation ||= closed.alternation;
+			parent.unbounded ||= closed.unbounded;
 			lastClosedGroup = closed;
 			i++;
 			continue;
 		}
 		let quantifier = false;
-		let unbounded = false;
+		let min = 0;
+		let max = 0;
 		if (ch === '*' || ch === '+') {
 			quantifier = true;
-			unbounded = true;
+			min = ch === '*' ? 0 : 1;
+			max = Infinity;
 			i++;
 		} else if (ch === '?') {
 			quantifier = true;
+			max = 1;
 			i++;
 		} else if (ch === '{') {
 			const match = /^\{(\d+)(?:(,)(\d*))?\}/.exec(source.slice(i));
 			if (match) {
 				quantifier = true;
-				unbounded = match[2] !== undefined && match[3] === '';
+				min = Number(match[1]);
+				max = match[2] === undefined ? min : match[3] === '' ? Infinity : Number(match[3]);
 				i += match[0].length;
 			} else {
 				i++;
@@ -182,20 +262,186 @@ export function findUnsafeRegexConstruct(source: string): string | undefined {
 		} else {
 			i++;
 		}
-		if (quantifier) {
-			if (source[i] === '?') {
-				i++; // lazy modifier
+		if (!quantifier) {
+			addLastClosedGroup();
+			continue;
+		}
+		if (source[i] === '?') {
+			i++; // lazy modifier
+		}
+		const counts = max - min + 1; // Infinity for an unbounded quantifier
+		const group = lastClosedGroup;
+		if (group && max > 1) {
+			if (group.alternation) {
+				return 'a repeated group with alternatives is not supported (it can backtrack exponentially)';
 			}
-			if (unbounded) {
-				if (lastClosedGroup?.unbounded) {
-					return 'nested unbounded quantifiers are not supported';
+			if (group.unbounded) {
+				return max === Infinity ? 'nested unbounded quantifiers are not supported' : 'a repeated group of unbounded length is not supported (its backtracking grows with the input)';
+			}
+			if (group.choices > 1) {
+				const choices = group.choices ** max * counts;
+				if (!(choices <= MAX_REPEATED_GROUP_CHOICES)) {
+					return max === Infinity
+						? 'a group whose length varies, repeated without bound, is not supported (it can backtrack exponentially)'
+						: 'a group whose length varies is repeated too often (it can backtrack exponentially)';
 				}
-				frames[frames.length - 1].unbounded = true;
+				addLastClosedGroup(choices);
+				continue;
 			}
 		}
-		lastClosedGroup = undefined;
+		if (max === Infinity) {
+			frames[frames.length - 1].unbounded = true;
+			addLastClosedGroup();
+		} else {
+			addLastClosedGroup((lastClosedGroup?.choices ?? 1) * counts);
+		}
 	}
 	return undefined;
+}
+
+/**
+ * The most backtracking steps one test of a pattern may take (about 10 ms):
+ * strings longer than what a pattern can test within it are not tested.
+ */
+const PATTERN_STEP_BUDGET = 10_000_000;
+
+/**
+ * The most steps per character of the input that one test of a pattern whose
+ * time grows linearly may take (a megabyte then takes well under a second) for
+ * the pattern to be tested on strings of any length.
+ */
+const MAX_STEPS_PER_CHARACTER = 256;
+
+/**
+ * A pattern that could only test shorter strings than this within
+ * {@link PATTERN_STEP_BUDGET} is not asserted; this also refuses every pattern
+ * whose time grows with the fourth or a higher power of the input length.
+ */
+const MIN_PATTERN_INPUT_LENGTH = 64;
+
+/** The longest input whose bound on the steps of one test stays within `budget` (-1 when not even the empty one does). */
+function longestInputWithin(cost: IRegexCost, budget: number): number {
+	if (!(regexStepBound(cost, 0) <= budget)) {
+		return -1;
+	}
+	let low = 0; // within the budget
+	let high = 1;
+	while (regexStepBound(cost, high) <= budget) {
+		low = high;
+		high *= 2;
+		if (high > Number.MAX_SAFE_INTEGER) {
+			return Infinity;
+		}
+	}
+	while (high - low > 1) {
+		const middle = Math.floor((low + high) / 2);
+		if (regexStepBound(cost, middle) <= budget) {
+			low = middle;
+		} else {
+			high = middle;
+		}
+	}
+	return low;
+}
+
+function formatSteps(steps: number): string {
+	return Number.isFinite(steps) ? String(Math.ceil(steps)) : 'too many';
+}
+
+/**
+ * The longest string that one test of a pattern the guard accepted can check
+ * within {@link PATTERN_STEP_BUDGET}, from the polynomial that bounds the steps
+ * of its backtracking ({@link estimateRegexCost}, which reads the pattern in
+ * the mode it compiled in, `unicode` for the `u` flag): `unlimited` for a
+ * pattern whose time grows at most linearly with few steps per character (most
+ * patterns), a length for one whose time grows faster (e.g.
+ * `^[^@]+@[^@]+\.[^@]+$`, quadratic, or `^a*.{4000}!`), or a reason not to
+ * assert it at all. The bound is for a backtracking matcher without the
+ * optimizations that often make V8 faster, so it also holds where they do not
+ * apply.
+ */
+export function patternInputLimit(source: string, unicode: boolean): PatternInputLimit {
+	return inputLimitOf(estimateRegexCost(source, unicode));
+}
+
+export type PatternInputLimit =
+	| { readonly kind: 'unlimited' }
+	| { readonly kind: 'limited'; readonly maxInputLength: number; readonly cause: string }
+	| { readonly kind: 'refused'; readonly cause: string };
+
+function inputLimitOf(cost: IRegexCost): PatternInputLimit {
+	const [constantSteps = 0, stepsPerCharacter = 0] = cost.coefficients;
+	if (cost.degree <= 1 && stepsPerCharacter <= MAX_STEPS_PER_CHARACTER && constantSteps <= PATTERN_STEP_BUDGET) {
+		return { kind: 'unlimited' };
+	}
+	const degree = cost.degree;
+	const growth = degree === 2 ? 'the square of the input length' : degree === 3 ? 'the cube of the input length' : degree > MAX_DEGREE ? `the input length to a power above ${MAX_DEGREE}` : `the input length to the power ${degree}`;
+	const cause = degree >= 2
+		? `its backtracking can take time that grows with ${growth}`
+		: stepsPerCharacter > MAX_STEPS_PER_CHARACTER
+			? `its backtracking can take ${formatSteps(stepsPerCharacter)} steps for each character of the input`
+			: `its backtracking can take ${formatSteps(constantSteps)} steps`;
+	const maxInputLength = longestInputWithin(cost, PATTERN_STEP_BUDGET);
+	if (!(maxInputLength >= MIN_PATTERN_INPUT_LENGTH)) {
+		return { kind: 'refused', cause };
+	}
+	return { kind: 'limited', maxInputLength, cause };
+}
+
+interface IPatternAnalysis {
+	readonly limit: PatternInputLimit;
+	/** The work the analysis took, which a compilation that finds it here is charged all the same. */
+	readonly work: number;
+}
+
+/** How many analyses {@link patternAnalyses} keeps (patterns have at most 4096 characters by default). */
+const PATTERN_ANALYSIS_CACHE_SIZE = 256;
+
+/**
+ * The analyses of the most recently used patterns, by mode and source: a
+ * schema is often compiled more than once (to check it, then to use it). A
+ * compilation is charged the recorded work of an analysis it finds here, so
+ * that what it asserts does not depend on what was compiled before.
+ */
+const patternAnalyses = new Map<string, IPatternAnalysis>();
+
+function rememberPatternAnalysis(key: string, analysis: IPatternAnalysis): void {
+	patternAnalyses.delete(key);
+	if (patternAnalyses.size >= PATTERN_ANALYSIS_CACHE_SIZE) {
+		const oldest = patternAnalyses.keys().next();
+		if (!oldest.done) {
+			patternAnalyses.delete(oldest.value);
+		}
+	}
+	patternAnalyses.set(key, analysis);
+}
+
+/** How many backtracking analyses compilations have run (one found in {@link patternAnalyses} is not one). */
+let patternAnalysisRuns = 0;
+
+/** How many backtracking analyses of patterns compilations have run in this process: an analysis a compilation reuses (from an earlier one) is not counted. For tests. */
+export function getPatternAnalysisRunCount(): number {
+	return patternAnalysisRuns;
+}
+
+/**
+ * A budget for the backtracking analysis of the patterns of several
+ * compilations, which then share it as if they were one (see
+ * `IJsonSchemaCompileOptions.sharedPatternAnalysisBudget`): what one of them
+ * spends is gone for the others, and a pattern one of them has paid for (or
+ * found beyond the budget) costs the others nothing (and is refused for them
+ * too). Use one for a group of schemas whose total analysis time must be
+ * bounded, such as the tool schemas of one list a server sends.
+ */
+export class PatternAnalysisBudget {
+	/** What is left of {@link total}. */
+	public workLeft: number;
+	/** The limits of the patterns analyzed under this budget (undefined beyond it), by mode and source. */
+	public readonly limits = new Map<string, PatternInputLimit | undefined>();
+
+	constructor(public readonly total: number = DEFAULT_PATTERN_ANALYSIS_BUDGET) {
+		this.workLeft = total;
+	}
 }
 
 //#endregion
@@ -210,24 +456,29 @@ export interface ICompiledSchemaTree {
 export interface ICompileResult {
 	readonly tree: ICompiledSchemaTree | undefined;
 	readonly errors: IJsonSchemaCompileError[];
+	/** Problems that do not prevent compilation (see {@link ICompiledJsonSchema.warnings}). */
+	readonly warnings: IJsonSchemaCompileError[];
 }
 
 export function compileSchemaTree(schema: unknown, options: IJsonSchemaCompileOptions = {}): ICompileResult {
 	const detection = detectDialect(schema, options);
 	if (!detection.dialect) {
-		return { tree: undefined, errors: [detection.error!] };
+		return { tree: undefined, errors: [detection.error!], warnings: [] };
 	}
 	if (!isJsonObject(schema) && typeof schema !== 'boolean') {
-		return { tree: undefined, errors: [{ code: 'invalid-schema', path: '', message: 'A schema must be an object or a boolean' }] };
+		return { tree: undefined, errors: [{ code: 'invalid-schema', path: '', message: 'A schema must be an object or a boolean' }], warnings: [] };
 	}
 	const ctx = new CompileContext(options);
+	if (detection.warning) {
+		ctx.warnings.push(detection.warning);
+	}
 	const root = ctx.compileDocument(schema, ROOT_DOCUMENT_URI, detection.dialect, true);
 	ctx.resolveReferences();
 	ctx.checkReferenceChains();
 	if (ctx.errors.length) {
-		return { tree: undefined, errors: ctx.errors };
+		return { tree: undefined, errors: ctx.errors, warnings: ctx.warnings };
 	}
-	return { tree: { root, dialect: detection.dialect }, errors: [] };
+	return { tree: { root, dialect: detection.dialect }, errors: [], warnings: ctx.warnings };
 }
 
 interface IPendingReference {
@@ -238,11 +489,21 @@ interface IPendingReference {
 
 class CompileContext {
 	public readonly errors: IJsonSchemaCompileError[] = [];
+	public readonly warnings: IJsonSchemaCompileError[] = [];
 
 	private readonly maxDepth: number;
 	private readonly maxSubschemas: number;
 	private readonly maxRefHops: number;
 	private readonly maxPatternLength: number;
+	/**
+	 * The budget of the analyses of the patterns: this compilation's own, or
+	 * one it shares with others; its limits are those of the patterns analyzed
+	 * under it (a repeated pattern costs nothing).
+	 */
+	private readonly patternAnalysis: PatternAnalysisBudget;
+	private readonly sharesPatternAnalysis: boolean;
+	private readonly unsupportedDialect: IJsonSchemaCompileOptions['unsupportedDialect'];
+	private readonly tolerateLocalReferenceProblems: boolean;
 	private readonly remoteDocuments = new Map<string, unknown>();
 	private readonly nodes = new Map<object, SchemaNode>();
 	private readonly resources = new Map<string, ISchemaResource>();
@@ -256,6 +517,10 @@ class CompileContext {
 		this.maxSubschemas = options.maxSubschemas ?? DEFAULT_MAX_SUBSCHEMAS;
 		this.maxRefHops = options.maxRefHops ?? DEFAULT_MAX_REF_HOPS;
 		this.maxPatternLength = options.maxPatternLength ?? DEFAULT_MAX_PATTERN_LENGTH;
+		this.sharesPatternAnalysis = !!options.sharedPatternAnalysisBudget;
+		this.patternAnalysis = options.sharedPatternAnalysisBudget ?? new PatternAnalysisBudget(options.patternAnalysisBudget ?? DEFAULT_PATTERN_ANALYSIS_BUDGET);
+		this.unsupportedDialect = options.unsupportedDialect;
+		this.tolerateLocalReferenceProblems = options.localReferenceProblems === 'warn';
 		if (options.remoteDocuments) {
 			for (const [uri, raw] of options.remoteDocuments) {
 				this.remoteDocuments.set(normalizeUri(uri), raw);
@@ -265,6 +530,19 @@ class CompileContext {
 
 	private error(code: JsonSchemaCompileErrorCode, path: string, message: string): void {
 		this.errors.push({ code, path, message });
+	}
+
+	private warning(code: JsonSchemaCompileErrorCode, path: string, message: string): void {
+		this.warnings.push({ code, path, message });
+	}
+
+	/** A problem confined to a known document: an error, or a warning when such problems are tolerated (see `localReferenceProblems`). */
+	private localProblem(code: JsonSchemaCompileErrorCode, path: string, message: string, whenTolerated: string): void {
+		if (this.tolerateLocalReferenceProblems) {
+			this.warning(code, path, `${message}; ${whenTolerated}`);
+		} else {
+			this.error(code, path, message);
+		}
 	}
 
 	private pathIn(document: ISchemaDocument, pointer: string): string {
@@ -307,7 +585,11 @@ class CompileContext {
 					if (document.dialect === 'draft-07' && uriPart === '' && ANCHOR_PATTERN.test(fragment)) {
 						anchorFromId = fragment;
 					} else {
-						this.error('invalid-schema', this.pathIn(document, pointer + '/$id'), `'$id' must not contain a non-empty fragment`);
+						const plainName = ANCHOR_PATTERN.test(fragment);
+						this.localProblem('invalid-schema', this.pathIn(document, pointer + '/$id'), `'$id' must not contain a non-empty fragment`, plainName ? 'the fragment is read as an anchor' : 'the fragment is ignored');
+						if (plainName && this.tolerateLocalReferenceProblems) {
+							anchorFromId = fragment;
+						}
 					}
 				}
 				if (uriPart !== '') {
@@ -359,7 +641,7 @@ class CompileContext {
 			if (raw.$anchor !== undefined) {
 				const anchor = raw.$anchor;
 				if (typeof anchor !== 'string' || !ANCHOR_PATTERN.test(anchor)) {
-					this.error('invalid-schema', this.pathIn(document, pointer + '/$anchor'), `'$anchor' must be a plain name`);
+					this.localProblem('invalid-schema', this.pathIn(document, pointer + '/$anchor'), `'$anchor' must be a plain name`, 'it is ignored');
 				} else {
 					resource.anchors.set(anchor, node);
 				}
@@ -367,7 +649,7 @@ class CompileContext {
 			if (raw.$dynamicAnchor !== undefined) {
 				const anchor = raw.$dynamicAnchor;
 				if (typeof anchor !== 'string' || !ANCHOR_PATTERN.test(anchor)) {
-					this.error('invalid-schema', this.pathIn(document, pointer + '/$dynamicAnchor'), `'$dynamicAnchor' must be a plain name`);
+					this.localProblem('invalid-schema', this.pathIn(document, pointer + '/$dynamicAnchor'), `'$dynamicAnchor' must be a plain name`, 'it is ignored');
 				} else {
 					resource.anchors.set(anchor, node);
 					resource.dynamicAnchors.set(anchor, node);
@@ -401,20 +683,101 @@ class CompileContext {
 		};
 	}
 
-	private compilePattern(source: string, path: string): RegExp | undefined {
+	/**
+	 * Compiles a `pattern` or a `patternProperties` key. Patterns are compiled
+	 * with the `u` flag (code point semantics), and again without it when that
+	 * is a syntax error: identity escapes such as `\-`, `\#` or `\:` are valid
+	 * ECMA-262 without `u` and common in real schemas. A pattern that still
+	 * does not compile, or that the backtracking guard rejects, is not
+	 * asserted (it validates nothing) and is reported as a warning, so the
+	 * rest of the schema stays usable. A pattern whose backtracking can take
+	 * more than linear time (or many steps per character) is only tested on
+	 * strings it can check within a step budget ({@link patternInputLimit},
+	 * for the mode it compiled in), also with a warning. The analyses of the
+	 * patterns of one compilation share a budget ({@link analyzePattern}): a
+	 * pattern beyond it is not asserted either, with a warning. Only an
+	 * over-long pattern (a limit) is an error.
+	 */
+	private compilePattern(source: string, path: string): IGuardedPattern | undefined {
 		if (source.length > this.maxPatternLength) {
 			this.error('invalid-pattern', path, `Pattern exceeds the maximum length of ${this.maxPatternLength} characters`);
 			return undefined;
 		}
 		const problem = findUnsafeRegexConstruct(source);
 		if (problem) {
-			this.error('invalid-pattern', path, `Pattern is not allowed: ${problem}`);
+			this.warning('invalid-pattern', path, `Pattern is not checked: ${problem}`);
 			return undefined;
 		}
+		const regex = this.compileRegExp(source, path);
+		if (!regex) {
+			return undefined;
+		}
+		const limit = this.analyzePattern(source, regex.unicode);
+		if (!limit) {
+			this.warning('invalid-pattern', path, this.sharesPatternAnalysis
+				? `Pattern is not checked: analyzing the backtracking of the patterns of the schemas that share a budget of ${this.patternAnalysis.total} steps takes more than that budget`
+				: `Pattern is not checked: analyzing the backtracking of the patterns of the schema takes more than its budget of ${this.patternAnalysis.total} steps`);
+			return undefined;
+		}
+		switch (limit.kind) {
+			case 'unlimited':
+				return { regex, maxInputLength: Infinity };
+			case 'limited':
+				this.warning('invalid-pattern', path, `Pattern is checked only for strings of at most ${limit.maxInputLength} characters: ${limit.cause}`);
+				return { regex, maxInputLength: limit.maxInputLength };
+			case 'refused':
+				this.warning('invalid-pattern', path, `Pattern is not checked: ${limit.cause}`);
+				return undefined;
+		}
+	}
+
+	/**
+	 * The {@link patternInputLimit} of a pattern, within the analysis budget of
+	 * the compilation (or the one it shares with others): undefined for a
+	 * pattern whose analysis does not fit in what is left of it, which also
+	 * uses up the rest, so that every later pattern that needs an analysis is
+	 * refused at once (an analysis that runs out stops there: the budget bounds
+	 * the time). A pattern analyzed under the budget already costs nothing,
+	 * and an analysis from an earlier compilation ({@link patternAnalyses})
+	 * costs what it took, so the outcome depends on the schemas alone.
+	 */
+	private analyzePattern(source: string, unicode: boolean): PatternInputLimit | undefined {
+		const key = (unicode ? 'u:' : '-:') + source;
+		const budget = this.patternAnalysis;
+		if (budget.limits.has(key)) {
+			return budget.limits.get(key);
+		}
+		let analysis = patternAnalyses.get(key);
+		if (!analysis && budget.workLeft > 0) {
+			patternAnalysisRuns++;
+			const result = analyzeRegexCost(source, unicode, budget.workLeft);
+			if (result) {
+				analysis = { limit: inputLimitOf(result.cost), work: result.work };
+			}
+		}
+		let limit: PatternInputLimit | undefined;
+		if (analysis && analysis.work <= budget.workLeft) {
+			rememberPatternAnalysis(key, analysis);
+			budget.workLeft -= analysis.work;
+			limit = analysis.limit;
+		} else {
+			budget.workLeft = 0;
+		}
+		budget.limits.set(key, limit);
+		return limit;
+	}
+
+	private compileRegExp(source: string, path: string): RegExp | undefined {
+		let unicodeError: unknown;
 		try {
 			return new RegExp(source, 'u');
 		} catch (error) {
-			this.error('invalid-pattern', path, `Pattern is invalid: ${error instanceof Error ? error.message : String(error)}`);
+			unicodeError = error;
+		}
+		try {
+			return new RegExp(source);
+		} catch {
+			this.warning('invalid-pattern', path, `Pattern is not checked: it is not a valid regular expression (${unicodeError instanceof Error ? unicodeError.message : String(unicodeError)})`);
 			return undefined;
 		}
 	}
@@ -454,7 +817,7 @@ class CompileContext {
 		}
 		const fragment = decodeFragment(rawFragment);
 		if (fragment === undefined) {
-			this.error('unresolved-ref', path, `Fragment of '${value}' is not correctly percent-encoded`);
+			this.unresolvedLocalReference(path, `Fragment of '${value}' is not correctly percent-encoded`);
 			return undefined;
 		}
 		if (fragment === '') {
@@ -465,9 +828,14 @@ class CompileContext {
 		}
 		const anchor = resource.anchors.get(fragment);
 		if (!anchor) {
-			this.error('unresolved-ref', path, `Cannot find anchor '${fragment}' in '${resource.baseUri}'`);
+			this.unresolvedLocalReference(path, `Cannot find anchor '${fragment}' in '${resource.baseUri}'`);
 		}
 		return anchor;
+	}
+
+	/** A reference into a known document that names no location of it. */
+	private unresolvedLocalReference(path: string, message: string): void {
+		this.localProblem('unresolved-ref', path, message, 'the reference is not checked');
 	}
 
 	private resolvePointer(resource: ISchemaResource, pointer: string, path: string): SchemaNode | undefined {
@@ -481,7 +849,7 @@ class CompileContext {
 			} else if (Array.isArray(current) && /^(?:0|[1-9]\d*)$/.test(token) && Number(token) < current.length) {
 				current = current[Number(token)];
 			} else {
-				this.error('unresolved-ref', path, `Cannot resolve JSON pointer '${pointer}' in '${resource.baseUri}'`);
+				this.unresolvedLocalReference(path, `Cannot resolve JSON pointer '${pointer}' in '${resource.baseUri}'`);
 				return undefined;
 			}
 			currentPointer += '/' + escapePointerToken(token);
@@ -493,7 +861,7 @@ class CompileContext {
 			}
 		}
 		if (typeof current !== 'boolean' && !isJsonObject(current)) {
-			this.error('unresolved-ref', path, `JSON pointer '${pointer}' in '${resource.baseUri}' does not point to a schema`);
+			this.unresolvedLocalReference(path, `JSON pointer '${pointer}' in '${resource.baseUri}' does not point to a schema`);
 			return undefined;
 		}
 		return this.compileNode(current, contextResource, contextResource.document, currentPointer, depth);
@@ -509,10 +877,13 @@ class CompileContext {
 			this.error('remote-ref', path, `Reference to '${uri}' cannot be resolved: references to remote documents are not supported`);
 			return undefined;
 		}
-		const detection = detectDialect(raw, { dialect: inheritedDialect }, uri + '#');
+		const detection = detectDialect(raw, { dialect: inheritedDialect, unsupportedDialect: this.unsupportedDialect }, uri + '#');
 		if (!detection.dialect) {
 			this.errors.push(detection.error!);
 			return undefined;
+		}
+		if (detection.warning) {
+			this.warnings.push(detection.warning);
 		}
 		if (!isJsonObject(raw) && typeof raw !== 'boolean') {
 			this.error('invalid-schema', uri + '#', 'A schema must be an object or a boolean');
@@ -718,8 +1089,30 @@ const METASCHEMAS = new Map<string, JsonObject>([
 	[DIALECT_DRAFT_07_URI, DRAFT_07_METASCHEMA],
 ]);
 
-export function getMetaschemaDocument(dialect: JsonSchemaDialect): JsonObject {
-	return dialect === 'draft-07' ? DRAFT_07_METASCHEMA : DRAFT_2020_12_METASCHEMA;
+/**
+ * The 2020-12 metaschema without its rules for `$id` fragments and the form of
+ * `$anchor` and `$dynamicAnchor`, which the compiler reports as tolerated
+ * problems (see `localReferenceProblems`). The draft-07 metaschema has no such
+ * rules.
+ */
+function lenientDraft202012Metaschema(): JsonObject {
+	return {
+		...DRAFT_2020_12_METASCHEMA,
+		properties: {
+			...DRAFT_2020_12_METASCHEMA.properties as JsonObject,
+			$id: { $ref: '#/$defs/uriReferenceString' },
+			$anchor: true,
+			$dynamicAnchor: true,
+		},
+	};
+}
+
+/** @param tolerateLocalReferenceProblems The metaschema for `localReferenceProblems: 'warn'`. */
+export function getMetaschemaDocument(dialect: JsonSchemaDialect, tolerateLocalReferenceProblems = false): JsonObject {
+	if (dialect === 'draft-07') {
+		return DRAFT_07_METASCHEMA;
+	}
+	return tolerateLocalReferenceProblems ? lenientDraft202012Metaschema() : DRAFT_2020_12_METASCHEMA;
 }
 
 //#endregion

@@ -4,7 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { compileJsonSchema, ICompiledJsonSchema, IJsonSchemaCompileOptions, isCompiledJsonSchema, JsonSchemaBudgetExceededError, JsonSchemaCompileErrorCode, validateJsonSchemaDocument } from '../../../common/jsonSchemaValidator/index.js';
+import { DEFAULT_PATTERN_ANALYSIS_BUDGET, getPatternAnalysisRunCount } from '../../../common/jsonSchemaValidator/compile.js';
+import { checkJsonSchemaDocument, compileJsonSchema, ICompiledJsonSchema, IJsonSchemaCompileOptions, isCompiledJsonSchema, JsonSchemaBudgetExceededError, JsonSchemaCompileErrorCode, PatternAnalysisBudget, validateJsonSchemaDocument } from '../../../common/jsonSchemaValidator/index.js';
+import { analyzeRegexCost } from '../../../common/jsonSchemaValidator/regexCost.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../utils.js';
 
 suite('JSON Schema Validator', () => {
@@ -217,6 +219,47 @@ suite('JSON Schema Validator', () => {
 			assert.deepStrictEqual(compileErrors({ $ref: '#missing' }), ['unresolved-ref']);
 		});
 
+		test('local reference problems can be tolerated as warnings, and the rest still validates', () => {
+			const tolerant: IJsonSchemaCompileOptions = { localReferenceProblems: 'warn' };
+			const sortedWarnings = (compiled: { readonly warnings: readonly { readonly code: string; readonly path: string }[] }) => compiled.warnings.map(w => `${w.code} ${w.path}`).sort();
+
+			// a reference to a location the document does not have asserts nothing
+			const refs = compile({ type: 'object', properties: { a: { $ref: '#/$defs/missing' }, b: { $ref: '#nowhere' }, c: { $ref: '#/properties/n/type' }, n: { type: 'integer' } } }, tolerant);
+			assert.deepStrictEqual(sortedWarnings(refs), ['unresolved-ref /properties/a/$ref', 'unresolved-ref /properties/b/$ref', 'unresolved-ref /properties/c/$ref']);
+			assertValid(refs, { a: 'anything', b: 1, c: null });
+			assertInvalid(refs, { n: 'x' }, 'type');
+
+			// a $id with a fragment: a plain name names its schema, anything else is ignored
+			const ids = compile({
+				$defs: { n: { $id: '#num', type: 'number' }, s: { $id: 'https://example.com/s.json#x/y', type: 'string' } },
+				properties: { a: { $ref: '#num' }, s: { $ref: 'https://example.com/s.json' } },
+			}, tolerant);
+			assert.deepStrictEqual(sortedWarnings(ids), ['invalid-schema /$defs/n/$id', 'invalid-schema /$defs/s/$id']);
+			assertInvalid(ids, { a: 'x' }, 'type');
+			assertInvalid(ids, { s: 1 }, 'type');
+			assertValid(ids, { a: 1, s: 'x' });
+
+			// an anchor that is not a plain name is ignored
+			const anchors = compile({ $anchor: '1bad', $dynamicAnchor: 'not a name', type: 'string' }, tolerant);
+			assert.deepStrictEqual(sortedWarnings(anchors), ['invalid-schema /$anchor', 'invalid-schema /$dynamicAnchor']);
+			assertInvalid(anchors, 1, 'type');
+
+			// by default each is a compile error; a reference to another document stays one
+			assert.deepStrictEqual(compileErrors({ properties: { c: { $ref: '#/properties/n/type' }, n: { type: 'integer' } } }), ['unresolved-ref']);
+			assert.deepStrictEqual(compileErrors({ $defs: { n: { $id: '#num' } } }), ['invalid-schema']);
+			assert.deepStrictEqual(compileErrors({ $dynamicAnchor: 'not a name' }), ['invalid-schema']);
+			assert.deepStrictEqual(compileErrors({ $ref: 'https://example.com/other.json' }, tolerant), ['remote-ref']);
+			assert.deepStrictEqual(compileErrors({ $ref: 'https://json-schema.org/draft/2020-12/schema#/$defs/missing', type: 5 }, tolerant), ['invalid-schema']);
+
+			// the document check agrees: the metaschema leaves these to the compiler
+			const document = { type: 'object', $id: 'urn:example:tool#input', $defs: { n: { $anchor: '1bad' } }, properties: { a: { $ref: '#/$defs/missing' } } };
+			assert.ok(checkJsonSchemaDocument(document).errors.length > 0);
+			const check = checkJsonSchemaDocument(document, tolerant);
+			assert.deepStrictEqual(check.errors, []);
+			assert.deepStrictEqual(sortedWarnings(check), ['invalid-schema /$defs/n/$anchor', 'invalid-schema /$id', 'unresolved-ref /properties/a/$ref']);
+			assert.ok(checkJsonSchemaDocument({ type: 'object', properties: { a: { type: 5 } } }, tolerant).errors.some(e => e.path === '/properties/a/type'), 'other problems stay errors');
+		});
+
 		test('$ref applies alongside sibling keywords in 2020-12 and creates a new scope', () => {
 			const schema = compile({ $defs: { a: { type: 'integer' } }, $ref: '#/$defs/a', minimum: 5 });
 			assertValid(schema, 5);
@@ -362,9 +405,31 @@ suite('JSON Schema Validator', () => {
 			assert.deepStrictEqual(compileErrors({ $schema: 'https://json-schema.org/draft/2019-09/schema' }), ['unsupported-dialect']);
 			assert.deepStrictEqual(compileErrors({ $schema: 'http://json-schema.org/draft-04/schema#' }), ['unsupported-dialect']);
 			assert.deepStrictEqual(compileErrors({ $schema: 42 }), ['unsupported-dialect']);
+			assert.deepStrictEqual(compileErrors({ $schema: 'http://json-schema.org/draft-04/schema#' }, { unsupportedDialect: 'error' }), ['unsupported-dialect']);
 			assert.strictEqual(compile({ $schema: 'https://json-schema.org/draft/2020-12/schema' }).dialect, '2020-12');
 			assert.strictEqual(compile({}, draft7).dialect, 'draft-07');
 			assert.strictEqual(compile({ $schema: 'https://json-schema.org/draft/2020-12/schema' }, draft7).dialect, '2020-12');
+		});
+
+		test('tolerates an unsupported dialect with a warning when asked to, validating in the default dialect', () => {
+			const tolerant: IJsonSchemaCompileOptions = { dialect: 'draft-07', unsupportedDialect: 'warn' };
+			const schema = compile({ $schema: 'http://json-schema.org/draft-04/schema#', items: [{ type: 'string' }], additionalItems: false }, tolerant);
+			assert.strictEqual(schema.dialect, 'draft-07');
+			assert.deepStrictEqual(schema.warnings.map(w => [w.code, w.path]), [['unsupported-dialect', '/$schema']]);
+			assertValid(schema, ['a']);
+			assertInvalid(schema, [1], 'type');
+			assertInvalid(schema, ['a', 'b']);
+			assert.strictEqual(compile({ $schema: 'https://json-schema.org/draft/2019-09/schema' }, { unsupportedDialect: 'warn' }).dialect, '2020-12');
+			// a supplied remote document in an unsupported dialect is tolerated the same way
+			const remoteDocuments = new Map<string, unknown>([['https://example.com/old.json', { $schema: 'http://json-schema.org/draft-04/schema#', type: 'integer' }]]);
+			const withRemote = compile({ $ref: 'https://example.com/old.json' }, { ...tolerant, remoteDocuments });
+			assert.deepStrictEqual(withRemote.warnings.map(w => w.code), ['unsupported-dialect']);
+			assertInvalid(withRemote, 'x', 'type');
+			assert.deepStrictEqual(compileErrors({ $ref: 'https://example.com/old.json' }, { remoteDocuments }), ['unsupported-dialect']);
+			// the document check agrees
+			const check = checkJsonSchemaDocument({ $schema: 'http://json-schema.org/draft-04/schema#', type: 'object', properties: {} }, tolerant);
+			assert.deepStrictEqual(check.errors, []);
+			assert.deepStrictEqual(check.warnings.map(w => w.code), ['unsupported-dialect']);
 		});
 	});
 
@@ -421,22 +486,355 @@ suite('JSON Schema Validator', () => {
 			assert.throws(() => schema.validate(Array.from({ length: 10_000 }, (_, i) => i)), JsonSchemaBudgetExceededError);
 		});
 
-		test('regular expressions are guarded', () => {
-			assert.deepStrictEqual(compileErrors({ pattern: '(a+)+$' }), ['invalid-pattern']);
-			assert.deepStrictEqual(compileErrors({ pattern: '(?:a*)*' }), ['invalid-pattern']);
-			assert.deepStrictEqual(compileErrors({ pattern: '(a{2,}){3,}' }), ['invalid-pattern']);
-			assert.deepStrictEqual(compileErrors({ pattern: '((ab)+c)*' }), ['invalid-pattern']);
-			assert.deepStrictEqual(compileErrors({ pattern: '(a)\\1' }), ['invalid-pattern']);
-			assert.deepStrictEqual(compileErrors({ pattern: '(?<n>a)\\k<n>' }), ['invalid-pattern']);
-			assert.deepStrictEqual(compileErrors({ pattern: '(?<=a)b' }), ['invalid-pattern']);
-			assert.deepStrictEqual(compileErrors({ pattern: '(?<!a)b' }), ['invalid-pattern']);
-			assert.deepStrictEqual(compileErrors({ pattern: '[' }), ['invalid-pattern']);
-			assert.deepStrictEqual(compileErrors({ pattern: 'a'.repeat(5000) }), ['invalid-pattern']);
-			assert.deepStrictEqual(compileErrors({ patternProperties: { '(a+)+': true } }), ['invalid-pattern']);
-			assert.deepStrictEqual(compileErrors({ pattern: 'a' }, { maxPatternLength: 0 }), ['invalid-pattern']);
-			for (const safe of ['^(a|b)+$', '(a+)?', '(ab){2,5}', '(?<name>a+)b*', '(?=a+)b+', '[(a+)]+', '\\(a+\\)+', '(a+)(b+)', '^\\d{3}-\\d{4}$', '(a+)(?:b)*']) {
-				compile({ pattern: safe });
+		test('regular expressions are guarded: a rejected pattern asserts nothing and is a warning', () => {
+			const unsafe = [
+				'(a+)+$', '(?:a*)*', '(a{2,}){3,}', '((ab)+c)*', '(a)\\1', '(?<n>a)\\k<n>', '(?<=a)b', '(?<!a)b',
+				// a common hostname / e-mail domain pattern: nested unbounded quantifiers
+				'^([a-z0-9-]+\\.)+[a-z]{2,}$',
+				// groups nested so deep that analysing them could exhaust the stack (2000 levels did)
+				'('.repeat(65) + 'a' + ')'.repeat(65), '('.repeat(2000) + ')'.repeat(2000),
+			];
+			for (const pattern of unsafe) {
+				const schema = compile({ type: 'string', pattern, minLength: 2 });
+				assert.deepStrictEqual(schema.warnings.map(w => [w.code, w.path]), [['invalid-pattern', '/pattern']], pattern);
+				assertValid(schema, '!!'); // the pattern is not asserted…
+				assertInvalid(schema, '!', 'minLength'); // …the other keywords are
+				assertInvalid(schema, 1, 'type');
 			}
+			for (const safe of ['(a+)?', '(ab){2,5}', '(?<name>a+)b*', '^(?=a+)b+', '[(a+)]+', '\\(a+\\)+', '^(a+)(b+)$', '^\\d{3}-\\d{4}$', '(a+)(?:b)*', '('.repeat(64) + 'a' + ')'.repeat(64)]) {
+				assert.deepStrictEqual(compile({ pattern: safe }).warnings, [], safe);
+			}
+			assert.deepStrictEqual(compile({ pattern: '('.repeat(65) + 'a' + ')'.repeat(65) }).warnings.map(w => w.message), ['Pattern is not checked: groups nested more than 64 deep are not supported']);
+		});
+
+		test('a repeated group with alternatives, or of varying length, is not asserted: a single RegExp.test cannot be interrupted', () => {
+			const unsafe = [
+				// overlapping alternatives under a quantifier backtrack exponentially (`^(a|a)*$` on `aaa…b`)
+				'^(a|a)*$', '^(a|b)+$', '(a|b){2}', '((a|b)c)+', '(?:x(?:a|b)?)+', '(?<n>a|b)*',
+				// a repeated group of unbounded length (polynomial or worse)
+				'(a*){2}', '^(\\w+\\.){2}\\w+$',
+				// a group whose length varies, repeated without bound or so often that it can split a match in more than 256 ways
+				'(ab?)*', '(a?)+', '(a{1,2}){9}', '((a{1,2}){3}){3}', '(\\d{1,4}:){7}',
+			];
+			for (const pattern of unsafe) {
+				const schema = compile({ type: 'string', pattern });
+				assert.deepStrictEqual(schema.warnings.map(w => [w.code, w.path]), [['invalid-pattern', '/pattern']], pattern);
+				assertInvalid(schema, 1, 'type');
+			}
+			// not asserted, so the instance that makes the pattern backtrack is answered at once
+			const started = Date.now();
+			assertValid(compile({ type: 'string', pattern: '^(a|a)*$' }), 'a'.repeat(40) + 'b');
+			assert.ok(Date.now() - started < 1000);
+
+			for (const safe of ['^(a|b)$', '(a|b)?', '^(\\+|-)?\\d+$', '([a-z]{2})+', '(?:ab)+', '^(a{1,2}){8}$', '^((a{1,2}){2}){2}$', '^(\\d{1,3}\\.){3}\\d{1,3}$', '^\\w+(?:\\.\\w+)?$']) {
+				assert.deepStrictEqual(compile({ pattern: safe }).warnings, [], safe);
+			}
+			// Unanchored, the 256 splits are tried at every position: still asserted, on strings that one test can check within the step budget.
+			assert.deepStrictEqual(compile({ pattern: '(a{1,2}){8}' }).warnings.map(w => w.message), ['Pattern is checked only for strings of at most 9763 characters: its backtracking can take 1024 steps for each character of the input']);
+			const ipv4 = compile({ type: 'string', pattern: '^(\\d{1,3}\\.){3}\\d{1,3}$' });
+			assertValid(ipv4, '10.0.0.1');
+			assertInvalid(ipv4, '10.0.0', 'pattern');
+		});
+
+		test('polynomial backtracking is bounded: a pattern is not asserted, or only on strings it can test within the step budget', () => {
+			const warningsOf = (pattern: string) => compile({ type: 'string', pattern }).warnings.map(w => w.message);
+			// Loops whose give-backs let the next loop match again: one test of n characters costs about n^k steps.
+			// Bounded loops multiply the splits instead (`a{0,30}` ten times: 31^9 per position).
+			for (const pattern of ['^' + 'a*'.repeat(16) + '$', '^a*a*a*a*$', '\\d+\\d+\\d+$', '^a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a{30}$', '^' + 'a{0,30}'.repeat(10) + '$']) {
+				const schema = compile({ type: 'string', pattern, minLength: 2 });
+				assert.deepStrictEqual(schema.warnings.map(w => [w.code, w.path, w.message.startsWith('Pattern is not checked: its backtracking can ')]), [['invalid-pattern', '/pattern', true]], pattern);
+				assertValid(schema, 'a'.repeat(18) + '!'); // not asserted: the 8 s test of the review is answered at once
+				assertInvalid(schema, '!', 'minLength');
+			}
+			assert.deepStrictEqual(warningsOf('\\d+\\d+\\d+$'), ['Pattern is not checked: its backtracking can take time that grows with the input length to the power 4']);
+			assert.deepStrictEqual(warningsOf('^(a|a)*$'), ['Pattern is not checked: a repeated group with alternatives is not supported (it can backtrack exponentially)']);
+
+			// Quadratic and cubic patterns are tested on strings up to the length the budget allows, and only on those.
+			assert.deepStrictEqual(warningsOf('^[^@]+@[^@]+\\.[^@]+$'), ['Pattern is checked only for strings of at most 2234 characters: its backtracking can take time that grows with the square of the input length']);
+			assert.deepStrictEqual(warningsOf('^a*a*a*$'), ['Pattern is checked only for strings of at most 169 characters: its backtracking can take time that grows with the cube of the input length']);
+			assert.deepStrictEqual(warningsOf('a+b'), ['Pattern is checked only for strings of at most 2235 characters: its backtracking can take time that grows with the square of the input length'], 'an unanchored search retries at every position');
+			const email = compile({ type: 'string', pattern: '^[^@]+@[^@]+\\.[^@]+$' });
+			assertValid(email, 'user@example.com');
+			assertInvalid(email, 'user@example', 'pattern');
+			assertInvalid(email, 'a@' + '.'.repeat(2231) + '@', 'pattern'); // the longest string tested
+			assertValid(email, 'a@' + '.'.repeat(2232) + '@'); // one character more is not tested
+			const cubic = compile({ type: 'string', pattern: '^a*a*a*$' });
+			let started = Date.now();
+			assertInvalid(cubic, 'a'.repeat(168) + '!', 'pattern');
+			assertValid(cubic, 'a'.repeat(5000) + '!');
+			assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms`);
+
+			// The same limit applies to patternProperties keys: a longer key may match, so nothing is asserted about it.
+			const keyed = compile({ patternProperties: { 'x+y': { type: 'string' } }, additionalProperties: false });
+			assert.deepStrictEqual(keyed.warnings.map(w => w.path), ['/patternProperties/x+y']);
+			assertValid(keyed, { xy: 'v' });
+			assertInvalid(keyed, { xy: 1 }, 'type');
+			assertInvalid(keyed, { z: 'v' }, 'additionalProperties');
+			assertValid(keyed, { ['x'.repeat(5000)]: 1 });
+
+			// Common patterns whose time grows linearly are asserted on strings of any length, without a warning.
+			const linear: [pattern: string, valid: string, invalid: string][] = [
+				['^\\d+\\.\\d+\\.\\d+$', '1.22.333', '1.2'],
+				['^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$', '1.0.0-rc.1+build.5', '01.0.0'],
+				['^\\d{4}-\\d{2}-\\d{2}$', '2026-07-28', '2026-7-28'],
+				['^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$', '2026-07-28T10:00:00.5Z', '2026-07-28T10:00'],
+				['^[a-z][a-z0-9-]*$', 'my-server-2', '2-server'],
+				['^https?://\\S+$', 'https://example.com/a', 'ftp://example.com'],
+				['^\\s*\\S+\\s*$', '  token ', 'two words'],
+				['^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', '123e4567-e89b-12d3-a456-426614174000', '123e4567'],
+				['\\d+', 'abc1', 'abc'],
+				['\\(a+\\)', 'x(aa)', '(aa'],
+			];
+			for (const [pattern, valid, invalid] of linear) {
+				const schema = compile({ type: 'string', pattern });
+				assert.deepStrictEqual(schema.warnings, [], pattern);
+				assertValid(schema, valid);
+				assertInvalid(schema, invalid, 'pattern');
+			}
+			started = Date.now();
+			assertInvalid(compile({ type: 'string', pattern: '^\\d+\\.\\d+\\.\\d+$' }), '1'.repeat(1_000_000) + '!', 'pattern');
+			assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms`);
+		});
+
+		test('a pattern that compiles only without the u flag is costed as that mode reads it: \\u{N} repeats u, and a quantifier after an astral character repeats its trail surrogate', () => {
+			const warningsOf = (pattern: string) => compile({ type: 'string', pattern }).warnings.map(w => w.message);
+			// With the u flag `\u{0}` is a character between the loops; `\:` is a syntax error with it, so the
+			// same loops without it are adjacent (`\u{0}` is `u` zero times), and `😀+` is `😀+`.
+			const separated = '^' + 'u*\\u{0}'.repeat(5) + 'u*$';
+			const adjacent = '^\\:?' + 'u*\\u{0}'.repeat(5) + 'u*$';
+			const astral = '^\\:?' + '\u{1F600}+\\uDE00*x'.repeat(5) + '$';
+			assert.deepStrictEqual(warningsOf(separated), []);
+			assert.deepStrictEqual(warningsOf('^' + '\u{1F600}+\\uDE00*x'.repeat(5) + '$'), []);
+			assert.deepStrictEqual(warningsOf(adjacent), ['Pattern is not checked: its backtracking can take time that grows with the input length to the power 6']);
+			assert.deepStrictEqual(warningsOf(astral), ['Pattern is not checked: its backtracking can take time that grows with the input length to the power 6']);
+			// The other escapes of that mode: `\p{N}` repeats `p`, and `\012` is a line feed.
+			assert.deepStrictEqual(warningsOf('^\\:?p*\\p{99999}!'), ['Pattern is checked only for strings of at most 2234 characters: its backtracking can take time that grows with the square of the input length']);
+			assert.deepStrictEqual(warningsOf('^\\:?\\012*\\n*$'), ['Pattern is checked only for strings of at most 1579 characters: its backtracking can take time that grows with the square of the input length']);
+
+			// Not asserted, so the instances of the review (6 s and 15 s in one RegExp.test) are answered at once, also as keys.
+			const started = Date.now();
+			assertValid(compile({ type: 'string', pattern: adjacent }), 'u'.repeat(90) + '!');
+			assertValid(compile({ type: 'string', pattern: astral }), ('\uD83D' + '\uDE00'.repeat(40) + 'x').repeat(5) + '!');
+			const keyed = compile({ patternProperties: { [adjacent]: { type: 'string' } }, additionalProperties: false });
+			assert.deepStrictEqual(keyed.warnings.map(w => w.code), ['invalid-pattern']);
+			assertValid(keyed, { ['u'.repeat(60) + '!']: 1 });
+			assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms`);
+			const unicode = compile({ type: 'string', pattern: separated });
+			assertValid(unicode, 'uu\0u\0\0\0u\0');
+			assertInvalid(unicode, 'u'.repeat(90) + '!', 'pattern');
+		});
+
+		test('long counts, lookaheads in loops and long sequences are costed: such a pattern is tested only on strings it can check within the step budget', () => {
+			const square = (length: number) => `Pattern is checked only for strings of at most ${length} characters: its backtracking can take time that grows with the square of the input length`;
+			const cases: [pattern: string, warning: string, longest: (length: number) => string][] = [
+				// Each give-back of the loop runs the count, which scans what is left of the input (14 s for 120000 characters).
+				['^a*.{99999999}!', square(3160), length => 'a'.repeat(length)],
+				['^[a-z]*[a-z0-9]{50000}$', square(3160), length => 'a'.repeat(length)],
+				['^a*[a!]{20000,20031}!', square(3145), length => 'a'.repeat(length)],
+				// An unanchored search runs the count at every position.
+				['.{99999}x', square(3161), length => 'a'.repeat(length)],
+				// The lookahead scans again at every iteration of the loop around it, or at every give-back of the loop before it.
+				['^(?:(?=.{99999}).)*$', square(3160), length => 'a'.repeat(length - 1) + '\n'],
+				['^a*(?=a*)b', square(3160), length => 'a'.repeat(length)],
+				// A sequence of 4000 characters is tried at every position (1.5 s for a megabyte).
+				['.'.repeat(4000) + '!', 'Pattern is checked only for strings of at most 2497 characters: its backtracking can take 4002 steps for each character of the input', length => 'a'.repeat(length)],
+			];
+			for (const [pattern, warning, longest] of cases) {
+				const schema = compile({ type: 'string', pattern });
+				assert.deepStrictEqual(schema.warnings.map(w => w.message), [warning], pattern);
+				const started = Date.now();
+				assertInvalid(schema, longest(Number(/at most (\d+)/.exec(warning)![1])), 'pattern');
+				assertValid(schema, longest(120_000)); // not tested
+				assert.ok(Date.now() - started < 1000, `${pattern} took ${Date.now() - started} ms`);
+			}
+			// The loop that matches, and so ends the test, also scans at every iteration (about a second for a megabyte).
+			const matching = compile({ type: 'string', pattern: '^(?:(?=.{1000}).)*' });
+			assert.deepStrictEqual(matching.warnings.map(w => w.message), [square(3160)]);
+			const started = Date.now();
+			assertValid(matching, 'a'.repeat(1_000_000));
+			assert.ok(Date.now() - started < 500, `took ${Date.now() - started} ms`);
+
+			// Counts that no loop before them gives back to, and a loop of a fixed-length group, stay linear.
+			const linear: [pattern: string, valid: string, invalid: string][] = [
+				['^[a-f0-9]{64}$', 'a'.repeat(64), 'a'.repeat(63)],
+				['^(?:a{40})*$', 'a'.repeat(80), 'a'.repeat(79)],
+				['^(?=.*[A-Z])(?=.*\\d).{8,}$', 'Passw0rd', 'password'],
+			];
+			for (const [pattern, valid, invalid] of linear) {
+				const schema = compile({ type: 'string', pattern });
+				assert.deepStrictEqual(schema.warnings, [], pattern);
+				assertValid(schema, valid);
+				assertInvalid(schema, invalid, 'pattern');
+			}
+		});
+
+		test('patterns that need the ECMA-262 identity escapes of non-unicode mode compile and assert', () => {
+			// Each is a syntax error with the `u` flag ("Invalid escape") and valid without it.
+			const cases: [pattern: string, valid: string, invalid: string][] = [
+				['^\\d{3}\\-\\d{4}$', '555-1234', '5551234'],
+				['^[a-zA-Z0-9\\-\\_]+$', 'a-b_C9', 'a b'],
+				['^\\#[0-9a-f]{6}$', '#00ff00', '00ff00'],
+				['^[\\w\\s\\,]+$', 'a, b', 'a;b'],
+				['^[a-z]+\\=[0-9]+$', 'a=1', 'a1'],
+				['^\\w+\\:\\d+$', 'host:8080', 'host8080'],
+				['^\\@[a-z]+$', '@user', 'user'],
+				['^[^\\"]*$', 'plain', 'say "hi"'],
+			];
+			for (const [pattern, valid, invalid] of cases) {
+				assert.throws(() => new RegExp(pattern, 'u'), SyntaxError, `${pattern} is a syntax error with the u flag`);
+				const schema = compile({ pattern });
+				assert.deepStrictEqual(schema.warnings, [], pattern);
+				assertValid(schema, valid);
+				assertInvalid(schema, invalid, 'pattern');
+			}
+			// The same fallback applies to patternProperties keys.
+			const keyed = compile({ patternProperties: { '^x\\-': { type: 'string' } }, additionalProperties: false });
+			assert.deepStrictEqual(keyed.warnings, []);
+			assertValid(keyed, { 'x-a': 'v' });
+			assertInvalid(keyed, { 'x-a': 1 }, 'type');
+			assertInvalid(keyed, { y: 'v' }, 'additionalProperties');
+		});
+
+		test('a pattern that compiles in neither mode is not asserted and the rest of the schema still validates', () => {
+			const schema = compile({ type: 'object', properties: { id: { type: 'string', pattern: '[' }, n: { type: 'integer' } }, required: ['n'] });
+			assert.deepStrictEqual(schema.warnings.map(w => [w.code, w.path]), [['invalid-pattern', '/properties/id/pattern']]);
+			assertValid(schema, { id: 'anything', n: 1 });
+			assertInvalid(schema, { id: 'x' }, 'required');
+			assertInvalid(schema, { id: 5, n: 1 }, 'type');
+			assertInvalid(schema, { id: 'x', n: 1.5 }, 'type');
+		});
+
+		test('a patternProperties key that cannot be used leaves no property to additionalProperties', () => {
+			const schema = compile({ patternProperties: { '^x-': { type: 'string' }, '(a+)+': { type: 'number' } }, additionalProperties: false });
+			assert.deepStrictEqual(schema.warnings.map(w => [w.code, w.path]), [['invalid-pattern', '/patternProperties/(a+)+']]);
+			assertValid(schema, { 'x-a': 's', other: true }); // `other` may match the unusable pattern
+			assertInvalid(schema, { 'x-a': 1 }, 'type'); // the usable pattern is still asserted
+			const unevaluated = compile({ patternProperties: { '[': { type: 'string' } }, unevaluatedProperties: false });
+			assert.deepStrictEqual(unevaluated.warnings.map(w => w.code), ['invalid-pattern']);
+			assertValid(unevaluated, { a: 1 });
+		});
+
+		test('pattern limits stay compile errors', () => {
+			assert.deepStrictEqual(compileErrors({ pattern: 'a'.repeat(5000) }), ['invalid-pattern']);
+			assert.deepStrictEqual(compileErrors({ pattern: 'a' }, { maxPatternLength: 0 }), ['invalid-pattern']);
+			assert.deepStrictEqual(compileErrors({ patternProperties: { ['a'.repeat(5000)]: true } }), ['invalid-pattern']);
+		});
+
+		suite('the backtracking analysis of the patterns of one compilation has a budget', () => {
+			/** A long alternation of distinct characters, the slowest kind of pattern to analyze (about 10 ms for 4096 characters); `i` makes it distinct. */
+			const heavy = (i: number, prefix = '') => `^${prefix}${i}:(?:${Array.from({ length: 2000 }, (_, k) => String.fromCharCode(0x4e00 + 2 * k)).join('|')})$`.slice(0, 4096);
+			const workOf = (pattern: string) => analyzeRegexCost(pattern, true)!.work;
+			const budgetWarning = `Pattern is not checked: analyzing the backtracking of the patterns of the schema takes more than its budget of ${DEFAULT_PATTERN_ANALYSIS_BUDGET} steps`;
+			const schemaOf = (patterns: readonly string[]) => ({ type: 'object', properties: Object.fromEntries(patterns.map((pattern, i) => [`p${i}`, { type: 'string', pattern }])) });
+
+			test('many large patterns: those beyond the budget are not asserted, with a warning, and compiling stays fast', () => {
+				// Patterns no earlier compilation analyzed, so that the first compilation below analyzes them.
+				const prefix = `run${Date.now()}-`;
+				const patterns = Array.from({ length: 300 }, (_, i) => heavy(i, prefix));
+				// The patterns the budget covers, in the order of the schema.
+				let left = DEFAULT_PATTERN_ANALYSIS_BUDGET;
+				let analyzed = 0;
+				while (analyzed < patterns.length && workOf(patterns[analyzed]) <= left) {
+					left -= workOf(patterns[analyzed]);
+					analyzed++;
+				}
+				assert.ok(analyzed > 0 && analyzed < 20, `${analyzed} patterns fit in the budget`);
+				// The analyses a compilation runs: those that fit, and the one that runs out of what is left (if anything is).
+				const runsPerCompilation = { first: analyzed + (left > 0 ? 1 : 0), later: left > 0 ? 1 : 0 };
+				const schema = schemaOf(patterns);
+				const started = Date.now();
+				let runs = getPatternAnalysisRunCount();
+				const compiled = compile(schema);
+				const elapsed = Date.now() - started;
+				assert.strictEqual(getPatternAnalysisRunCount() - runs, runsPerCompilation.first);
+				// Without the budget, analyzing them takes about 4 s here (each compilation).
+				assert.ok(elapsed < 1500, `took ${elapsed} ms`);
+				const expected = patterns.slice(analyzed).map((_, i) => ['invalid-pattern', `/properties/p${analyzed + i}/pattern`, budgetWarning]);
+				assert.deepStrictEqual(compiled.warnings.map(w => [w.code, w.path, w.message]), expected);
+				const first = String.fromCharCode(0x4e00);
+				assertValid(compiled, { p0: `${prefix}0:${first}` });
+				assertInvalid(compiled, { p0: `${prefix}1:${first}` }, 'pattern');
+				assertValid(compiled, { [`p${patterns.length - 1}`]: 'not asserted' });
+				assertInvalid(compiled, { [`p${patterns.length - 1}`]: 1 }, 'type');
+
+				// Compiled again (as the MCP schema checks do), the same patterns are asserted, and the analyses
+				// are reused: a later compilation runs only the analysis that runs out (it is not kept), so it
+				// takes about 10 ms, against 100 ms for the first one.
+				for (let i = 0; i < 3; i++) {
+					runs = getPatternAnalysisRunCount();
+					assert.deepStrictEqual(compile(schema).warnings.map(w => [w.code, w.path, w.message]), expected);
+					assert.strictEqual(getPatternAnalysisRunCount() - runs, runsPerCompilation.later, `compilation ${i + 2}`);
+				}
+			});
+
+			test('a single pattern of the maximal length is always analyzed: the heaviest one known takes less than the budget', () => {
+				// 2040 distinct characters, each with `*` (4082 characters): about 850 000 units, some 25 ms.
+				const stars = `^${Array.from({ length: 2040 }, (_, k) => String.fromCharCode(0x4e00 + 2 * k) + '*').join('')}$`;
+				assert.ok(stars.length <= 4096);
+				const work = workOf(stars);
+				assert.ok(work > 500_000 && work < DEFAULT_PATTERN_ANALYSIS_BUDGET / 2, `${work} units`);
+				// Analyzed within the budget: refused for its backtracking, not for the budget.
+				const messages = compile({ pattern: stars }).warnings.map(w => w.message);
+				assert.ok(messages.length === 1 && messages[0].startsWith('Pattern is not checked: its backtracking can take '), JSON.stringify(messages));
+			});
+
+			test('compilations that share a budget count as one: what one spends is gone for the others, and a pattern one paid for is free for the others', () => {
+				const prefix = `shared${Date.now()}-`;
+				const patterns = Array.from({ length: 40 }, (_, i) => heavy(i, prefix));
+				const sharedWarning = `Pattern is not checked: analyzing the backtracking of the patterns of the schemas that share a budget of ${DEFAULT_PATTERN_ANALYSIS_BUDGET} steps takes more than that budget`;
+				// Alone, each schema of one pattern is analyzed within its own budget.
+				for (const pattern of patterns.slice(0, 3)) {
+					assert.deepStrictEqual(compile({ pattern }).warnings, []);
+				}
+				// Sharing one budget, the schemas after those it covers have their pattern refused.
+				let left = DEFAULT_PATTERN_ANALYSIS_BUDGET;
+				let covered = 0;
+				while (covered < patterns.length && workOf(patterns[covered]) <= left) {
+					left -= workOf(patterns[covered]);
+					covered++;
+				}
+				assert.ok(covered >= 3 && covered < 20, `${covered} patterns fit in the budget`);
+				const budget = new PatternAnalysisBudget();
+				const runs = getPatternAnalysisRunCount();
+				const outcomes = patterns.map(pattern => compile({ pattern }, { sharedPatternAnalysisBudget: budget }).warnings.map(w => w.message));
+				assert.deepStrictEqual(outcomes, patterns.map((_, i) => i < covered ? [] : [sharedWarning]));
+				// The three patterns compiled alone are not analyzed again, and nothing is once the budget is spent.
+				assert.strictEqual(getPatternAnalysisRunCount() - runs, covered - 3 + (left > 0 ? 1 : 0));
+				assert.strictEqual(budget.workLeft, 0);
+				// Compiled again under the same budget, a pattern it paid for is still asserted, one it refused is still refused.
+				const again = compile({ properties: { a: { pattern: patterns[0] }, b: { pattern: patterns[covered] } } }, { sharedPatternAnalysisBudget: budget });
+				assert.deepStrictEqual(again.warnings.map(w => [w.path, w.message]), [['/properties/b/pattern', sharedWarning]]);
+				assertInvalid(again, { a: 'x' }, 'pattern');
+				// A per-compilation budget is ignored when a shared one is given.
+				assert.deepStrictEqual(compile({ pattern: patterns[0] }, { sharedPatternAnalysisBudget: new PatternAnalysisBudget(), patternAnalysisBudget: 0 }).warnings, []);
+			});
+
+			test('a repeated pattern is analyzed once, and schemas of usual patterns stay within the budget', () => {
+				// 4000 copies of the slowest pattern: about 48 s without the budget, all of it analyzing the same pattern again.
+				const started = Date.now();
+				const repeated = compile(schemaOf(Array.from({ length: 4000 }, () => heavy(0))));
+				assert.ok(Date.now() - started < 1500, `took ${Date.now() - started} ms`);
+				assert.deepStrictEqual(repeated.warnings, []);
+				assertInvalid(repeated, { p3999: '0:x' }, 'pattern');
+				const usual = compile(schemaOf(Array.from({ length: 4000 }, (_, i) => `^${i}\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$`)));
+				assert.deepStrictEqual(usual.warnings, []);
+				assertValid(usual, { p3999: '3999.1.0-rc.1' });
+				assertInvalid(usual, { p3999: '3999.01.0' }, 'pattern');
+			});
+
+			test('an analysis found from an earlier compilation is charged what it took, so the budget decides alone', () => {
+				const pattern = heavy(1);
+				const work = workOf(pattern);
+				assert.deepStrictEqual(compile({ pattern }).warnings, []); // analyzed (and kept)
+				const tight = (budget: number) => compile({ pattern }, { patternAnalysisBudget: budget }).warnings.map(w => w.message);
+				assert.deepStrictEqual(tight(work - 1), [budgetWarning.replace(String(DEFAULT_PATTERN_ANALYSIS_BUDGET), String(work - 1))]);
+				assert.deepStrictEqual(tight(work), []);
+				// A pattern beyond the budget uses up the rest (its analysis stopped there): every later pattern that needs
+				// an analysis is refused, even one that would fit in what was left; a repeat of one analyzed before is not.
+				const later = compile({ properties: { a: { pattern }, b: { pattern: heavy(2) }, c: { pattern: '^x+$' }, d: { pattern } } }, { patternAnalysisBudget: work + workOf('^x+$') });
+				assert.deepStrictEqual(later.warnings.map(w => w.path), ['/properties/b/pattern', '/properties/c/pattern']);
+				assertInvalid(later, { d: '1:x' }, 'pattern');
+			});
 		});
 	});
 
@@ -512,10 +910,21 @@ suite('JSON Schema Validator', () => {
 			assert.ok(typeErrors.some(error => error.code === 'invalid-schema' && error.path === '/type'), JSON.stringify(typeErrors));
 			assert.deepStrictEqual(validateJsonSchemaDocument({ $schema: 'https://json-schema.org/draft/2019-09/schema' }).map(error => error.code), ['unsupported-dialect']);
 			assert.deepStrictEqual(validateJsonSchemaDocument({ $ref: 'https://example.com/other.json' }).map(error => error.code), ['remote-ref']);
-			assert.deepStrictEqual(validateJsonSchemaDocument({ pattern: '(a+)+' }).map(error => error.code), ['invalid-pattern']);
+			assert.deepStrictEqual(validateJsonSchemaDocument({ pattern: 'a'.repeat(5000) }).map(error => error.code), ['invalid-pattern']);
 			assert.deepStrictEqual(validateJsonSchemaDocument({ $id: 'urn:example:foo-bar-baz-qux#somepart' }).map(error => error.code), ['invalid-schema']);
 			assert.ok(validateJsonSchemaDocument({ $schema: 'http://json-schema.org/draft-07/schema#', items: [5] }).some(error => error.code === 'invalid-schema'));
 			assert.ok(validateJsonSchemaDocument(5).some(error => error.code === 'invalid-schema'));
+		});
+
+		test('a document with a pattern that cannot be used is accepted with a warning', () => {
+			for (const pattern of ['(a+)+', '^([a-z0-9-]+\\.)+[a-z]{2,}$', '[']) {
+				const schema = { type: 'object', properties: { host: { type: 'string', pattern } } };
+				assert.deepStrictEqual(validateJsonSchemaDocument(schema), [], pattern);
+				const check = checkJsonSchemaDocument(schema);
+				assert.deepStrictEqual(check.errors, [], pattern);
+				assert.deepStrictEqual(check.warnings.map(w => [w.code, w.path]), [['invalid-pattern', '/properties/host/pattern']], pattern);
+			}
+			assert.deepStrictEqual(checkJsonSchemaDocument({ type: 'string', pattern: '^\\d+\\-\\d+$' }), { errors: [], warnings: [] });
 		});
 	});
 

@@ -53,9 +53,21 @@ export interface ISchemaResource {
 	readonly dynamicAnchors: Map<string, SchemaNode>;
 }
 
+/** A regular expression the backtracking guard accepted (see `compilePattern`). */
+export interface IGuardedPattern {
+	readonly regex: RegExp;
+	/**
+	 * Strings longer than this many UTF-16 code units are not tested, so that
+	 * one test stays within the backtracking budget: whether they match is
+	 * unknown and nothing is asserted about them. `Infinity` when every string
+	 * is tested.
+	 */
+	readonly maxInputLength: number;
+}
+
 export interface IPatternProperty {
 	readonly source: string;
-	readonly regex: RegExp;
+	readonly pattern: IGuardedPattern;
 	readonly node: SchemaNode;
 }
 
@@ -95,7 +107,7 @@ export class SchemaNode {
 	// Validation: strings
 	public minLength: number | undefined;
 	public maxLength: number | undefined;
-	public pattern: RegExp | undefined;
+	public pattern: IGuardedPattern | undefined;
 	public format: string | undefined;
 
 	// Validation and applicators: objects
@@ -105,6 +117,11 @@ export class SchemaNode {
 	public dependentRequired: ReadonlyMap<string, readonly string[]> | undefined;
 	public properties: ReadonlyMap<string, SchemaNode> | undefined;
 	public patternProperties: readonly IPatternProperty[] | undefined;
+	/**
+	 * A `patternProperties` key could not be compiled: any property might match
+	 * it, so no property is left for `additionalProperties` (nothing is asserted).
+	 */
+	public opaquePatternProperties = false;
 	public additionalProperties: SchemaNode | undefined;
 	public unevaluatedProperties: SchemaNode | undefined;
 	public propertyNames: SchemaNode | undefined;
@@ -152,8 +169,8 @@ export interface IKeywordCompileContext {
 	readonly dialect: JsonSchemaDialect;
 	/** Compiles a subschema found at `pointerSuffix` (e.g. `/properties/foo`) below the current schema. */
 	child(raw: unknown, pointerSuffix: string): SchemaNode;
-	/** Compiles a guarded regular expression; reports a compile error and returns undefined if rejected. */
-	pattern(source: string, pointerSuffix: string): RegExp | undefined;
+	/** Compiles a guarded regular expression; returns undefined (after reporting a warning or an error) if it cannot be used. */
+	pattern(source: string, pointerSuffix: string): IGuardedPattern | undefined;
 	/** Registers a reference to be resolved once the whole document has been walked. */
 	ref(node: SchemaNode, keyword: '$ref' | '$dynamicRef', value: string): void;
 	/** Reports an `invalid-schema` error at `pointerSuffix` below the current schema. */
@@ -368,10 +385,12 @@ export function parseKeywords(raw: JsonObject, node: SchemaNode, ctx: IKeywordCo
 					invalid('patternProperties', `'patternProperties/${source}' must be a schema`);
 					continue;
 				}
-				const regex = ctx.pattern(source, '/patternProperties/' + escapePointerToken(source));
+				const pattern = ctx.pattern(source, '/patternProperties/' + escapePointerToken(source));
 				const child = ctx.child(item, '/patternProperties/' + escapePointerToken(source));
-				if (regex) {
-					result.push({ source, regex, node: child });
+				if (pattern) {
+					result.push({ source, pattern, node: child });
+				} else {
+					target.opaquePatternProperties = true;
 				}
 			}
 			target.patternProperties = result;
@@ -840,10 +859,11 @@ function evaluateString(node: SchemaNode, value: string, path: string, ctx: IEva
 			valid = false;
 		}
 	}
-	if (node.pattern) {
+	// A string longer than the pattern's input limit is not tested: nothing is asserted about it.
+	if (node.pattern && value.length <= node.pattern.maxInputLength) {
 		ctx.tick();
-		if (!node.pattern.test(value)) {
-			ctx.error(node, 'pattern', path, `must match pattern '${node.pattern.source}'`);
+		if (!node.pattern.regex.test(value)) {
+			ctx.error(node, 'pattern', path, `must match pattern '${node.pattern.regex.source}'`);
 			valid = false;
 		}
 	}
@@ -980,13 +1000,20 @@ function evaluateObject(node: SchemaNode, object: JsonObject, path: string, ctx:
 			}
 			if (node.patternProperties) {
 				for (const patternProperty of node.patternProperties) {
-					if (patternProperty.regex.test(key)) {
+					if (key.length > patternProperty.pattern.maxInputLength) {
+						// Too long to be tested: it may match, so nothing is asserted about it.
+						evaluated = true;
+					} else if (patternProperty.pattern.regex.test(key)) {
 						if (!ctx.evaluateChild(patternProperty.node, object[key], childPath(path, key))) {
 							valid = false;
 						}
 						evaluated = true;
 					}
 				}
+			}
+			if (!evaluated && node.opaquePatternProperties) {
+				// It may match a pattern that could not be compiled: nothing is asserted about it.
+				evaluated = true;
 			}
 			if (!evaluated && node.additionalProperties) {
 				if (!ctx.evaluateChild(node.additionalProperties, object[key], childPath(path, key))) {
