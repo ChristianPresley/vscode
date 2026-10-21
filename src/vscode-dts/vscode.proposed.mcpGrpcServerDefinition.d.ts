@@ -12,7 +12,10 @@ declare module 'vscode' {
 	 */
 	export enum McpGrpcBinding {
 		/**
-		 * Try the JSON-RPC tunnel first and fall back to the typed service.
+		 * The JSON-RPC tunnel. The editor never switches to Google's typed service
+		 * on its own; use {@link McpGrpcBinding.Typed Typed} for servers that only
+		 * offer it. A server without the tunnel fails to start with an error that
+		 * says so.
 		 */
 		Auto = 1,
 		/**
@@ -21,7 +24,9 @@ declare module 'vscode' {
 		 */
 		Tunnel = 2,
 		/**
-		 * Call the methods of Google's typed `model_context_protocol.Mcp` service.
+		 * Call the methods of Google's typed `model_context_protocol.Mcp` service,
+		 * for servers that do not offer the tunnel. The typed service carries no
+		 * subscriptions, notifications, pagination beyond the first page or tasks.
 		 */
 		Typed = 3,
 	}
@@ -30,9 +35,10 @@ declare module 'vscode' {
 	 * McpGrpcServerDefinition represents an MCP server available over gRPC
 	 * (HTTP/2). The editor connects to {@link McpHttpServerDefinition.uri},
 	 * which must use the `grpc://` (plaintext) or `grpcs://` (TLS) scheme, and
-	 * speaks either the zig-sdk JSON-RPC tunnel service
-	 * (`/mcp.zig.transport.v1.Mcp/Call`) or the typed
-	 * `model_context_protocol.Mcp` service, depending on {@link binding}.
+	 * speaks the zig-sdk JSON-RPC tunnel service
+	 * (`/mcp.zig.transport.v1.Mcp/Call`), or the typed
+	 * `model_context_protocol.Mcp` service when {@link binding} is
+	 * {@link McpGrpcBinding.Typed}.
 	 *
 	 * Because it extends {@link McpHttpServerDefinition}, instances can be
 	 * returned from a {@link McpServerDefinitionProvider} wherever a
@@ -45,8 +51,11 @@ declare module 'vscode' {
 		 */
 		readonly tls?: {
 			/**
-			 * Path to a PEM-encoded certificate authority bundle used to verify the
-			 * server certificate, in addition to the system roots.
+			 * Path to a PEM-encoded certificate authority bundle that is trusted for
+			 * the server certificate in addition to the certificate authorities that
+			 * HTTPS requests use: the bundled roots and, when the
+			 * `http.systemCertificates` setting is on, the operating system's
+			 * certificate store.
 			 */
 			ca?: string;
 			/**
@@ -63,9 +72,23 @@ declare module 'vscode' {
 
 		/**
 		 * The gRPC service binding the server implements. When unset,
-		 * {@link McpGrpcBinding.Auto} is used.
+		 * {@link McpGrpcBinding.Auto} is used, which is the JSON-RPC tunnel; only
+		 * {@link McpGrpcBinding.Typed} calls the typed service.
 		 */
 		readonly binding?: McpGrpcBinding;
+
+		/**
+		 * The interval between HTTP/2 keep-alive pings in milliseconds, sent only
+		 * while at least one call is open (an idle connection is not pinged, as
+		 * gRPC clients do by default). gRPC servers allow one ping every 5 minutes
+		 * by default and close the connection of a client that pings more often,
+		 * so a value below 300000 is raised to it, and the interval is doubled for
+		 * the next connection after a server answers with `too_many_pings`; `0`
+		 * sends no pings at all. When unset, a ping is sent every 5 minutes and 10
+		 * seconds only while a `subscriptions/listen` stream is open, so that a NAT
+		 * or load balancer does not cut a stream that has no events for a while.
+		 */
+		keepAliveMs?: number;
 
 		/**
 		 * @param label The human-readable name of the server.

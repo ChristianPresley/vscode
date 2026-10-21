@@ -27,15 +27,16 @@ import { McpGrpcHandle } from './extHostMcpGrpc.js';
 export class NodeExtHostMpcService extends ExtHostMcpService {
 	private nodeServers = this._register(new DisposableMap<number, McpStdioStateHandler>());
 
-	protected override _startMcp(id: number, launch: McpServerLaunch, defaultCwd?: URI, errorOnUserInteraction?: boolean): void {
+	protected override _startMcp(id: number, launch: McpServerLaunch, defaultCwd?: URI, errorOnUserInteraction?: boolean): void | Promise<void> {
 		if (launch.type === McpServerTransportType.Stdio) {
-			this.startNodeMpc(id, launch, defaultCwd);
+			// A rejection reaches `$startMcp`, which reports the Error state.
+			return this.startNodeMpc(id, launch, defaultCwd);
 		} else if (launch.type === McpServerTransportType.HTTP) {
 			this._sseEventSources.set(id, new McpHTTPHandleNode(id, launch, this._proxy, this._logService, errorOnUserInteraction));
 		} else if (launch.type === McpServerTransportType.Grpc) {
 			this._sseEventSources.set(id, new McpGrpcHandle(id, launch, this._proxy, this._logService, errorOnUserInteraction));
 		} else {
-			super._startMcp(id, launch, defaultCwd, errorOnUserInteraction);
+			return super._startMcp(id, launch, defaultCwd, errorOnUserInteraction);
 		}
 	}
 

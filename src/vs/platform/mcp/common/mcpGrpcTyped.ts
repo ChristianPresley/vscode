@@ -124,21 +124,74 @@ export function routingMetadataFor(rpc: ITypedRpc, params: unknown): Record<stri
 	return typeof value === 'string' ? { [key]: value } : {};
 }
 
+/** What a typed response tells about its server (see {@link decodeTypedServerIdentity}). */
+export interface ITypedServerIdentity {
+	/** The `serverInfo` in the `_meta` of the response (`common.metadata`). */
+	readonly serverInfo?: MCP.Implementation;
+	/** The `instructions` of the response (`common.instructions`, sent on an initial response). */
+	readonly instructions?: string;
+}
+
+/**
+ * The server identity a response message of `rpc` carries in its common
+ * fields: the `serverInfo` a 2026-07-28 server puts in the `_meta` of every
+ * result, and the `instructions` of an initial response. Fields that are
+ * absent, empty or not of their MCP shape are left out; malformed protobuf
+ * gives an empty identity.
+ */
+export function decodeTypedServerIdentity(rpc: ITypedRpc, bytes: Uint8Array): ITypedServerIdentity {
+	let common: Msg | undefined;
+	try {
+		common = getMessage(decodeMessage(rpc.response, bytes), 'common');
+	} catch {
+		return {};
+	}
+	if (!common) {
+		return {};
+	}
+	const identity: { serverInfo?: MCP.Implementation; instructions?: string } = {};
+	const instructions = common.instructions;
+	if (typeof instructions === 'string' && instructions.length > 0) {
+		identity.instructions = instructions;
+	}
+	const metadata = common.metadata;
+	if (isObject(metadata)) {
+		let meta: JsonObject | undefined;
+		try {
+			meta = structToJson(metadata);
+		} catch {
+			meta = undefined;
+		}
+		const info = meta && hasOwn(meta, META_SERVER_INFO) ? meta[META_SERVER_INFO] : undefined;
+		if (isObject(info) && typeof info.name === 'string' && info.name.length > 0) {
+			// Kept as the server sent it (title, icons, ...), as the protocol engine keeps a later result's serverInfo.
+			identity.serverInfo = { ...(info as Partial<MCP.Implementation>), name: info.name, version: typeof info.version === 'string' ? info.version : '' };
+		}
+	}
+	return identity;
+}
+
 /**
  * The typed binding has no `server/discover`. A client synthesizes the
  * discover result of a typed server: every capability the eight RPCs cover,
- * the one protocol revision the binding speaks, and the authority as the
- * server name.
+ * the one protocol revision the binding speaks, the `serverInfo` and
+ * `instructions` of `identity` (what a typed response of the server told,
+ * see {@link decodeTypedServerIdentity}) and, without a `serverInfo`, the
+ * authority as the server name.
  */
-export function synthesizeDiscoverResult(authority: string): MCP.DiscoverResult {
-	return {
+export function synthesizeDiscoverResult(authority: string, identity: ITypedServerIdentity = {}): MCP.DiscoverResult {
+	const result: MCP.DiscoverResult = {
 		supportedVersions: [LATEST_MCP_PROTOCOL_VERSION],
 		capabilities: { tools: {}, prompts: {}, resources: {}, completions: {} },
 		ttlMs: 0,
 		cacheScope: 'private',
 		resultType: 'complete',
-		_meta: { [META_SERVER_INFO]: { name: authority, version: '' } },
+		_meta: { [META_SERVER_INFO]: identity.serverInfo ?? { name: authority, version: '' } },
 	};
+	if (identity.instructions !== undefined) {
+		result.instructions = identity.instructions;
+	}
+	return result;
 }
 
 function encode(descriptor: IMessageDescriptor, message: Msg): Uint8Array {

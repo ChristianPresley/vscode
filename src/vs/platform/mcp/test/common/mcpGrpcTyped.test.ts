@@ -5,10 +5,11 @@
 
 import assert from 'assert';
 import { decodeMessage, encodeMessage } from '../../../../base/common/protobuf/codec.js';
+import { jsonToStruct } from '../../../../base/common/protobuf/wellKnown.js';
 import { ProtoDecodeError, decodeUtf8 } from '../../../../base/common/protobuf/wire.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { CALL_TOOL_RESPONSE, ITypedRpc, LIST_TOOLS_REQUEST, LIST_TOOLS_RESPONSE, RESULT_TYPE, TUNNEL_CALL_PATH, TYPED_PATH_PREFIX, TYPED_RPCS, typedRpcForMethod, typedRpcForPath } from '../../common/mcpGrpcProto.js';
-import { decodeTypedRequest, decodeTypedResponse, encodeTypedRequest, encodeTypedResponse, McpUnexpressibleError, McpUnexpressibleKind, routingMetadataFor, synthesizeDiscoverResult } from '../../common/mcpGrpcTyped.js';
+import { decodeTypedRequest, decodeTypedResponse, decodeTypedServerIdentity, encodeTypedRequest, encodeTypedResponse, McpUnexpressibleError, McpUnexpressibleKind, routingMetadataFor, synthesizeDiscoverResult } from '../../common/mcpGrpcTyped.js';
 
 function rpcOf(method: string): ITypedRpc {
 	const rpc = typedRpcForMethod(method);
@@ -417,6 +418,52 @@ suite('MCP - gRPC typed binding', () => {
 				resultType: 'complete',
 				_meta: { 'io.modelcontextprotocol/serverInfo': { name: 'mcp.example:50051', version: '' } },
 			});
+		});
+
+		test('takes serverInfo and instructions from what a typed response told', () => {
+			const serverInfo = { name: 'mcp-conformance-test-server', version: '0.1.0', title: 'Conformance' };
+			assert.deepStrictEqual(synthesizeDiscoverResult('127.0.0.1:50052', { serverInfo, instructions: 'Use echo.' }), {
+				supportedVersions: ['2026-07-28'],
+				capabilities: { tools: {}, prompts: {}, resources: {}, completions: {} },
+				ttlMs: 0,
+				cacheScope: 'private',
+				resultType: 'complete',
+				instructions: 'Use echo.',
+				_meta: { 'io.modelcontextprotocol/serverInfo': serverInfo },
+			});
+			assert.deepStrictEqual(synthesizeDiscoverResult('127.0.0.1:50052', { instructions: 'Use echo.' })._meta, { 'io.modelcontextprotocol/serverInfo': { name: '127.0.0.1:50052', version: '' } });
+		});
+	});
+
+	suite('decodeTypedServerIdentity', () => {
+		const listTools = () => rpcOf('tools/list');
+		const withCommon = (common: Record<string, unknown>) => encodeMessage(LIST_TOOLS_RESPONSE, { common, tools: [] });
+
+		test('reads serverInfo from common.metadata and instructions from common.instructions', () => {
+			const serverInfo = { name: 'mcp-conformance-test-server', version: '0.1.0', icons: [{ src: 'https://example.com/i.png' }] };
+			assert.deepStrictEqual(decodeTypedServerIdentity(listTools(), withCommon({
+				instructions: 'Use echo.',
+				metadata: jsonToStruct({ 'io.modelcontextprotocol/serverInfo': serverInfo, other: 1 }),
+			})), { serverInfo, instructions: 'Use echo.' });
+		});
+
+		test('a server encoding its _meta the way encodeTypedResponse does is understood', () => {
+			const serverInfo = { name: 'typed', version: '2' };
+			const bytes = encodeTypedResponse(listTools(), { resultType: 'complete', tools: [], ttlMs: 0, cacheScope: 'private', _meta: { 'io.modelcontextprotocol/serverInfo': serverInfo } });
+			assert.deepStrictEqual(decodeTypedServerIdentity(listTools(), bytes), { serverInfo });
+		});
+
+		test('leaves out what is absent, empty or not of its MCP shape', () => {
+			const meta = (info: unknown) => withCommon({ metadata: jsonToStruct({ 'io.modelcontextprotocol/serverInfo': info }) });
+			assert.deepStrictEqual([
+				decodeTypedServerIdentity(listTools(), encodeMessage(LIST_TOOLS_RESPONSE, { tools: [] })),
+				decodeTypedServerIdentity(listTools(), withCommon({ instructions: '' })),
+				decodeTypedServerIdentity(listTools(), meta({ name: '', version: '1' })),
+				decodeTypedServerIdentity(listTools(), meta({ version: '1' })),
+				decodeTypedServerIdentity(listTools(), meta('a string')),
+				decodeTypedServerIdentity(listTools(), meta({ name: 'no-version' })),
+				decodeTypedServerIdentity(listTools(), new Uint8Array([0xff, 0xff, 0xff])),
+			], [{}, {}, {}, {}, {}, { serverInfo: { name: 'no-version', version: '' } }, {}]);
 		});
 	});
 });

@@ -9,6 +9,7 @@ import { createRequire } from 'node:module';
 import { homedir } from 'os';
 import type * as netType from 'net';
 import type * as tlsType from 'tls';
+import { CancellationTokenSource } from '../../../base/common/cancellation.js';
 import { CancellationError } from '../../../base/common/errors.js';
 import { GrpcStatus, decodeBinaryMetadata, grpcStatusName } from '../../../base/common/grpc/status.js';
 import { JsonRpcId } from '../../../base/common/jsonRpcProtocol.js';
@@ -18,15 +19,16 @@ import { Disposable, IDisposable, toDisposable } from '../../../base/common/life
 import { decodeMessage, encodeMessage } from '../../../base/common/protobuf/codec.js';
 import { decodeUtf8, encodeUtf8 } from '../../../base/common/protobuf/wire.js';
 import { GrpcChannel, IGrpcCall, IGrpcCallOptions, IGrpcChannelOptions, IGrpcTrailers } from '../../../base/node/grpcChannel.js';
+import { localize } from '../../../nls.js';
 import { canLog, ILogService, LogLevel } from '../../../platform/log/common/log.js';
 import { JSON_RPC_MESSAGE, MAX_ERROR_BIN_BYTES, MCP_ERROR_BIN_TRAILER, MCP_ERROR_CODE_TRAILER, MCP_PROTOCOL_VERSION_METADATA, TUNNEL_CALL_PATH, typedRpcForMethod } from '../../../platform/mcp/common/mcpGrpcProto.js';
-import { decodeTypedResponse, encodeTypedRequest, McpUnexpressibleError, routingMetadataFor, synthesizeDiscoverResult } from '../../../platform/mcp/common/mcpGrpcTyped.js';
-import { isHeaderSafeAscii } from '../../../platform/mcp/common/mcpHttpHeaders.js';
+import { decodeTypedResponse, decodeTypedServerIdentity, encodeTypedRequest, ITypedServerIdentity, McpUnexpressibleError, routingMetadataFor, synthesizeDiscoverResult } from '../../../platform/mcp/common/mcpGrpcTyped.js';
+import { buildMirroredHeaders, isHeaderSafeAscii } from '../../../platform/mcp/common/mcpHttpHeaders.js';
 import { LATEST_MCP_PROTOCOL_VERSION } from '../../../platform/mcp/common/mcpProtocolVersions.js';
 import product from '../../../platform/product/common/product.js';
 import { IMcpMessageEnvelope, IMcpRequestAbort, McpConnectionState, McpServerTransportGrpc } from '../../contrib/mcp/common/mcpTypes.js';
 import { MainThreadMcpShape } from '../common/extHost.protocol.js';
-import { CommonResponse, IMcpExtHostHandle, McpAuthHeaderProvider } from '../common/extHostMcp.js';
+import { CommonResponse, IMcpExtHostHandle, McpAuthHeaderProvider, stripCrossOriginHeaders } from '../common/extHostMcp.js';
 import { MCP_OAUTH_MAX_CHALLENGE_CYCLES } from '../common/mcpOAuthClientFactory.js';
 
 /**
@@ -39,11 +41,17 @@ import { MCP_OAUTH_MAX_CHALLENGE_CYCLES } from '../common/mcpOAuthClientFactory.
  * - Google's typed service `model_context_protocol.Mcp`: eight unary RPCs that
  *   carry the list, read, get, call and complete methods as typed messages.
  *
- * With `binding: 'auto'` (the default) the handle uses the tunnel and switches
- * to the typed binding when the server answers the tunnel with a bare
- * UNIMPLEMENTED. A typed-only server has no `server/discover` and no
- * `subscriptions/listen`: the handle answers the first with a synthesized
- * result and the second with -32601.
+ * `binding: 'auto'` (the default) is the tunnel, exactly as `binding: 'tunnel'`:
+ * a custom transport of MCP keeps JSON-RPC, so the handle never switches to the
+ * typed service on its own, and speaks it only with an explicit
+ * `binding: 'typed'`. A gRPC server (HTTP 200) that answers the tunnel's
+ * `server/discover` with a bare UNIMPLEMENTED does not serve the tunnel: the
+ * discover, and with it the connection, fails with {@link noTunnelMessage},
+ * which names the typed binding; any other HTTP status is a transport failure
+ * (`http-status`). A typed-only server has no `server/discover` and no
+ * `subscriptions/listen`: on the typed binding the handle answers the first
+ * with a synthesized result (with the `serverInfo` and `instructions` of the
+ * server's first ListTools response) and the second with -32601.
  *
  * As on the other transports, the handle never invents JSON-RPC errors for
  * transport conditions: a JSON-RPC error the server put in the trailers
@@ -129,6 +137,64 @@ export function isLoopbackHost(host: string): boolean {
 /** The deadline of the calls that get one by default (the request timeout of the zig-sdk client). */
 export const DEFAULT_GRPC_DEADLINE_MS = 60_000;
 
+/**
+ * The shortest keepalive interval the handle uses. grpc-core and grpc-js
+ * servers allow one PING every 5 minutes by default and answer more frequent
+ * ones with GOAWAY `too_many_pings` (ENHANCE_YOUR_CALM), which ends every
+ * call on the connection.
+ */
+export const MIN_GRPC_KEEPALIVE_MS = 300_000;
+
+/**
+ * The keepalive interval of a connection while it carries a
+ * `subscriptions/listen` stream, when `keepAliveMs` is unset: a stream that
+ * has no events for minutes is otherwise cut by the idle timeout of a NAT or
+ * load balancer. It is 10 s above {@link MIN_GRPC_KEEPALIVE_MS}, so that
+ * timer and network jitter never make a PING arrive early for the ping
+ * policy of the server (a "ping strike"; the third ends the connection).
+ */
+export const DEFAULT_GRPC_LISTEN_KEEPALIVE_MS = MIN_GRPC_KEEPALIVE_MS + 10_000;
+
+/** The longest delay a timer can wait (2^31-1 ms, about 24.8 days): the largest `keepAliveMs` and `deadlineMs` of the schema. */
+export const MAX_GRPC_TIMER_MS = 2_147_483_647;
+
+/** Whether a configured `deadlineMs` is usable: a positive, finite number. */
+function isValidDeadline(ms: number | undefined): ms is number {
+	return typeof ms === 'number' && Number.isFinite(ms) && ms > 0;
+}
+
+/** Whether a configured `keepAliveMs` is usable: 0 (no pings) or a positive, finite number. */
+function isValidKeepAlive(ms: number | undefined): ms is number {
+	return typeof ms === 'number' && Number.isFinite(ms) && ms >= 0;
+}
+
+/**
+ * The keepalive of the connection for a configured `keepAliveMs`, the same
+ * in mcp.json and in `McpGrpcServerDefinition`: `0` sends no PINGs at all; a
+ * positive value sends one at that interval only while at least one call is
+ * open (the channel sends none on an idle connection, whose PINGs gRPC
+ * servers count as strikes, and doubles the interval for the next connection
+ * after a `too_many_pings` GOAWAY), raised to {@link MIN_GRPC_KEEPALIVE_MS}
+ * and cut to {@link MAX_GRPC_TIMER_MS}; unset (or a value that is not a
+ * number of milliseconds, which is ignored) sends one every
+ * {@link DEFAULT_GRPC_LISTEN_KEEPALIVE_MS} only while a
+ * `subscriptions/listen` stream is open.
+ */
+export function grpcKeepAliveFor(configuredMs: number | undefined): Pick<IGrpcChannelOptions, 'keepAliveTimeMs' | 'longLivedKeepAliveTimeMs'> {
+	if (!isValidKeepAlive(configuredMs)) {
+		return { longLivedKeepAliveTimeMs: DEFAULT_GRPC_LISTEN_KEEPALIVE_MS };
+	}
+	if (configuredMs === 0) {
+		return {};
+	}
+	return { keepAliveTimeMs: Math.min(Math.max(configuredMs, MIN_GRPC_KEEPALIVE_MS), MAX_GRPC_TIMER_MS) };
+}
+
+/** Whether a call is a `subscriptions/listen` stream: it gets no deadline, and the connection is kept alive while it is open. */
+function isListenCall(method: string, kind: IMcpMessageEnvelope['kind'] | undefined): boolean {
+	return kind === 'listen' || method === 'subscriptions/listen';
+}
+
 /** The methods that are bounded by {@link DEFAULT_GRPC_DEADLINE_MS} unless a deadline is configured. */
 const DEFAULT_DEADLINE_METHODS: ReadonlySet<string> = new Set([
 	'server/discover',
@@ -149,18 +215,20 @@ function isInputRequiredRetry(params: unknown): boolean {
 /**
  * The deadline of a call, sent as `grpc-timeout`. A `subscriptions/listen`
  * stream never gets one. Otherwise the deadline of the envelope wins, then the
- * configured `deadlineMs`; without either only the discover, list, read,
- * prompt and completion methods are bounded (60 s), so that `tools/call` and
- * the retries of `input_required` rounds can take as long as they need.
+ * configured `deadlineMs` (when it is a positive number; any other value is
+ * treated as unset, since a zero deadline would fail every call at once);
+ * without either only the discover, list, read, prompt and completion methods
+ * are bounded (60 s), so that `tools/call` and the retries of `input_required`
+ * rounds can take as long as they need.
  */
 export function grpcDeadlineFor(method: string, kind: IMcpMessageEnvelope['kind'] | undefined, params: unknown, configuredMs: number | undefined, envelopeMs?: number): number | undefined {
-	if (kind === 'listen' || method === 'subscriptions/listen') {
+	if (isListenCall(method, kind)) {
 		return undefined;
 	}
 	if (envelopeMs !== undefined) {
 		return envelopeMs;
 	}
-	if (configuredMs !== undefined) {
+	if (isValidDeadline(configuredMs)) {
 		return configuredMs;
 	}
 	if (isInputRequiredRetry(params)) {
@@ -236,6 +304,20 @@ export function mapGrpcTrailersToJsonRpc(trailers: IGrpcTrailers, requestId: Jso
 		}
 	}
 	const name = grpcStatusName(trailers.status);
+	if (trailers.httpStatus !== undefined && trailers.httpStatus !== 200) {
+		// Not a gRPC answer (a web server, or an intermediary refusing the call): a transport
+		// failure, never the JSON-RPC error a gRPC status-only failure may stand for.
+		const synthesized = `HTTP status ${trailers.httpStatus}`;
+		return {
+			kind: 'abort',
+			abort: {
+				reason: 'http-status',
+				httpStatus: trailers.httpStatus,
+				grpcStatus: trailers.status,
+				message: `${synthesized} instead of a gRPC response (${name})${trailers.message && trailers.message !== synthesized ? `: ${trailers.message}` : ''}`,
+			},
+		};
+	}
 	return {
 		kind: 'abort',
 		abort: { reason: 'grpc-status', grpcStatus: trailers.status, message: trailers.message ? `${name}: ${trailers.message}` : name },
@@ -245,6 +327,44 @@ export function mapGrpcTrailersToJsonRpc(trailers: IGrpcTrailers, requestId: Jso
 /** Whether the trailers carry a JSON-RPC error of the server (so the path is an MCP endpoint). */
 function hasMcpError(trailers: IGrpcTrailers): boolean {
 	return trailers.raw[MCP_ERROR_CODE_TRAILER] !== undefined || trailers.raw[MCP_ERROR_BIN_TRAILER] !== undefined;
+}
+
+/**
+ * Whether the peer answered as a gRPC server: HTTP 200 with a `grpc-status`
+ * of its own. Only such an UNIMPLEMENTED means the tunnel is missing; the
+ * channel also maps an HTTP 404 of a web server to UNIMPLEMENTED.
+ */
+function answeredAsGrpcServer(trailers: IGrpcTrailers): boolean {
+	return trailers.httpStatus === 200 && trailers.raw['grpc-status'] !== undefined;
+}
+
+/**
+ * Whether the trailers of a tunnel `server/discover` say that the server does
+ * not serve the tunnel: a gRPC server's bare UNIMPLEMENTED, without the
+ * `mcp-error-code` or `mcp-error-bin` of a JSON-RPC error (a tunnel server
+ * answers a method it does not know with -32601 in `mcp-error-code`).
+ */
+function isMissingTunnel(trailers: IGrpcTrailers): boolean {
+	return trailers.status === GrpcStatus.UNIMPLEMENTED && !hasMcpError(trailers) && answeredAsGrpcServer(trailers);
+}
+
+/**
+ * The error of a connection whose server does not serve the JSON-RPC tunnel.
+ * `binding: 'auto'` never switches to the typed binding (Google's typed
+ * service keeps no JSON-RPC, which MCP asks of custom transports), so the
+ * message names the setting that does, both in a configuration and in the
+ * `McpGrpcServerDefinition` of an extension (whose users cannot change it).
+ * UNIMPLEMENTED only says that the server has no such method, and its
+ * `grpc-message` says more (another gRPC service listening on that port
+ * names the service it does not know), so when the server sent one it is
+ * part of the message instead of the claim that the tunnel is missing.
+ */
+function noTunnelMessage(authority: string, serverMessage: string | undefined): string {
+	const reason = serverMessage?.trim();
+	if (reason) {
+		return localize('mcpGrpc.noTunnelWithReason', "The gRPC server at {0} answered a call to the MCP JSON-RPC tunnel service (mcp.zig.transport.v1.Mcp) with UNIMPLEMENTED: \"{1}\". If it only offers Google's typed MCP service, set \"binding\": \"typed\" in its configuration, or, if an extension provides the server, ask its author to use McpGrpcBinding.Typed.", authority, reason);
+	}
+	return localize('mcpGrpc.noTunnel', "The gRPC server at {0} does not implement the MCP JSON-RPC tunnel service (mcp.zig.transport.v1.Mcp). If it only offers Google's typed MCP service, set \"binding\": \"typed\" in its configuration, or, if an extension provides the server, ask its author to use McpGrpcBinding.Typed.", authority);
 }
 
 /**
@@ -259,20 +379,61 @@ function authChallengeStatus(trailers: IGrpcTrailers): 401 | 403 | undefined {
 	return trailers.status === GrpcStatus.UNAUTHENTICATED ? 401 : trailers.status === GrpcStatus.PERMISSION_DENIED ? 403 : undefined;
 }
 
+/**
+ * Whether a failed call never reached an answer of the MCP server: it was
+ * cancelled, ran out of time, lost or could not open its connection, met an
+ * authorization challenge (a status-only UNAUTHENTICATED or PERMISSION_DENIED)
+ * or got an HTTP answer that is not gRPC. A JSON-RPC error of the server in
+ * the trailers is an answer.
+ */
+function isCallFailure(trailers: IGrpcTrailers): boolean {
+	if (hasMcpError(trailers)) {
+		return false;
+	}
+	if (trailers.httpStatus !== undefined && trailers.httpStatus !== 200) {
+		return true;
+	}
+	switch (trailers.status) {
+		case GrpcStatus.CANCELLED:
+		case GrpcStatus.DEADLINE_EXCEEDED:
+		case GrpcStatus.UNAVAILABLE:
+		case GrpcStatus.UNAUTHENTICATED:
+		case GrpcStatus.PERMISSION_DENIED:
+			return true;
+		default:
+			return false;
+	}
+}
+
 //#endregion
 
 //#region Connections
 
-/** Proxy resolution of the extension host (`@vscode/proxy-agent` as patched by `proxyResolver.ts`). */
+/** Proxy resolution and certificates of the extension host (`@vscode/proxy-agent` as patched by `proxyResolver.ts`). */
 export interface IGrpcProxyLookup {
 	resolveProxyURL?(url: string): Promise<string | undefined>;
 	lookupProxyAuthorization?(proxyURL: string, proxyAuthenticate: string | string[] | undefined, state: Record<string, unknown>): Promise<string | undefined>;
+	/** The `http.proxySupport` setting of the extension host (`override`, `fallback`, `on` or `off`). */
+	getProxySupport?(): string | undefined;
+	/**
+	 * The certificate authorities the `fetch` of the extension host (and so
+	 * Streamable HTTP) verifies servers with: Node's bundled roots and the
+	 * certificates of the operating system store, when `http.systemCertificates`
+	 * is on; `undefined` when it is off (Node's bundled roots alone).
+	 */
+	loadCaCertificates?(): Promise<readonly string[] | undefined>;
 }
 
 export interface IGrpcConnectionFactoryOptions {
 	readonly secure: boolean;
-	/** PEM certificates that verify the server; when unset, the roots of the extension host. */
+	/** PEM certificates trusted for the server in addition to the roots (`tls.ca`). */
 	readonly ca?: readonly string[];
+	/**
+	 * The roots that verify the server and an HTTPS proxy, read for each
+	 * connection ({@link IGrpcProxyLookup.loadCaCertificates}); without them,
+	 * or when it resolves `undefined`, Node's bundled roots.
+	 */
+	readonly loadRootCertificates?: () => Promise<readonly string[] | undefined>;
 	/** Defaults to true; false skips the verification of the server certificate. */
 	readonly rejectUnauthorized?: boolean;
 	/** The TLS server name (SNI and certificate check); defaults to the host when it is not an IP address. */
@@ -426,7 +587,7 @@ function sendConnect(socket: netType.Socket, authority: string, authorization: s
 }
 
 /** Opens a tunnel to `authority` through an HTTP or HTTPS proxy with CONNECT, answering its authentication challenges. */
-async function connectThroughProxy(net: typeof netType, tls: typeof tlsType, proxyUrl: string, authority: string, options: IGrpcConnectionFactoryOptions, timeoutMs: number): Promise<netType.Socket> {
+async function connectThroughProxy(net: typeof netType, tls: typeof tlsType, proxyUrl: string, authority: string, options: IGrpcConnectionFactoryOptions, timeoutMs: number, roots: () => Promise<readonly string[] | undefined>): Promise<netType.Socket> {
 	const proxy = new URL(proxyUrl);
 	if (proxy.protocol !== 'http:' && proxy.protocol !== 'https:') {
 		throw new Error(`gRPC connections can only use HTTP CONNECT proxies, not '${proxy.protocol}' proxies`);
@@ -444,7 +605,7 @@ async function connectThroughProxy(net: typeof netType, tls: typeof tlsType, pro
 	}
 	for (let attempt = 0; attempt < MAX_PROXY_AUTH_ATTEMPTS; attempt++) {
 		const socket = proxy.protocol === 'https:'
-			? await connectTls(net, tls, { host: proxyHost, port: proxyPort, rejectUnauthorized: true, timeoutMs })
+			? await connectTls(net, tls, { host: proxyHost, port: proxyPort, ca: await roots(), rejectUnauthorized: true, timeoutMs })
 			: await connectPlain(net, proxyHost, proxyPort, timeoutMs);
 		const response = await sendConnect(socket, authority, authorization, timeoutMs);
 		if (response.statusCode === 200) {
@@ -471,34 +632,57 @@ async function connectThroughProxy(net: typeof netType, tls: typeof tlsType, pro
 /**
  * Creates the `createConnection` hook of a {@link GrpcChannel}: a TCP
  * connection (through the CONNECT proxy the extension host resolves for the
- * server, when there is one) and, for `grpcs://`, TLS with ALPN `h2`. `net`
- * and `tls` come through the module loader of the extension host, so that its
- * proxy and certificate patches apply.
+ * server, when there is one and `http.proxySupport` is not `off`) and, for
+ * `grpcs://`, TLS with ALPN `h2`. `net` and `tls` come through the module
+ * loader of the extension host, so that its proxy and certificate patches
+ * apply. TLS trusts the roots the extension host's `fetch` trusts
+ * ({@link IGrpcConnectionFactoryOptions.loadRootCertificates}) and, for the
+ * server, the `tls.ca` certificates on top of them.
  */
 export function createGrpcConnectionFactory(options: IGrpcConnectionFactoryOptions): (target: { host: string; port: number }) => Promise<netType.Socket | tlsType.TLSSocket> {
 	const timeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+	const loadRoots = async (): Promise<readonly string[] | undefined> => {
+		try {
+			const roots = await options.loadRootCertificates?.();
+			return roots?.length ? roots : undefined;
+		} catch (error) {
+			options.log?.(LogLevel.Warning, `Could not load the system certificates, verifying with Node's bundled roots only: ${stringifyError(error)}`);
+			return undefined;
+		}
+	};
 	return async target => {
 		const net = loadNet();
 		const tls = loadTls();
 		const host = net.isIPv6(target.host) ? `[${target.host}]` : target.host;
 		const authority = `${host}:${target.port}`;
 		let proxyUrl: string | undefined;
-		try {
-			proxyUrl = await options.proxy?.resolveProxyURL?.(`${options.secure ? 'https' : 'http'}://${authority}/`);
-		} catch (error) {
-			options.log?.(LogLevel.Warning, `Could not resolve the proxy for ${authority}, connecting directly: ${stringifyError(error)}`);
+		// Read per connection: the setting can change while the server runs. With `off` the
+		// extension host's own requests go direct, and so does gRPC (it sets no agent of its
+		// own, so `on` behaves like `override`, as for fetch).
+		if (options.proxy?.getProxySupport?.() === 'off') {
+			options.log?.(LogLevel.Trace, `http.proxySupport is off: connecting to ${authority} directly`);
+		} else {
+			try {
+				proxyUrl = await options.proxy?.resolveProxyURL?.(`${options.secure ? 'https' : 'http'}://${authority}/`);
+			} catch (error) {
+				options.log?.(LogLevel.Warning, `Could not resolve the proxy for ${authority}, connecting directly: ${stringifyError(error)}`);
+			}
 		}
-		const socket = proxyUrl ? await connectThroughProxy(net, tls, proxyUrl, authority, options, timeoutMs) : undefined;
+		const socket = proxyUrl ? await connectThroughProxy(net, tls, proxyUrl, authority, options, timeoutMs, loadRoots) : undefined;
 		if (!options.secure) {
 			return socket ?? await connectPlain(net, target.host, target.port, timeoutMs);
 		}
 		try {
+			// An explicit `ca` replaces the default roots (and the patched `tls.connect` adds
+			// nothing to it), so `tls.ca` comes on top of the full set.
+			const roots = await loadRoots();
+			const ca = options.ca?.length ? [...(roots ?? tls.rootCertificates), ...options.ca] : roots;
 			return await connectTls(net, tls, {
 				host: target.host,
 				port: target.port,
 				socket,
 				servername: options.servername,
-				ca: options.ca,
+				ca,
 				rejectUnauthorized: options.rejectUnauthorized ?? true,
 				alpn: 'h2',
 				timeoutMs,
@@ -522,19 +706,49 @@ export interface IMcpGrpcChannel extends IDisposable {
 export interface IMcpGrpcHandleOptions {
 	/** Creates the channel (tests pass a fake); defaults to a {@link GrpcChannel}. */
 	readonly createChannel?: (options: IGrpcChannelOptions) => IMcpGrpcChannel;
+	/** Creates the `createConnection` hook of the channel; defaults to {@link createGrpcConnectionFactory}. */
+	readonly createConnectionFactory?: (options: IGrpcConnectionFactoryOptions) => NonNullable<IGrpcChannelOptions['createConnection']>;
 	/** Reads the PEM file of `tls.ca`. */
 	readonly readCaFile?: (path: string) => Promise<string>;
-	/** Fetches authorization metadata; defaults to the global `fetch` of the extension host. */
+	/**
+	 * Sends one request for authorization metadata, without following
+	 * redirects (the handle follows them itself); defaults to the global
+	 * `fetch` of the extension host.
+	 */
 	readonly fetchMetadata?: (url: string, init: IMetadataRequestInit) => Promise<CommonResponse>;
+	/** Each authorization metadata request (with its redirects) is aborted after this long; defaults to 30 s. */
+	readonly metadataTimeoutMs?: number;
 	/** The proxy resolution; defaults to the one of the extension host. */
 	readonly proxyLookup?: () => Promise<IGrpcProxyLookup>;
 }
 
-/** A request for authorization metadata. */
+/** One request for authorization metadata. */
 export interface IMetadataRequestInit {
 	readonly method: string;
 	readonly headers: Record<string, string>;
 	readonly body?: Uint8Array<ArrayBuffer>;
+	/** Always `manual`: the handle follows redirects itself, so that credentials never follow one to another origin. */
+	readonly redirect: 'manual';
+	/** Aborted when the handle is disposed, the call it serves is cancelled, or the request takes longer than its timeout. */
+	readonly signal: AbortSignal;
+}
+
+/** The metadata that carries credentials; trace logs show it blanked, as on Streamable HTTP. */
+const CREDENTIAL_METADATA: ReadonlySet<string> = new Set(['authorization', 'proxy-authorization', 'cookie', 'set-cookie']);
+
+/** Redirects of an authorization metadata request that are followed, as on Streamable HTTP. */
+const MAX_METADATA_REDIRECTS = 5;
+const REDIRECT_STATUS_CODES: ReadonlySet<number> = new Set([301, 302, 303, 307, 308]);
+const DEFAULT_METADATA_TIMEOUT_MS = 30_000;
+
+/** Sets `name` to `value` in `headers`, replacing it in any letter case. */
+function setHeader(headers: Record<string, string>, name: string, value: string): void {
+	for (const key of Object.keys(headers)) {
+		if (key.toLowerCase() === name.toLowerCase()) {
+			delete headers[key];
+		}
+	}
+	headers[name] = value;
 }
 
 /** Every {@link OAuthClientError} (it survives the RPC boundary by name) ends the authorization flow. */
@@ -542,21 +756,24 @@ function isTerminalAuthorizationError(error: unknown): boolean {
 	return error instanceof OAuthClientError || (error instanceof Error && error.name === 'OAuthClientError');
 }
 
-const enum BindingMode {
-	/** `binding: 'auto'` before the tunnel answered: the tunnel is tried first. */
-	Probing,
-	Tunnel,
-	Typed,
-}
-
 interface IActiveCall {
 	cancelled: boolean;
 	call: IGrpcCall | undefined;
+	/** Set while the call waits for its authorization challenge to be handled: ends that handling. */
+	onCancel?: () => void;
+}
+
+/** Cancels an in-flight call: RST_STREAM(CANCEL) for its stream, and the end of its challenge handling. */
+function cancelActiveCall(active: IActiveCall): void {
+	active.cancelled = true;
+	active.call?.cancel();
+	active.onCancel?.();
 }
 
 /**
- * The proxy functions `proxyResolver.ts` puts on the `@vscode/proxy-agent`
- * module of the extension host; none when proxy resolution is not set up.
+ * The proxy functions, the `http.proxySupport` accessor and the certificate
+ * loader that `proxyResolver.ts` puts on the `@vscode/proxy-agent` module of
+ * the extension host; none when proxy resolution is not set up.
  */
 export async function extensionHostProxyLookup(): Promise<IGrpcProxyLookup> {
 	const agentModule = proxyAgent as unknown as IGrpcProxyLookup & { readonly default?: IGrpcProxyLookup };
@@ -564,6 +781,8 @@ export async function extensionHostProxyLookup(): Promise<IGrpcProxyLookup> {
 	return {
 		resolveProxyURL: typeof target.resolveProxyURL === 'function' ? url => target.resolveProxyURL!(url) : undefined,
 		lookupProxyAuthorization: typeof target.lookupProxyAuthorization === 'function' ? (url, challenge, state) => target.lookupProxyAuthorization!(url, challenge, state) : undefined,
+		getProxySupport: typeof target.getProxySupport === 'function' ? () => target.getProxySupport!() : undefined,
+		loadCaCertificates: typeof target.loadCaCertificates === 'function' ? () => target.loadCaCertificates!() : undefined,
 	};
 }
 
@@ -581,7 +800,11 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 	private readonly _authority: string;
 	private readonly _host: string;
 	private readonly _secure: boolean;
-	private _mode: BindingMode;
+	/**
+	 * The binding the handle speaks, fixed for its lifetime: `typed` only with
+	 * `binding: 'typed'`; `auto` (the default) and `tunnel` speak the tunnel.
+	 */
+	readonly binding: 'tunnel' | 'typed';
 	private _channel: Promise<IMcpGrpcChannel> | undefined;
 	/** In-flight requests by {@link requestKey}, for {@link cancelRequest}. */
 	private readonly _requests = new Map<string, IActiveCall>();
@@ -592,6 +815,10 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 	/** The protocol version of the last enveloped message; authorization metadata requests carry it. */
 	private _protocolVersion: string | undefined;
 	private _warnedCleartextToken = false;
+	/** Aborts the authorization metadata requests in flight when the handle is disposed. */
+	private readonly _abortCtrl = new AbortController();
+	/** The identity a typed-only server gave on this connection, for its synthesized discover. */
+	private _typedIdentity: ITypedServerIdentity | undefined;
 
 	constructor(
 		private readonly _id: number,
@@ -606,8 +833,11 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 		this._authority = authority.slice(authority.lastIndexOf('@') + 1);
 		this._host = authorityHost(this._authority);
 		this._secure = _launch.uri.scheme === 'grpcs';
-		this._mode = _launch.binding === 'tunnel' ? BindingMode.Tunnel : _launch.binding === 'typed' ? BindingMode.Typed : BindingMode.Probing;
-		this._register(toDisposable(() => this._cancelAll()));
+		this.binding = _launch.binding === 'typed' ? 'typed' : 'tunnel';
+		this._register(toDisposable(() => {
+			this._abortCtrl.abort();
+			this._cancelAll();
+		}));
 		this._auth = this._register(new McpAuthHeaderProvider({
 			id: _id,
 			launch: _launch,
@@ -616,15 +846,25 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 			protocolVersion: () => this._protocolVersion ?? LATEST_MCP_PROTOCOL_VERSION,
 			// The gRPC port serves no HTTP/1.1: the protected resource is the server's HTTPS identity.
 			resourceUrl: () => `https://${this._authority}/`,
-			fetchMetadata: (url, init, transportHeaders) => this._fetchMetadata(url, init, transportHeaders),
+			fetchMetadata: (url, init, transportHeaders, signal) => this._fetchMetadata(url, init, transportHeaders, signal),
 			log: (level, message) => this._log(level, message),
 		}));
 		this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Running });
-	}
-
-	/** The binding in use: `undefined` while `auto` has not seen the tunnel answer yet. */
-	get binding(): 'tunnel' | 'typed' | undefined {
-		return this._mode === BindingMode.Tunnel ? 'tunnel' : this._mode === BindingMode.Typed ? 'typed' : undefined;
+		// The mcp.json schema rejects these values; a configuration that has them anyway still works.
+		const { deadlineMs, keepAliveMs } = _launch;
+		if (deadlineMs !== undefined && !isValidDeadline(deadlineMs)) {
+			this._log(LogLevel.Warning, `deadlineMs ${deadlineMs} is not a positive number of milliseconds; it is ignored`);
+		}
+		if (keepAliveMs !== undefined) {
+			const { keepAliveTimeMs } = grpcKeepAliveFor(keepAliveMs);
+			if (!isValidKeepAlive(keepAliveMs)) {
+				this._log(LogLevel.Warning, `keepAliveMs ${keepAliveMs} is not a number of milliseconds (0 turns keepalive pings off); it is ignored`);
+			} else if (keepAliveTimeMs !== undefined && keepAliveTimeMs > keepAliveMs) {
+				this._log(LogLevel.Warning, `keepAliveMs ${keepAliveMs} is below the ${MIN_GRPC_KEEPALIVE_MS} ms that gRPC servers allow by default; a keepalive ping is sent every ${keepAliveTimeMs} ms instead`);
+			} else if (keepAliveTimeMs !== undefined && keepAliveTimeMs < keepAliveMs) {
+				this._log(LogLevel.Warning, `keepAliveMs ${keepAliveMs} is longer than a timer can wait; a keepalive ping is sent every ${keepAliveTimeMs} ms instead`);
+			}
+		}
 	}
 
 	async send(message: string, envelope?: IMcpMessageEnvelope): Promise<void> {
@@ -651,9 +891,9 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 		const active = this._requests.get(key);
 		if (active) {
 			this._requests.delete(key);
-			active.cancelled = true;
-			// RST_STREAM(CANCEL): the server cancels the request handler.
-			active.call?.cancel();
+			// RST_STREAM(CANCEL): the server cancels the request handler. An authorization
+			// discovery the request waits for ends too.
+			cancelActiveCall(active);
 		}
 	}
 
@@ -664,8 +904,7 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 
 	private _cancelAll(): void {
 		for (const active of this._active) {
-			active.cancelled = true;
-			active.call?.cancel();
+			cancelActiveCall(active);
 		}
 		this._active.clear();
 		this._requests.clear();
@@ -695,17 +934,10 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 		this._requests.set(key, active);
 		this._active.add(active);
 		try {
-			if (this._mode === BindingMode.Typed) {
+			if (this.binding === 'typed') {
 				await this._sendTyped(id, method, params, envelope, active);
-				return;
-			}
-			const tunnel = await this._sendTunnel(text, id, method, params, envelope, active);
-			if (tunnel === 'unimplemented') {
-				if (this._mode === BindingMode.Probing) {
-					this._mode = BindingMode.Typed;
-					this._log(LogLevel.Info, `${this._authority} does not serve the JSON-RPC tunnel; switching to the typed gRPC binding`);
-				}
-				await this._sendTyped(id, method, params, envelope, active);
+			} else {
+				await this._sendTunnel(text, id, method, params, envelope, active);
 			}
 		} catch (err) {
 			if (!active.cancelled) {
@@ -726,7 +958,7 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 	}
 
 	private async _sendNotification(text: string, method: string, envelope: IMcpMessageEnvelope | undefined): Promise<void> {
-		if (this._mode === BindingMode.Typed) {
+		if (this.binding === 'typed') {
 			this._log(LogLevel.Debug, `The typed gRPC binding has no RPC for the notification ${method}; dropping it`);
 			return;
 		}
@@ -734,7 +966,7 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 		this._active.add(active);
 		try {
 			// The server answers a notification with an empty stream and status 0.
-			const trailers = await this._runCall(TUNNEL_CALL_PATH, encodeTunnelMessage(text), this._metadata(envelope), undefined, active, () => { });
+			const trailers = await this._runCall(TUNNEL_CALL_PATH, encodeTunnelMessage(text), this._metadata(envelope), {}, active, () => { });
 			if (trailers.status !== GrpcStatus.OK) {
 				this._log(LogLevel.Info, `The notification ${method} ended with ${grpcStatusName(trailers.status)}${trailers.message ? `: ${trailers.message}` : ''}`);
 			}
@@ -750,13 +982,16 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 	/**
 	 * One JSON-RPC request on the tunnel: every message of the response stream
 	 * is delivered as it arrives (notifications, then the response; the events
-	 * of a listen stream). Returns `unimplemented` when `auto` should switch to
-	 * the typed binding.
+	 * of a listen stream). A `server/discover` that a gRPC server answers with
+	 * a bare UNIMPLEMENTED is aborted with {@link noTunnelMessage} (reason
+	 * `transport-error`, so that the engine fails the handshake with it instead
+	 * of trying `initialize`); nothing is sent on the typed binding.
 	 */
-	private async _sendTunnel(text: string, id: JsonRpcId, method: string, params: unknown, envelope: IMcpMessageEnvelope | undefined, active: IActiveCall): Promise<'done' | 'unimplemented'> {
+	private async _sendTunnel(text: string, id: JsonRpcId, method: string, params: unknown, envelope: IMcpMessageEnvelope | undefined, active: IActiveCall): Promise<void> {
 		let sawResponse = false;
 		const deadlineMs = grpcDeadlineFor(method, envelope?.kind, params, this._launch.deadlineMs, envelope?.deadlineMs);
-		const trailers = await this._runCall(TUNNEL_CALL_PATH, encodeTunnelMessage(text), this._metadata(envelope), deadlineMs, active, payload => {
+		const callOptions: IGrpcCallOptions = { deadlineMs, longLived: isListenCall(method, envelope?.kind) };
+		const trailers = await this._runCall(TUNNEL_CALL_PATH, encodeTunnelMessage(text), this._metadata(envelope), callOptions, active, payload => {
 			const message = decodeTunnelMessage(payload);
 			if (!sawResponse && isResponseFor(message, id)) {
 				sawResponse = true;
@@ -764,27 +999,27 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 			this._deliver(message);
 		});
 		if (active.cancelled) {
-			return 'done';
+			return;
 		}
 		if (trailers.status === GrpcStatus.OK) {
-			this._confirmTunnel();
 			if (!sawResponse) {
 				this._abort(id, active, { reason: 'stream-closed', message: `The response stream for ${method} ended before the response arrived` });
 			}
-			return 'done';
+			return;
 		}
 		if (sawResponse) {
 			this._log(LogLevel.Debug, `The ${method} call ended with ${grpcStatusName(trailers.status)} after its response`);
-			return 'done';
+			return;
 		}
-		if (hasMcpError(trailers)) {
-			// A JSON-RPC error of the server (a -32601 for an unknown method included): the tunnel exists.
-			this._confirmTunnel();
-		} else if (trailers.status === GrpcStatus.UNIMPLEMENTED && this._launch.binding !== 'tunnel' && this._mode !== BindingMode.Tunnel) {
-			return 'unimplemented';
+		if (method === 'server/discover' && isMissingTunnel(trailers)) {
+			// A gRPC server without the tunnel service (an HTTP 404, any non-200, is no gRPC server
+			// at all and fails below as a transport error). It may serve the typed service, but
+			// only an explicit `binding: 'typed'` uses that.
+			this._log(LogLevel.Warning, `${this._authority} answered server/discover on the JSON-RPC tunnel with ${grpcStatusName(trailers.status)}${trailers.message ? `: ${trailers.message}` : ''}`);
+			this._abort(id, active, { reason: 'transport-error', grpcStatus: trailers.status, message: noTunnelMessage(this._authority, trailers.message) });
+			return;
 		}
 		this._deliverTrailers(id, active, trailers);
-		return 'done';
 	}
 
 	/** One request on the typed binding, or the answer a typed-only server cannot give itself. */
@@ -792,7 +1027,17 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 		const rpc = typedRpcForMethod(method);
 		if (!rpc) {
 			if (method === 'server/discover') {
-				this._deliver(JSON.stringify({ jsonrpc: '2.0', id, result: synthesizeDiscoverResult(this._authority) }));
+				const probe = await this._typedServerIdentity(params, envelope, active);
+				if (active.cancelled) {
+					return;
+				}
+				if (probe.kind === 'failed') {
+					// The server is unreachable or the authorization was not resolved (the user declined to
+					// sign in): the discover fails as any request does, and the next one probes again.
+					this._deliverTrailers(id, active, probe.trailers);
+					return;
+				}
+				this._deliver(JSON.stringify({ jsonrpc: '2.0', id, result: synthesizeDiscoverResult(this._authority, probe.identity) }));
 			} else if (method === 'subscriptions/listen') {
 				this._deliver(JSON.stringify({
 					jsonrpc: '2.0',
@@ -827,7 +1072,7 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 		}
 		const payloads: Uint8Array[] = [];
 		const deadlineMs = grpcDeadlineFor(method, envelope?.kind, params, this._launch.deadlineMs, envelope?.deadlineMs);
-		const trailers = await this._runCall(rpc.path, body, metadata, deadlineMs, active, payload => payloads.push(payload));
+		const trailers = await this._runCall(rpc.path, body, metadata, { deadlineMs }, active, payload => payloads.push(payload));
 		if (active.cancelled) {
 			return;
 		}
@@ -851,13 +1096,66 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 	}
 
 	/**
+	 * The `serverInfo` and `instructions` for the synthesized `server/discover`
+	 * of a typed-only server. Every typed response carries the server's
+	 * `serverInfo` in its `_meta`, and an initial response its `instructions`:
+	 * the first discover of the connection asks for the first page of
+	 * ListTools and takes them from its common fields. Without them (the server
+	 * answers the call with an error, the response has none) the synthesized
+	 * result names the server after its authority. A failure of the call itself
+	 * (a cancellation, a denied, lost or refused connection, a deadline, an
+	 * HTTP answer that is not gRPC, an authorization challenge that was not
+	 * resolved, a terminal authorization failure) fails the discover as it fails
+	 * any request.
+	 */
+	private async _typedServerIdentity(params: unknown, envelope: IMcpMessageEnvelope | undefined, active: IActiveCall): Promise<{ readonly kind: 'identity'; readonly identity: ITypedServerIdentity } | { readonly kind: 'failed'; readonly trailers: IGrpcTrailers }> {
+		if (this._typedIdentity) {
+			return { kind: 'identity', identity: this._typedIdentity };
+		}
+		const rpc = typedRpcForMethod('tools/list');
+		if (!rpc) {
+			return { kind: 'identity', identity: {} };
+		}
+		// The request metadata of the discover (protocol version, client info and capabilities) applies to any request.
+		const probeParams = isObject(params) && isObject(params._meta) ? { _meta: params._meta } : {};
+		let body: Uint8Array;
+		try {
+			body = encodeTypedRequest(rpc, probeParams);
+		} catch (err) {
+			if (!(err instanceof McpUnexpressibleError)) {
+				throw err;
+			}
+			body = encodeTypedRequest(rpc, {});
+		}
+		const probeEnvelope = envelope && { ...envelope, method: 'tools/list', headers: buildMirroredHeaders('tools/list', probeParams) };
+		const metadata = this._metadata(probeEnvelope, LATEST_MCP_PROTOCOL_VERSION);
+		const deadlineMs = grpcDeadlineFor('tools/list', 'request', probeParams, this._launch.deadlineMs, envelope?.deadlineMs);
+		const payloads: Uint8Array[] = [];
+		const trailers = await this._runCall(rpc.path, body, metadata, { deadlineMs }, active, payload => payloads.push(payload));
+		if (trailers.status !== GrpcStatus.OK && isCallFailure(trailers)) {
+			this._log(LogLevel.Info, `The ${rpc.name} call that asks ${this._authority} for its serverInfo failed with ${grpcStatusName(trailers.status)}${trailers.message ? `: ${trailers.message}` : ''}`);
+			return { kind: 'failed', trailers };
+		}
+		if (trailers.status !== GrpcStatus.OK || payloads.length !== 1) {
+			this._log(LogLevel.Info, `The ${rpc.name} call that asks ${this._authority} for its serverInfo ended with ${grpcStatusName(trailers.status)}${trailers.message ? `: ${trailers.message}` : ''}; naming the server after its address`);
+			return { kind: 'identity', identity: {} };
+		}
+		const identity = decodeTypedServerIdentity(rpc, payloads[0]);
+		if (!identity.serverInfo) {
+			this._log(LogLevel.Info, `The ${rpc.name} response of ${this._authority} carries no serverInfo; naming the server after its address`);
+		}
+		this._typedIdentity = identity;
+		return { kind: 'identity', identity };
+	}
+
+	/**
 	 * Runs one call and returns its trailers, after feeding every response
 	 * message to `onMessage`. A status-only UNAUTHENTICATED (an HTTP 401) or
 	 * PERMISSION_DENIED (403) before any message is an authorization challenge:
 	 * the {@link McpAuthHeaderProvider} discovers the authorization metadata of
 	 * the server's HTTPS identity, gets a token and the call runs again.
 	 */
-	private async _runCall(path: string, body: Uint8Array, metadata: Record<string, string>, deadlineMs: number | undefined, active: IActiveCall, onMessage: (payload: Uint8Array) => void): Promise<IGrpcTrailers> {
+	private async _runCall(path: string, body: Uint8Array, metadata: Record<string, string>, callOptions: IGrpcCallOptions, active: IActiveCall, onMessage: (payload: Uint8Array) => void): Promise<IGrpcTrailers> {
 		const callMetadata = { ...metadata };
 		await this._auth.addAuthHeader(callMetadata);
 		for (let cycle = 0; ; cycle++) {
@@ -870,8 +1168,8 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 				throw new CancellationError();
 			}
 			this._noteTokenSent(callMetadata);
-			this._traceCall(path, callMetadata, deadlineMs);
-			const call = channel.call(path, callMetadata, body, { deadlineMs });
+			this._traceCall(path, callMetadata, callOptions.deadlineMs);
+			const call = channel.call(path, callMetadata, body, callOptions);
 			active.call = call;
 
 			let received = 0;
@@ -911,20 +1209,90 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 				this._log(LogLevel.Warning, `${grpcStatusName(trailers.status)} from ${this._authority} after ${cycle} authorization attempts; giving up on this call`);
 				return trailers;
 			}
-			if (!await this._auth.handleChallenge(challengeStatus, trailers.raw['www-authenticate'], callMetadata)) {
+			if (!await this._handleChallenge(challengeStatus, trailers.raw['www-authenticate'], callMetadata, active)) {
 				return trailers;
 			}
 			this._log(LogLevel.Debug, `Retrying ${path} after ${grpcStatusName(trailers.status)} with a new token`);
 		}
 	}
 
-	/** Authorization metadata lives on the HTTPS side of the server; it is not subject to the allow list. */
-	private _fetchMetadata(url: string, init: IMetadataRequestInit, transportHeaders: Readonly<Record<string, string>> | undefined): Promise<CommonResponse> {
-		const headers: Record<string, string> = { ...init.headers, ...transportHeaders, 'user-agent': `${product.nameLong}/${product.version}` };
-		if (this._options.fetchMetadata) {
-			return this._options.fetchMetadata(url, { ...init, headers });
+	/**
+	 * Hands a challenge of `active` to the {@link McpAuthHeaderProvider} with a
+	 * token that is cancelled with the call ({@link cancelRequest}, {@link close}
+	 * or disposal), so that cancelling the call ends its discovery (and aborts
+	 * the metadata request in flight) and stops it waiting for other challenges.
+	 */
+	private async _handleChallenge(status: 401 | 403, wwwAuthenticate: string | undefined, metadata: Record<string, string>, active: IActiveCall): Promise<boolean> {
+		const cts = new CancellationTokenSource();
+		active.onCancel = () => cts.cancel();
+		if (active.cancelled || this._store.isDisposed) {
+			cts.cancel();
 		}
-		return fetch(url, { method: init.method, headers, body: init.body });
+		try {
+			return await this._auth.handleChallenge(status, wwwAuthenticate, metadata, cts.token);
+		} finally {
+			active.onCancel = undefined;
+			cts.dispose();
+		}
+	}
+
+	/**
+	 * Fetches authorization metadata, which lives on the HTTPS side of the
+	 * server (and at the authorization server); it is not subject to the allow
+	 * list. As on Streamable HTTP, redirects are followed here (at most
+	 * {@link MAX_METADATA_REDIRECTS}, to http(s) only), and a request to
+	 * another origin than the HTTPS identity, or a redirect that changes the
+	 * origin, carries neither the configured headers nor `Authorization`,
+	 * cookies or proxy credentials; the generated `transportHeaders` and the
+	 * user agent survive. Disposing the handle, the timeout or `requestSignal`
+	 * (the discovery it serves ended: its call was cancelled) aborts it.
+	 */
+	private async _fetchMetadata(url: string, init: Pick<IMetadataRequestInit, 'method' | 'headers' | 'body'>, transportHeaders: Readonly<Record<string, string>> | undefined, requestSignal?: AbortSignal): Promise<CommonResponse> {
+		const generated: Record<string, string> = { ...transportHeaders, 'user-agent': `${product.nameLong}/${product.version}` };
+		let headers: Record<string, string> = { ...init.headers };
+		for (const [name, value] of Object.entries(generated)) {
+			setHeader(headers, name, value);
+		}
+		let current = new URL(url);
+		if (current.protocol !== 'https:' && current.protocol !== 'http:') {
+			throw new Error(`Authorization metadata of ${this._authority} must be fetched over http(s), not '${current.protocol}'`);
+		}
+		if (current.origin !== new URL(`https://${this._authority}/`).origin) {
+			headers = stripCrossOriginHeaders(headers, this._launch.headers, generated);
+		}
+		const signals = [this._abortCtrl.signal, AbortSignal.timeout(this._options.metadataTimeoutMs ?? DEFAULT_METADATA_TIMEOUT_MS)];
+		if (requestSignal) {
+			signals.push(requestSignal);
+		}
+		const signal = AbortSignal.any(signals);
+		const fetchOnce = this._options.fetchMetadata ?? ((target: string, request: IMetadataRequestInit): Promise<CommonResponse> => fetch(target, request));
+		let method = init.method;
+		let body = init.body;
+		let target = url;
+		for (let redirects = 0; ; redirects++) {
+			signal.throwIfAborted();
+			const response = await fetchOnce(target, { method, headers, body, redirect: 'manual', signal });
+			const location = REDIRECT_STATUS_CODES.has(response.status) ? response.headers.get('location') : null;
+			if (!location || redirects >= MAX_METADATA_REDIRECTS) {
+				return response;
+			}
+			const next = new URL(location, current);
+			if (next.protocol !== 'https:' && next.protocol !== 'http:') {
+				throw new Error(`The authorization metadata request to ${current.origin} redirected to a non-http(s) target (${next.protocol}), which is not allowed`);
+			}
+			response.body?.cancel().catch(() => { /* the body of a redirect is not read */ });
+			if (next.origin !== current.origin) {
+				headers = stripCrossOriginHeaders(headers, this._launch.headers, generated);
+			}
+			// As fetch does: 303 always, and 301/302 after a POST, continue with a GET without a body.
+			if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === 'POST')) {
+				method = 'GET';
+				body = undefined;
+			}
+			this._log(LogLevel.Trace, `Following the redirect (${response.status}) of the authorization metadata request from ${current.origin}${current.pathname} to ${next.origin}${next.pathname}`);
+			current = next;
+			target = next.toString();
+		}
 	}
 
 	/** A bearer token over cleartext `grpc://` to another machine can be read on the way: warn once. */
@@ -950,13 +1318,6 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 			metadata[MCP_PROTOCOL_VERSION_METADATA] = protocolVersion;
 		}
 		return metadata;
-	}
-
-	private _confirmTunnel(): void {
-		if (this._mode === BindingMode.Probing) {
-			this._mode = BindingMode.Tunnel;
-			this._log(LogLevel.Debug, `${this._authority} serves the JSON-RPC tunnel`);
-		}
 	}
 
 	private async _checkAllowed(): Promise<void> {
@@ -986,22 +1347,23 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 		const tls = this._launch.tls;
 		let ca: string[] | undefined;
 		if (this._secure && tls?.ca) {
-			const pem = await (this._options.readCaFile ?? (path => readFile(path, 'utf-8')))(untildify(tls.ca, homedir()));
-			// In addition to the system roots, as the configuration documents.
-			ca = [...loadTls().rootCertificates, pem];
+			// Trusted in addition to the roots of the extension host (see createGrpcConnectionFactory).
+			ca = [await (this._options.readCaFile ?? (path => readFile(path, 'utf-8')))(untildify(tls.ca, homedir()))];
 		}
 		const proxyLookup = await (this._options.proxyLookup ?? extensionHostProxyLookup)();
 		if (this._store.isDisposed) {
 			throw new CancellationError();
 		}
+		const loadCaCertificates = proxyLookup.loadCaCertificates;
 		const options: IGrpcChannelOptions = {
 			authority: this._authority,
 			secure: this._secure,
-			keepAliveTimeMs: this._launch.keepAliveMs,
-			userAgent: `vscode-grpc/0.1 (${product.nameLong} ${product.version})`,
-			createConnection: createGrpcConnectionFactory({
+			...grpcKeepAliveFor(this._launch.keepAliveMs),
+			userAgent: `grpc-node-vscode/${product.version} (${product.nameLong})`,
+			createConnection: (this._options.createConnectionFactory ?? createGrpcConnectionFactory)({
 				secure: this._secure,
 				ca,
+				loadRootCertificates: loadCaCertificates ? () => loadCaCertificates.call(proxyLookup) : undefined,
 				rejectUnauthorized: !tls?.insecure,
 				servername: tls?.serverName,
 				proxy: proxyLookup,
@@ -1036,10 +1398,13 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 
 	private _traceCall(path: string, metadata: Readonly<Record<string, string>>, deadlineMs: number | undefined): void {
 		if (canLog(this._logService.getLevel(), LogLevel.Trace)) {
+			// Never log credentials: neither the ones the transport adds nor the configured
+			// headers, whose values are typically API keys.
+			const configured = new Set(this._launch.headers.map(([name]) => name.toLowerCase()));
 			const shown: Record<string, string> = {};
 			for (const [name, value] of Object.entries(metadata)) {
-				// Never log credentials.
-				shown[name.toLowerCase()] = name.toLowerCase() === 'authorization' || name.toLowerCase() === 'proxy-authorization' ? '***' : value;
+				const lower = name.toLowerCase();
+				shown[lower] = CREDENTIAL_METADATA.has(lower) || configured.has(lower) ? '***' : value;
 			}
 			this._log(LogLevel.Trace, `Calling ${path} on ${this._authority} with ${JSON.stringify(shown)}${deadlineMs !== undefined ? ` and a deadline of ${deadlineMs}ms` : ''}`);
 		}

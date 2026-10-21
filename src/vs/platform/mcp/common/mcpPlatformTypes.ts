@@ -102,7 +102,11 @@ export interface IMcpRemoteServerConfiguration extends ICommonMcpServerConfigura
 
 /** TLS settings of a {@link IMcpGrpcServerConfiguration}; only meaningful for `grpcs://` URLs. */
 export interface IMcpGrpcServerTlsConfiguration {
-	/** Path to a PEM-encoded certificate authority bundle that verifies the server certificate. */
+	/**
+	 * Path to a PEM-encoded certificate authority bundle trusted for the server
+	 * certificate in addition to the roots HTTPS requests use (the bundled roots
+	 * and, with `http.systemCertificates`, the operating system store).
+	 */
 	readonly ca?: string;
 	/** Skips server certificate verification. */
 	readonly insecure?: boolean;
@@ -113,7 +117,8 @@ export interface IMcpGrpcServerTlsConfiguration {
 /**
  * The gRPC service binding to speak: the zig-sdk JSON-RPC tunnel
  * (`/mcp.zig.transport.v1.Mcp/Call`), Google's typed `model_context_protocol.Mcp`
- * service, or `auto`, which tries the tunnel first and falls back to the typed service.
+ * service, or `auto` (the default), which is the tunnel: the client never
+ * switches to the typed service on its own, only `typed` speaks it.
  */
 export type McpGrpcBinding = 'auto' | 'tunnel' | 'typed';
 
@@ -124,9 +129,19 @@ export interface IMcpGrpcServerConfiguration extends ICommonMcpServerConfigurati
 	readonly headers?: Record<string, string>;
 	readonly tls?: IMcpGrpcServerTlsConfiguration;
 	readonly binding?: McpGrpcBinding;
-	/** Per-call deadline in milliseconds. Unset means no deadline, including on `tools/call`. */
+	/**
+	 * The deadline in milliseconds of every call except the `subscriptions/listen`
+	 * stream, which never has one; greater than 0. Unset: 60 seconds for
+	 * `server/discover` and the list, read, prompt and completion requests, and no
+	 * deadline for `tools/call`, the retries of `input_required` rounds and other requests.
+	 */
 	readonly deadlineMs?: number;
-	/** Interval in milliseconds between HTTP/2 keep-alive pings. Unset disables them. */
+	/**
+	 * Interval in milliseconds between HTTP/2 keep-alive pings, at least 300000
+	 * (5 minutes), sent only while a call is open (doubled for the next
+	 * connection after a `too_many_pings`); 0 sends none. Unset: a ping every
+	 * 310000 ms only while a `subscriptions/listen` stream is open.
+	 */
 	readonly keepAliveMs?: number;
 	readonly oauth?: IMcpRemoteServerOAuthConfiguration;
 	readonly dev?: IMcpDevModeConfig;

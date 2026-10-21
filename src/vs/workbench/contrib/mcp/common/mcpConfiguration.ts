@@ -151,7 +151,7 @@ const mcpProtocolVersionSchema: IJSONSchema = {
 	enumDescriptions: SUPPORTED_MCP_PROTOCOL_VERSIONS.map(version => eraForProtocolVersion(version) === 'modern'
 		? localize('app.mcp.json.protocolVersion.modern', "Revision {0}: stateless requests carrying their protocol metadata, `server/discover` and subscription-based notifications.", version)
 		: localize('app.mcp.json.protocolVersion.legacy', "Revision {0}: the `initialize` handshake with a stateful session.", version)),
-	markdownDescription: localize('app.mcp.json.protocolVersion', "Pins the Model Context Protocol revision used to talk to this server. By default, the newest revision both VS Code and the server support is negotiated. A pinned revision the server rejects still falls back to negotiation."),
+	markdownDescription: localize('app.mcp.json.protocolVersion', "Pins the Model Context Protocol revision used to talk to this server. By default, the newest revision both VS Code and the server support is negotiated. If the server rejects the pinned revision, VS Code negotiates a revision as it does without a pin, and uses that revision instead of the pin until the pin or the server's command, URL or other connection settings change, or until the **MCP: Reset Cached Tools** command runs."),
 };
 
 const mcpOAuthSchema: IJSONSchema = {
@@ -413,11 +413,11 @@ export const mcpGrpcServerSchema: IJSONSchema = {
 		tls: {
 			type: 'object',
 			additionalProperties: false,
-			markdownDescription: localize('app.mcp.json.grpc.tls', "TLS settings for `grpcs://` endpoints."),
+			markdownDescription: localize('app.mcp.json.grpc.tls', "TLS settings for `grpcs://` endpoints. The server certificate is verified against the same certificate authorities as HTTPS requests: the bundled roots and, when the `http.systemCertificates` setting is on, the operating system's certificate store."),
 			properties: {
 				ca: {
 					type: 'string',
-					description: localize('app.mcp.json.grpc.tls.ca', "Path to a PEM-encoded certificate authority bundle used to verify the server certificate, in addition to the system roots."),
+					markdownDescription: localize('app.mcp.json.grpc.tls.ca', "Path to a PEM-encoded certificate authority bundle that is trusted for the server certificate in addition to the bundled roots and, when the `http.systemCertificates` setting is on, the operating system's certificate store."),
 					examples: ['${workspaceFolder}/certs/ca.pem'],
 				},
 				insecure: {
@@ -435,22 +435,24 @@ export const mcpGrpcServerSchema: IJSONSchema = {
 			type: 'string',
 			enum: ['auto', 'tunnel', 'typed'],
 			default: 'auto',
-			enumDescriptions: [
-				localize('app.mcp.json.grpc.binding.auto', "Try the JSON-RPC tunnel first and fall back to the typed service."),
-				localize('app.mcp.json.grpc.binding.tunnel', "Send JSON-RPC messages through the `mcp.zig.transport.v1.Mcp/Call` tunnel."),
-				localize('app.mcp.json.grpc.binding.typed', "Call the typed `model_context_protocol.Mcp` service methods."),
+			markdownEnumDescriptions: [
+				localize('app.mcp.json.grpc.binding.auto', "The default: the JSON-RPC tunnel, exactly as `tunnel`. VS Code never switches to the typed service on its own."),
+				localize('app.mcp.json.grpc.binding.tunnel', "Send the JSON-RPC messages through the `mcp.zig.transport.v1.Mcp/Call` tunnel."),
+				localize('app.mcp.json.grpc.binding.typed', "Call the methods of Google's typed `model_context_protocol.Mcp` service, for a server that does not offer the tunnel. The typed service carries no subscriptions, notifications, pagination beyond the first page or tasks."),
 			],
-			description: localize('app.mcp.json.grpc.binding', "The gRPC service binding the server implements."),
+			markdownDescription: localize('app.mcp.json.grpc.binding', "The gRPC service the server implements. `auto` (the default) and `tunnel` send MCP's JSON-RPC messages through the `mcp.zig.transport.v1.Mcp/Call` tunnel; VS Code never switches to Google's typed `model_context_protocol.Mcp` service on its own. Set `typed` for a server that only offers the typed service: with `auto`, such a server fails to start with an error that says so."),
 		},
 		deadlineMs: {
 			type: 'number',
-			minimum: 0,
-			markdownDescription: localize('app.mcp.json.grpc.deadlineMs', "The deadline for each call in milliseconds. When unset there is no timeout, including on `tools/call`, so a tool that never returns keeps its request open until it is cancelled."),
+			exclusiveMinimum: 0,
+			maximum: 2147483647,
+			markdownDescription: localize('app.mcp.json.grpc.deadlineMs', "The deadline for each call in milliseconds, sent as `grpc-timeout`; it must be greater than 0. It applies to every request except the `subscriptions/listen` stream, which never has one. When unset, only `server/discover`, `tools/list`, `prompts/list`, `prompts/get`, `resources/list`, `resources/templates/list`, `resources/read` and `completion/complete` get a deadline of 60 seconds; `tools/call`, the retries of `input_required` rounds and the other requests get none, so a tool that never returns keeps its request open until it is cancelled."),
 		},
 		keepAliveMs: {
 			type: 'number',
-			minimum: 0,
-			description: localize('app.mcp.json.grpc.keepAliveMs', "The interval between HTTP/2 keep-alive pings in milliseconds. When unset, no pings are sent."),
+			// Either 0 (off) or an interval a gRPC server accepts that a timer can wait.
+			anyOf: [{ minimum: 300000, maximum: 2147483647 }, { const: 0 }],
+			markdownDescription: localize('app.mcp.json.grpc.keepAliveMs', "The interval between HTTP/2 keep-alive pings in milliseconds, from `300000` (5 minutes: gRPC servers allow one ping every 5 minutes by default and close the connection of a client that pings more often) to `2147483647`. The pings are sent only while at least one call is open, as gRPC clients do by default: servers count a ping on an idle connection as abuse. If the server still answers with `too_many_pings`, the interval is doubled for the next connection. `0` sends no pings at all. When unset, a ping is sent every 5 minutes and 10 seconds only while a `subscriptions/listen` stream is open, so that a NAT or load balancer does not cut a stream that has no events for a while."),
 		},
 		oauth: mcpOAuthSchema,
 		protocolVersion: mcpProtocolVersionSchema,

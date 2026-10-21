@@ -335,6 +335,25 @@ suite('extHostTypeConverters', function () {
 			});
 		});
 
+		test('converts the keepAliveMs of gRPC definitions both ways, 0 included, and leaves it out when unset', function () {
+			const roundTrip = (keepAliveMs: number | undefined) => {
+				const grpc = new McpGrpcServerDefinition('gRPC', URI.parse('grpcs://mcp.example.com:50051'));
+				grpc.keepAliveMs = keepAliveMs;
+				const launch = McpServerDefinition.from(grpc);
+				const back = McpServerDefinition.to({ id: 'grpc', label: 'gRPC', cacheNonce: '$$NONE', launch });
+				return {
+					hasKey: Object.prototype.hasOwnProperty.call(launch, 'keepAliveMs'),
+					launch: launch.type === McpServerTransportType.Grpc ? launch.keepAliveMs : 'not gRPC',
+					back: back instanceof McpGrpcServerDefinition ? back.keepAliveMs : 'not gRPC',
+				};
+			};
+			assert.deepStrictEqual([0, 600_000, undefined].map(roundTrip), [
+				{ hasKey: true, launch: 0, back: 0 },
+				{ hasKey: true, launch: 600_000, back: 600_000 },
+				{ hasKey: false, launch: undefined, back: undefined },
+			]);
+		});
+
 		test('rejects gRPC definitions whose URI is not grpc:// or grpcs://', function () {
 			const launch = McpServerDefinition.from(new McpGrpcServerDefinition('gRPC', URI.parse('https://mcp.example.com/mcp')));
 			assert.throws(() => McpServerDefinition.to({ id: 'grpc', label: 'gRPC', cacheNonce: '$$NONE', launch }), /must start with 'grpc:\/\/' or 'grpcs:\/\/'/);

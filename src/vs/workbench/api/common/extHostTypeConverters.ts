@@ -4219,6 +4219,7 @@ export namespace McpServerDefinition {
 				headers: Object.entries(item.headers),
 				tls: item.tls,
 				binding: McpGrpcBinding.from(item.binding),
+				...(typeof item.keepAliveMs === 'number' ? { keepAliveMs: item.keepAliveMs } : {}),
 			});
 		}
 		return McpServerLaunch.toSerialized(
@@ -4248,7 +4249,7 @@ export namespace McpServerDefinition {
 	export function to(dto: McpServerDefinitionType.Serialized): vscode.McpServerDefinition {
 		const launch = McpServerLaunch.fromSerialized(dto.launch);
 		if (launch.type === McpServerTransportType.Grpc) {
-			return new types.McpGrpcServerDefinition(
+			const result = new types.McpGrpcServerDefinition(
 				dto.label,
 				launch.uri,
 				Object.fromEntries(launch.headers),
@@ -4256,6 +4257,10 @@ export namespace McpServerDefinition {
 				launch.tls,
 				McpGrpcBinding.to(launch.binding),
 			);
+			if (launch.keepAliveMs !== undefined) {
+				result.keepAliveMs = launch.keepAliveMs;
+			}
+			return result;
 		} else if (launch.type === McpServerTransportType.HTTP) {
 			return new types.McpHttpServerDefinition(
 				dto.label,

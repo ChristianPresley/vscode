@@ -33,7 +33,7 @@ import { IProductService } from '../../../../platform/product/common/productServ
 import { buildClientCapabilities, buildEnvelope, buildRequestMeta } from '../../../contrib/mcp/common/mcpProtocolMeta.js';
 import { McpServerRequestHandler } from '../../../contrib/mcp/common/mcpServerRequestHandler.js';
 import { McpTaskManager } from '../../../contrib/mcp/common/mcpTaskManager.js';
-import { IMcpClientMethods, McpServerTransportGrpc, McpServerTransportType, MpcResponseError } from '../../../contrib/mcp/common/mcpTypes.js';
+import { IMcpClientMethods, McpClientError, McpServerTransportGrpc, McpServerTransportType, MpcResponseError } from '../../../contrib/mcp/common/mcpTypes.js';
 import { MCPLegacy } from '../../../contrib/mcp/common/modelContextProtocolLegacy.js';
 import { GrpcTestTransport } from './extHostMcpGrpcTestUtils.js';
 
@@ -64,6 +64,12 @@ const clientMethods: IMcpClientMethods = {
 	},
 };
 
+/** The serverInfo of the discover result (synthesized on the typed binding, from the first ListTools response). */
+function synthesizedServerInfoOf(handler: McpServerRequestHandler): unknown {
+	const meta: Readonly<Record<string, unknown>> | undefined = handler.discoverResult?._meta;
+	return meta?.['io.modelcontextprotocol/serverInfo'];
+}
+
 function textOf(result: MCPLegacy.CallToolResult): string {
 	return result.content.map(c => c.type === 'text' ? c.text : '').join('');
 }
@@ -81,16 +87,18 @@ async function waitFor(condition: () => boolean, what: string, timeoutMs = 10_00
 /**
  * An h2c front that serves only the typed binding: the tunnel path answers a
  * trailers-only UNIMPLEMENTED (as a typed-only server does), every other path
- * is forwarded to the peer.
+ * is forwarded to the peer. `paths` records the path of every call.
  */
-async function startTypedOnlyFront(upstreamAuthority: string): Promise<{ port: number; close(): Promise<void> }> {
+async function startTypedOnlyFront(upstreamAuthority: string): Promise<{ port: number; paths: string[]; close(): Promise<void> }> {
 	const upstream = http2.connect(`http://${upstreamAuthority}`);
 	upstream.on('error', () => { });
 	const sessions: http2.ServerHttp2Session[] = [];
+	const paths: string[] = [];
 	const server = http2.createServer();
 	server.on('session', session => sessions.push(session));
 	server.on('stream', (stream, headers) => {
 		stream.on('error', () => { });
+		paths.push(String(headers[':path']));
 		if (headers[':path'] === TUNNEL_PATH) {
 			stream.respond({ ':status': 200, 'content-type': 'application/grpc', 'grpc-status': '12', 'grpc-message': 'unknown service mcp.zig.transport.v1.Mcp' }, { endStream: true });
 			return;
@@ -141,6 +149,7 @@ async function startTypedOnlyFront(upstreamAuthority: string): Promise<{ port: n
 	assert.ok(address && typeof address === 'object');
 	return {
 		port: address.port,
+		paths,
 		close: async () => {
 			for (const session of sessions) {
 				session.destroy();
@@ -273,8 +282,10 @@ async function startTypedOnlyFront(upstreamAuthority: string): Promise<{ port: n
 
 	(TYPED ? suite : suite.skip)('typed binding', () => {
 
-		test('the eight RPCs, with discover synthesized from the authority', async () => {
+		test('the eight RPCs, with discover synthesized from the serverInfo of the first ListTools response', async () => {
 			const { transport, handler } = await connect('typed');
+			// Right after the discover, before the results of the calls below update it from their _meta.
+			const synthesizedServerInfo = { ...handler.serverInfo };
 			const tools = await handler.listTools();
 			const tool = textTool(tools);
 			const call = await handler.callTool({ name: tool.name, arguments: tool.args });
@@ -289,7 +300,11 @@ async function startTypedOnlyFront(upstreamAuthority: string): Promise<{ port: n
 			const completion = await handler.complete({ ref: { type: 'ref/prompt', name: prompt.name }, argument: { name: prompt.arguments?.[0]?.name ?? 'topic', value: 'a' } });
 
 			assert.strictEqual(transport.handle.binding, 'typed');
-			assert.strictEqual(handler.serverInfo.name === authority || handler.serverInfo.name.length > 0, true);
+			// A typed-only server has no server/discover: the synthesized result carries the
+			// serverInfo the server's typed responses carry (not its address), from the start.
+			assert.notStrictEqual(synthesizedServerInfo.name, authority);
+			assert.deepStrictEqual(synthesizedServerInfo, handler.serverInfo, 'the same serverInfo as the later typed results');
+			assert.deepStrictEqual(synthesizedServerInfoOf(handler), synthesizedServerInfo);
 			assert.deepStrictEqual(handler.discoverResult?.supportedVersions, [MODERN]);
 			assert.match(textOf(call), tool.expected);
 			assert.ok(got.messages.length > 0);
@@ -311,17 +326,31 @@ async function startTypedOnlyFront(upstreamAuthority: string): Promise<{ port: n
 			assert.strictEqual(textOf(result), 'Hello, Alice!');
 		});
 
-		test('auto falls back to the typed binding when the server has no tunnel', async () => {
+		test('auto against a typed-only server fails with the typed-binding hint; binding typed reaches it', async () => {
 			const front = await startTypedOnlyFront(authority);
 			try {
-				const { transport, handler } = await connect('auto', `127.0.0.1:${front.port}`);
+				const target = `127.0.0.1:${front.port}`;
+				// auto is the tunnel: the discover fails with the hint, and no typed RPC is sent.
+				await assert.rejects(connect('auto', target), (err: unknown) => {
+					assert.ok(err instanceof McpClientError, `expected an McpClientError, got ${err}`);
+					// The hint quotes the front's grpc-message, and names the fix for mcp.json and for an extension's definition.
+					assert.strictEqual(err.message, `The gRPC server at ${target} answered a call to the MCP JSON-RPC tunnel service (mcp.zig.transport.v1.Mcp) with UNIMPLEMENTED: "unknown service mcp.zig.transport.v1.Mcp". If it only offers Google's typed MCP service, set "binding": "typed" in its configuration, or, if an extension provides the server, ask its author to use McpGrpcBinding.Typed.`);
+					return true;
+				});
+				assert.deepStrictEqual(front.paths, [TUNNEL_PATH]);
+
+				const { transport, handler } = await connect('typed', target);
+				const synthesizedServerInfo = { ...handler.serverInfo };
 				const tools = await handler.listTools();
 				const tool = textTool(tools);
 				const result = await handler.callTool({ name: tool.name, arguments: tool.args });
 				assert.strictEqual(transport.handle.binding, 'typed');
 				assert.deepStrictEqual(handler.discoverResult?.supportedVersions, [MODERN]);
+				assert.notStrictEqual(synthesizedServerInfo.name, target);
+				assert.deepStrictEqual(synthesizedServerInfo, handler.serverInfo, 'the same serverInfo as the later typed results');
+				assert.deepStrictEqual(synthesizedServerInfoOf(handler), synthesizedServerInfo);
 				assert.match(textOf(result), tool.expected);
-				assert.ok(transport.logs.some(l => /switching to the typed gRPC binding/.test(l)));
+				assert.ok(!front.paths.slice(1).includes(TUNNEL_PATH), 'binding typed never calls the tunnel');
 			} finally {
 				await front.close();
 			}
