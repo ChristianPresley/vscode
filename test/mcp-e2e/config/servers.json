@@ -396,7 +396,7 @@
 				"binding": "tunnel"
 			},
 			"process": {
-				"$comment": "The soak test's own server: about 1,200 calls on one HTTP/2 session through runner/grpc-log-proxy.ts on 50055, a Node http2 server. Its rapid-reset protection (nghttp2: a bucket of 1000 resets refilled at 33/s) runs without the refill here: a client that resets completed streams loses the session after 1000 calls even at the zig server's ~40 ms per call, which is slower than the default refill.",
+				"$comment": "The soak test's own server: about 1,200 calls on one HTTP/2 session through runner/grpc-log-proxy.ts on 50055, a Node http2 server. Its rapid-reset protection (nghttp2: a bucket of 1000 resets refilled at 33/s) runs without the refill here: a client that resets completed streams loses the session after 1000 calls however slowly they come.",
 				"command": "{zig}",
 				"args": [
 					"--port",

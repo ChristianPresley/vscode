@@ -34,7 +34,7 @@ import { TestContextService, TestLoggerService, TestProductService, TestStorageS
 import { IMcpRegistry } from '../../common/mcpRegistryTypes.js';
 import { McpServerConnection } from '../../common/mcpServerConnection.js';
 import { McpService } from '../../common/mcpService.js';
-import { IMcpServer, IMcpTool, McpCapability, McpClientError, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, MpcResponseError } from '../../common/mcpTypes.js';
+import { IMcpServer, IMcpTool, IMcpToolCallContext, McpCapability, McpClientError, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, MpcResponseError } from '../../common/mcpTypes.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { ITestMcpTransportOptions, TestMcpMessageTransport, TestMcpRegistry } from './mcpRegistryTypes.js';
 import { McpServerRequestHandler } from '../../common/mcpServerRequestHandler.js';
@@ -63,6 +63,9 @@ class TestableMcpService extends McpService {
 		this.userCache.store(definitionId, JSON.parse(JSON.stringify(entry)));
 	}
 }
+
+/** A tool call made for a chat request (a model turn follows it). */
+const chatCallContext: IMcpToolCallContext = { chatSessionResource: URI.parse('vscode-chat-session://local/e2e') };
 
 suite('Workbench - MCP - McpService', () => {
 
@@ -1426,13 +1429,13 @@ suite('Workbench - MCP - McpService', () => {
 			});
 			const [tool] = await waitForState(server.tools, t => t.length === 1);
 			const started = Date.now();
-			await tool.call({});
+			await tool.call({}, chatCallContext);
 			assert.deepStrictEqual(server.tools.get().map(t => t.definition.name), ['login', 'secret'], 'the next model turn sees the new list');
 			assert.strictEqual(transports[0].getSentRequests('tools/list').length, 2);
 			assert.ok(Date.now() - started < TOOL_LIST_CHANGE_GRACE_MS, 'a completed re-list ends the wait before the grace window');
 		}));
 
-		test('without a change, the call of a server that announces changes waits the grace window; one that does not announce them does not wait', () => runWithFakedTimers({ maxTaskCount: 10_000 }, async () => {
+		test('without a change, a chat call of a server that announces changes waits the grace window; one that does not announce them does not wait', () => runWithFakedTimers({ maxTaskCount: 10_000 }, async () => {
 			for (const era of ['modern', 'legacy'] as const) {
 				const { server } = await startServer(era, transport => {
 					transport.setResponder('tools/list', req => result(era, req, { tools: [plainTool('echo')] }));
@@ -1440,10 +1443,24 @@ suite('Workbench - MCP - McpService', () => {
 				});
 				const [tool] = await waitForState(server.tools, t => t.length === 1);
 				const started = Date.now();
-				await tool.call({});
+				await tool.call({}, chatCallContext);
 				const waited = Date.now() - started;
 				// the 2026-07-28 test server declares tools.listChanged; the 2025-11-25 one does not
 				assert.ok(era === 'modern' ? waited >= TOOL_LIST_CHANGE_GRACE_MS : waited < TOOL_LIST_CHANGE_GRACE_MS, `${era}: waited ${waited} ms`);
+			}
+		}));
+
+		test('a call outside a chat request (gateway, vscode.lm.invokeTool) does not wait the grace window', () => runWithFakedTimers({ maxTaskCount: 10_000 }, async () => {
+			const { server } = await startServer('modern', transport => {
+				transport.setResponder('tools/list', req => result('modern', req, { tools: [plainTool('echo')] }));
+				transport.setResponder('tools/call', req => result('modern', req, { content: [] }));
+			});
+			const [tool] = await waitForState(server.tools, t => t.length === 1);
+			for (const context of [undefined, { chatSessionResource: undefined }]) {
+				const started = Date.now();
+				await tool.call({}, context);
+				const waited = Date.now() - started;
+				assert.ok(waited < TOOL_LIST_CHANGE_GRACE_MS, `waited ${waited} ms`);
 			}
 		}));
 

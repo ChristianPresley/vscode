@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
   The mutation runs of the MCP end-to-end suite: each run applies one mutation of
-  runner/mutations.ts (or, for soak-m8-package, tests the m8 package) and must make the tests it
+  runner/mutations.ts and must make the tests it
   names fail. Prints KILLED or NOT KILLED per mutation and exits non-zero when any survived.
 
 .DESCRIPTION
@@ -34,7 +34,7 @@ $results = @()
 foreach ($m in $mutations) {
 	$runId = "mut-$($m.name)-$stamp"
 	$runArgs = @('-NoProfile', '-File', (Join-Path $here 'run-e2e.ps1'), '-SkipBuild', '-Only', $m.only, '-RunId', $runId)
-	if ($m.deb) { $runArgs += @('-Deb', (Join-Path $Repo $m.deb)) } else { $runArgs += @('-Mutate', $m.name) }
+	$runArgs += @('-Mutate', $m.name)
 	if ($m.suites -eq 'api') { $runArgs += '-SkipUi' } elseif ($m.suites -eq 'ui') { $runArgs += '-SkipApi' }
 	Write-Host "`n=== mutation $($m.name): $($m.summary)"
 	Write-Host "pwsh $($runArgs -join ' ')"

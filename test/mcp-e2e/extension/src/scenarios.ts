@@ -626,6 +626,8 @@ export function apiTests(h: E2eHarness): ITestCase[] {
 				ctx.details.succeeded = succeeded;
 				ctx.details.ms = ms;
 				ctx.details.callsPerSecond = Math.round(succeeded / Math.max(ms / 1000, 0.001) * 10) / 10;
+				// The mean time per call as invokeTool sees it (recorded, no threshold).
+				ctx.details.meanMsPerCall = succeeded ? Math.round(ms / succeeded * 10) / 10 : undefined;
 				// The proxy's record of the soak, also when a call failed (it says why).
 				const isGreet = (e: IWireEvent) => e.event === 'call' && e.path === TUNNEL_CALL_PATH && !!e.jsonRpcMethods?.includes('tools/call');
 				const wire = await waitFor(`${succeeded} greet calls in the wire log`, 15_000, () => {

@@ -27,7 +27,7 @@
   pwsh -File test\mcp-e2e\run-e2e.ps1 -SkipBuild
   pwsh -File test\mcp-e2e\run-e2e.ps1 -Branch mcp-2026/final -AllowFail grpc
   pwsh -File test\mcp-e2e\run-e2e.ps1 -SkipBuild -Repeat 3 -RunId final
-  pwsh -File test\mcp-e2e\run-e2e.ps1 -Deb .build\e2e\code-oss_1.144.0-1792520798_amd64.deb -SkipUi -Only 'gRPC soak'
+  pwsh -File test\mcp-e2e\run-e2e.ps1 -Deb .build\e2e-keep\m8-6201d830320.deb -SkipUi -Only 'gRPC soak'
 #>
 param(
 	[string]$Branch,

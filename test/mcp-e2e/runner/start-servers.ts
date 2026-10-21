@@ -61,13 +61,27 @@ async function startProcess(logDir: string, name: string, command: string, args:
 		console.error(`[start-servers] port ${port} of ${name} is already in use`);
 		return false;
 	}
-	const out = fs.openSync(path.join(logDir, `${name}.log`), 'a');
-	const child = spawn(command, args, { detached: true, stdio: ['ignore', out, out], env: { ...process.env, ...env } });
-	child.unref();
-	pids[name] = child.pid ?? -1;
-	const ok = await waitForPort(port, 30_000);
-	console.log(`[start-servers] ${name}: ${command} ${args.join(' ')} (pid ${child.pid}) ${ok ? `listening on ${port}` : `NOT listening on ${port}`}`);
-	return ok;
+	// A server of the previous start can leave its port unbindable for a while although nothing
+	// listens any more (TIME_WAIT connections; the zig server binds without SO_REUSEADDR and exits
+	// with AddressInUse, seen in run dbg-2 between the API and the UI suite). A process that exits
+	// before it listens is started again until the port can be bound, for up to 90 s.
+	const deadline = Date.now() + 90_000;
+	for (let attempt = 1; ; attempt++) {
+		const out = fs.openSync(path.join(logDir, `${name}.log`), 'a');
+		const child = spawn(command, args, { detached: true, stdio: ['ignore', out, out], env: { ...process.env, ...env } });
+		fs.closeSync(out);
+		child.unref();
+		pids[name] = child.pid ?? -1;
+		let exitCode: number | null | undefined;
+		const exited = new Promise<void>(resolve => child.once('exit', code => { exitCode = code; resolve(); }));
+		const ok = await Promise.race([waitForPort(port, 30_000), exited.then(() => false)]);
+		if (ok || exitCode === undefined || Date.now() > deadline) {
+			console.log(`[start-servers] ${name}: ${command} ${args.join(' ')} (pid ${child.pid}) ${ok ? `listening on ${port}` : `NOT listening on ${port}${exitCode !== undefined ? ` (exited with ${exitCode})` : ''}`}${attempt > 1 ? ` after ${attempt} attempts` : ''}`);
+			return ok;
+		}
+		console.log(`[start-servers] ${name}: exited with ${exitCode} before listening on ${port} (attempt ${attempt}); starting it again in 3 s`);
+		await new Promise(r => setTimeout(r, 3000));
+	}
 }
 
 async function start(logDir: string, args: readonly string[]): Promise<number> {

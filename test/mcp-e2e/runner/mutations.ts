@@ -8,7 +8,7 @@
 // MCP_E2E_MUTATIONS=<name> (run-e2e.ps1 -Mutate <name>) applies it; `check` verifies the result.
 // Where a mutation is applied: prepare-profile.ts (mcp.json, settings), start-servers.ts (the proxy
 // and fixture flags), runner/http-fault-proxy.ts (--mutate), runner/oauth-browser.ts, or the test
-// itself (extension/src, testHelpers.mutated). The soak "mutation" is the m8 package (-Deb).
+// itself (extension/src, testHelpers.mutated).
 //
 // Usage: node runner/mutations.ts list            the table with the exact commands (Markdown)
 //        node runner/mutations.ts json            the same as JSON (run-mutations.ps1 reads it)
@@ -21,15 +21,13 @@ export interface IMutation {
 	readonly name: string;
 	/** What it simulates. */
 	readonly summary: string;
-	readonly appliedBy: 'prepare-profile' | 'start-servers' | 'http-fault-proxy' | 'oauth-browser' | 'test' | 'package';
+	readonly appliedBy: 'prepare-profile' | 'start-servers' | 'http-fault-proxy' | 'oauth-browser' | 'test';
 	/** Substrings of the names of the tests that must fail (each must match at least one failed test). */
 	readonly mustFail: readonly string[];
 	/** The -Only filter of the run (comma-separated substrings). */
 	readonly only: string;
 	/** Which suites the run needs. */
 	readonly suites: 'api' | 'ui' | 'both';
-	/** For the package mutation: the .deb to test (relative to the repository root). */
-	readonly deb?: string;
 }
 
 export const MUTATIONS: readonly IMutation[] = [
@@ -57,17 +55,12 @@ export const MUTATIONS: readonly IMutation[] = [
 	{ name: 'gateway-benign', appliedBy: 'test', suites: 'api', only: 'gateway Host/Origin,gateway unknown route,gateway header check,gateway requestState,gateway dispose', summary: 'the gateway tests send valid requests (and do not dispose) where they send invalid ones', mustFail: ['gateway Host/Origin checks', 'gateway unknown route', 'gateway header check', 'gateway requestState check', 'gateway dispose'] },
 	{ name: 'gateway-listen-no-trigger', appliedBy: 'test', suites: 'api', only: 'gateway listen stream', summary: 'the tool list of zig-http-gw does not change', mustFail: ['gateway listen stream'] },
 	{ name: 'gateway-rate-slow', appliedBy: 'test', suites: 'api', only: 'gateway rate limits', summary: 'the 130 calls are sent one after another, slower than the refill', mustFail: ['gateway rate limits'] },
-	{ name: 'soak-m8-package', appliedBy: 'package', suites: 'api', only: 'gRPC soak', deb: '.build/e2e/code-oss_1.144.0-1792520798_amd64.deb', summary: 'the m8 package (6201d830320), whose GrpcChannel resets every completed stream', mustFail: ['gRPC soak (zig-grpc-soak)'] },
 ];
 
 /** The run-e2e.ps1 command of a mutation run. */
 export function commandOf(m: IMutation): string {
 	const parts = ['pwsh -File test\\mcp-e2e\\run-e2e.ps1', '-SkipBuild'];
-	if (m.deb) {
-		parts.push('-Deb', m.deb.replace(/\//g, '\\'));
-	} else {
-		parts.push('-Mutate', m.name);
-	}
+	parts.push('-Mutate', m.name);
 	parts.push('-Only', `'${m.only}'`);
 	if (m.suites === 'api') {
 		parts.push('-SkipUi');

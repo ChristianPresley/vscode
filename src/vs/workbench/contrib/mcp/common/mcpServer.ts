@@ -1188,14 +1188,19 @@ export class McpServer extends Disposable implements IMcpServer {
 	 * once when there is no live tool list (the server stopped), instead of
 	 * waiting for the next connection, and as soon as `token` (the tool call's)
 	 * is cancelled: the request no longer needs the next turn's list.
+	 *
+	 * The grace window only matters when a model turn follows the call, so
+	 * callers outside a chat request (the gateway, `vscode.lm.invokeTool`
+	 * without a chat request) pass `withGraceWindow: false` and do not pay its
+	 * latency on every call.
 	 */
-	public awaitToolRefresh(token: CancellationToken = CancellationToken.None): Promise<void> {
+	public awaitToolRefresh(token: CancellationToken = CancellationToken.None, withGraceWindow = true): Promise<void> {
 		if (token.isCancellationRequested) {
 			return Promise.resolve();
 		}
 		const listingAtResult = this._tools.fromServerPromise.get();
 		const capabilities = this.capabilities.get();
-		const announcesChanges = capabilities === undefined || !!(capabilities & McpCapability.ToolsListChanged);
+		const announcesChanges = withGraceWindow && (capabilities === undefined || !!(capabilities & McpCapability.ToolsListChanged));
 		const graceOver = observableValue(this, !announcesChanges);
 		const store = new DisposableStore();
 		if (announcesChanges) {
@@ -1754,8 +1759,9 @@ export class McpTool implements IMcpTool {
 					_meta: meta,
 				}, token, progress ? (message) => progress.report({ message }) : undefined, context), h);
 
-				// Wait for tools to refresh for dynamic servers (#261611), unless the request is cancelled
-				await this._server.awaitToolRefresh(token);
+				// Wait for tools to refresh for dynamic servers (#261611), unless the request is cancelled.
+				// The grace window for late list changes only applies when a chat model turn follows.
+				await this._server.awaitToolRefresh(token, !!context?.chatSessionResource);
 
 				return result;
 			} catch (err) {
