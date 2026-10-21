@@ -7,8 +7,19 @@ on:
       - 'src/vs/base/common/grpc/**'
       - 'src/vs/base/node/grpcChannel.ts'
       - 'src/vs/base/node/grpcServer.ts'
+      - 'src/vs/base/test/common/protobuf/**'
+      - 'src/vs/base/test/common/grpc/**'
+      - 'src/vs/base/test/node/grpcChannel.test.ts'
+      - 'src/vs/base/test/node/grpcServer.test.ts'
+      - 'src/vs/base/test/node/http2FrameProxy.ts'
       - 'src/vs/platform/mcp/**'
       - 'src/vs/workbench/api/node/extHostMcpGrpc.ts'
+      - 'src/vs/workbench/api/node/extHostMcpNode.ts'
+      - 'src/vs/workbench/api/node/proxyResolver.ts'
+      - 'src/vs/workbench/api/common/extHostMcp.ts'
+      - 'src/vs/workbench/api/browser/mainThreadMcp.ts'
+      - 'src/vs/workbench/contrib/mcp/common/mcpServerRequestHandler.ts'
+      - 'src/vs/workbench/contrib/mcp/common/mcpTypes.ts'
       - 'src/vs/workbench/api/test/node/extHostMcpGrpc*.ts'
       - 'test/mcp-grpc/**'
       - '.github/workflows/mcp-grpc-interop.yml'
@@ -112,10 +123,69 @@ jobs:
           path: .build/zig-sdk
           persist-credentials: false
 
-      - name: Setup Zig
-        uses: ./.build/zig-sdk/.github/actions/setup-zig
+      # zig-sdk's setup-zig action reads .github/community-mirrors.txt from the
+      # workspace root (this checkout, not zig-sdk's), so it cannot run here:
+      # install the toolchain pinned in zig-sdk's zig.json from ziglang.org.
+      - name: Resolve the Zig toolchain pinned by zig-sdk
+        id: zig
+        working-directory: .build/zig-sdk
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64) target=x86_64-linux ;;
+            Linux-ARM64) target=aarch64-linux ;;
+            *) echo "unsupported runner $RUNNER_OS-$RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          python3 - "$target" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, os, re, sys
+          target = sys.argv[1]
+          with open('.github/zig.json') as f:
+              pin = json.load(f)
+          version = pin['version']
+          entry = pin['targets'][target]
+          if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+              sys.exit(f'unexpected Zig version {version!r}')
+          if not re.fullmatch(r'[0-9a-f]{64}', entry['shasum']):
+              sys.exit(f'unexpected sha256 {entry["shasum"]!r}')
+          if not entry['tarball'].startswith(f'https://ziglang.org/download/{version}/'):
+              sys.exit(f'the {target} tarball is not on ziglang.org: {entry["tarball"]}')
+          print(f'version={version}')
+          print(f'target={target}')
+          print(f'tarball={entry["tarball"]}')
+          print(f'shasum={entry["shasum"]}')
+          print(f'dir={os.environ["RUNNER_TEMP"]}/zig-{version}-{target}')
+          PY
+
+      - name: Restore the Zig toolchain
+        id: zig-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          pin-file: .build/zig-sdk/.github/zig.json
+          path: ${{ steps.zig.outputs.dir }}
+          key: zig-${{ steps.zig.outputs.version }}-${{ steps.zig.outputs.target }}
+
+      - name: Install Zig
+        if: steps.zig-cache.outputs.cache-hit != 'true'
+        working-directory: .build/zig-sdk
+        env:
+          ZIG_TARBALL: ${{ steps.zig.outputs.tarball }}
+          ZIG_SHASUM: ${{ steps.zig.outputs.shasum }}
+          ZIG_DIR: ${{ steps.zig.outputs.dir }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/$(basename "$ZIG_TARBALL")"
+          curl -fsSL --retry 3 --retry-all-errors -o "$archive" "$ZIG_TARBALL"
+          echo "$ZIG_SHASUM  $archive" | sha256sum --check --strict -
+          rm -rf "$ZIG_DIR"
+          mkdir -p "$ZIG_DIR"
+          tar -xJf "$archive" -C "$ZIG_DIR" --strip-components=1
+          rm -f "$archive"
+
+      - name: Add Zig to the PATH
+        env:
+          ZIG_DIR: ${{ steps.zig.outputs.dir }}
+        run: |
+          echo "$ZIG_DIR" >> "$GITHUB_PATH"
+          "$ZIG_DIR/zig" version
 
       - name: Build the zig-sdk conformance server
         working-directory: .build/zig-sdk
@@ -271,10 +341,67 @@ jobs:
           path: .build/zig-sdk
           persist-credentials: false
 
-      - name: Setup Zig
-        uses: ./.build/zig-sdk/.github/actions/setup-zig
+      # As in the zig-interop job: the toolchain pinned in zig-sdk's zig.json, from ziglang.org.
+      - name: Resolve the Zig toolchain pinned by zig-sdk
+        id: zig
+        working-directory: .build/zig-sdk
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64) target=x86_64-linux ;;
+            Linux-ARM64) target=aarch64-linux ;;
+            *) echo "unsupported runner $RUNNER_OS-$RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          python3 - "$target" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, os, re, sys
+          target = sys.argv[1]
+          with open('.github/zig.json') as f:
+              pin = json.load(f)
+          version = pin['version']
+          entry = pin['targets'][target]
+          if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+              sys.exit(f'unexpected Zig version {version!r}')
+          if not re.fullmatch(r'[0-9a-f]{64}', entry['shasum']):
+              sys.exit(f'unexpected sha256 {entry["shasum"]!r}')
+          if not entry['tarball'].startswith(f'https://ziglang.org/download/{version}/'):
+              sys.exit(f'the {target} tarball is not on ziglang.org: {entry["tarball"]}')
+          print(f'version={version}')
+          print(f'target={target}')
+          print(f'tarball={entry["tarball"]}')
+          print(f'shasum={entry["shasum"]}')
+          print(f'dir={os.environ["RUNNER_TEMP"]}/zig-{version}-{target}')
+          PY
+
+      - name: Restore the Zig toolchain
+        id: zig-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          pin-file: .build/zig-sdk/.github/zig.json
+          path: ${{ steps.zig.outputs.dir }}
+          key: zig-${{ steps.zig.outputs.version }}-${{ steps.zig.outputs.target }}
+
+      - name: Install Zig
+        if: steps.zig-cache.outputs.cache-hit != 'true'
+        working-directory: .build/zig-sdk
+        env:
+          ZIG_TARBALL: ${{ steps.zig.outputs.tarball }}
+          ZIG_SHASUM: ${{ steps.zig.outputs.shasum }}
+          ZIG_DIR: ${{ steps.zig.outputs.dir }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/$(basename "$ZIG_TARBALL")"
+          curl -fsSL --retry 3 --retry-all-errors -o "$archive" "$ZIG_TARBALL"
+          echo "$ZIG_SHASUM  $archive" | sha256sum --check --strict -
+          rm -rf "$ZIG_DIR"
+          mkdir -p "$ZIG_DIR"
+          tar -xJf "$archive" -C "$ZIG_DIR" --strip-components=1
+          rm -f "$archive"
+
+      - name: Add Zig to the PATH
+        env:
+          ZIG_DIR: ${{ steps.zig.outputs.dir }}
+        run: |
+          echo "$ZIG_DIR" >> "$GITHUB_PATH"
+          "$ZIG_DIR/zig" version
 
       - name: Build the zig-sdk example gRPC client
         working-directory: .build/zig-sdk

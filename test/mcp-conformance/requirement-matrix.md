@@ -1,8 +1,8 @@
 # MCP conformance requirement matrix
 
-One row per scenario that the requirement sets of `@modelcontextprotocol/conformance@0.2.0-alpha.11` name (`requirements/2026-07-28.yaml` and `requirements/2025-11-25.yaml`), for both legs and both revisions: the scored scenarios and the `not_scored` ones. A scenario that belongs to both revisions has a row for each, because it runs once at each revision's wire.
+One row per scenario that the requirement sets of `@modelcontextprotocol/conformance@0.2.0-alpha.12` name (`requirements/2026-07-28.yaml` and `requirements/2025-11-25.yaml`), for both legs and both revisions: the scored scenarios and the `not_scored` ones. A scenario that belongs to both revisions has a row for each, because it runs once at each revision's wire.
 
-`node test/mcp-conformance/run.ts check-matrix` checks this file: every scenario of both requirement sets has exactly one row, the scoring column matches the set, every `gap` row has an entry in its expected-failures file, and every not-scored row is driven or baselined. It also checks `requirement-tests.json`.
+`node test/mcp-conformance/run.ts check-matrix` checks this file: every scenario of both requirement sets has exactly one row, the scoring column matches the set, every `gap` row has an entry in its expected-failures file and no `driven` row has one, and every not-scored row is driven or baselined. It also checks `requirement-tests.json`.
 
 | Status | Meaning |
 | --- | --- |
@@ -129,16 +129,16 @@ One row per scenario that the requirement sets of `@modelcontextprotocol/conform
 | server | 2026-07-28 | `input-required-result-capability-check` | scored | driven | gateway fixture (M6) |
 | server | 2026-07-28 | `input-required-result-ignore-extra-params` | scored | driven | gateway fixture (M6) |
 | server | 2026-07-28 | `input-required-result-validate-input` | scored | driven | gateway fixture (M6) |
-| server | 2026-07-28 | `tasks-lifecycle` | not-scored | gap | Tasks extension (M9): every functional check passes; `wire-schema-valid` is baselined in `expected-failures-unscored.yml` (the suite validates a CreateTaskResult against CallToolResult, which requires `content`) |
-| server | 2026-07-28 | `tasks-capability-negotiation` | not-scored | gap | Tasks extension (M9): every functional check passes; `wire-schema-valid` is baselined in `expected-failures-unscored.yml` (the suite validates a CreateTaskResult against CallToolResult, which requires `content`) |
-| server | 2026-07-28 | `tasks-wire-fields` | not-scored | gap | Tasks extension (M9): every functional check passes; `wire-schema-valid` is baselined in `expected-failures-unscored.yml` (the suite validates a CreateTaskResult against CallToolResult, which requires `content`) |
-| server | 2026-07-28 | `tasks-request-state-removal` | not-scored | gap | Tasks extension (M9): every functional check passes; `wire-schema-valid` is baselined in `expected-failures-unscored.yml` (the suite validates a CreateTaskResult against CallToolResult, which requires `content`) |
-| server | 2026-07-28 | `tasks-mrtr-input` | not-scored | gap | Tasks extension (M9): every functional check passes; `wire-schema-valid` is baselined in `expected-failures-unscored.yml` (the suite validates a CreateTaskResult against CallToolResult, which requires `content`) |
-| server | 2026-07-28 | `tasks-request-headers` | not-scored | gap | Tasks extension (M9): every functional check passes; `wire-schema-valid` is baselined in `expected-failures-unscored.yml` (the suite validates a CreateTaskResult against CallToolResult, which requires `content`) |
-| server | 2026-07-28 | `tasks-dispatch-and-envelope` | not-scored | gap | Tasks extension (M9): every functional check passes; `wire-schema-valid` is baselined in `expected-failures-unscored.yml` (the suite validates a CreateTaskResult against CallToolResult, which requires `content`) |
+| server | 2026-07-28 | `tasks-lifecycle` | not-scored | driven | Tasks extension (M9): every check passes, `wire-schema-valid` included (since 0.2.0-alpha.12 the suite validates a CreateTaskResult against the generic result envelope) |
+| server | 2026-07-28 | `tasks-capability-negotiation` | not-scored | driven | Tasks extension (M9): every check passes, `wire-schema-valid` included (since 0.2.0-alpha.12 the suite validates a CreateTaskResult against the generic result envelope) |
+| server | 2026-07-28 | `tasks-wire-fields` | not-scored | driven | Tasks extension (M9): every check passes, `wire-schema-valid` included (since 0.2.0-alpha.12 the suite validates a CreateTaskResult against the generic result envelope) |
+| server | 2026-07-28 | `tasks-request-state-removal` | not-scored | driven | Tasks extension (M9): every check passes, `wire-schema-valid` included (since 0.2.0-alpha.12 the suite validates a CreateTaskResult against the generic result envelope) |
+| server | 2026-07-28 | `tasks-mrtr-input` | not-scored | driven | Tasks extension (M9): every check passes, `wire-schema-valid` included (since 0.2.0-alpha.12 the suite validates a CreateTaskResult against the generic result envelope) |
+| server | 2026-07-28 | `tasks-request-headers` | not-scored | driven | Tasks extension (M9): every check passes, `wire-schema-valid` included (since 0.2.0-alpha.12 the suite validates a CreateTaskResult against the generic result envelope) |
+| server | 2026-07-28 | `tasks-dispatch-and-envelope` | not-scored | driven | Tasks extension (M9): every check passes, `wire-schema-valid` included (since 0.2.0-alpha.12 the suite validates a CreateTaskResult against the generic result envelope) |
 | server | 2026-07-28 | `tasks-status-notifications` | not-scored | driven | Tasks extension (M9); the suite reports no checks (notifications are optional) |
 | server | 2026-07-28 | `tasks-required-task-error` | not-scored | driven | Tasks extension (M9): a `taskSupport: required` tool answers -32021 without the extension |
-| server | 2026-07-28 | `tasks-mrtr-composition` | not-scored | gap | Tasks extension (M9): every functional check passes; `wire-schema-valid` is baselined in `expected-failures-unscored.yml` (the suite validates a CreateTaskResult against CallToolResult, which requires `content`) |
+| server | 2026-07-28 | `tasks-mrtr-composition` | not-scored | driven | Tasks extension (M9): every check passes, `wire-schema-valid` included (since 0.2.0-alpha.12 the suite validates a CreateTaskResult against the generic result envelope) |
 | server | 2026-07-28 | `json-schema-2020-12` | not-scored | driven | pending: gateway fixture (M6) |
 | server | 2026-07-28 | `http-header-validation` | not-scored | driven | pending: gateway fixture (M6) |
 | server | 2026-07-28 | `http-custom-header-server-validation` | not-scored | driven | pending: gateway fixture (M6) |

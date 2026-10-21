@@ -105,6 +105,7 @@ const rules: readonly IChangeRule[] = [
 			'src/vs/workbench/api/node/mcpConformanceOAuth.ts',
 			'src/vs/workbench/api/node/mcpConformanceProxy.ts',
 			'src/vs/workbench/api/node/mcpConformanceScenarios.ts',
+			'src/vs/workbench/api/common/mcpOAuthClientFactory.ts',
 			'src/vs/workbench/api/browser/mainThreadMcp.ts',
 			'src/vs/base/common/oauth.ts',
 			'src/vs/base/common/oauthClient.ts',
@@ -112,8 +113,14 @@ const rules: readonly IChangeRule[] = [
 			'src/vs/base/common/jsonSchemaValidator/',
 			'src/vs/base/common/protobuf/',
 			'src/vs/base/common/grpc/',
+			// The Streamable HTTP transport parses its event streams with it.
+			'src/vs/base/common/sseParser.ts',
+			// The stdio launch reads a server's envFile with it.
+			'src/vs/base/common/envfile.ts',
 			'src/vs/base/node/grpcChannel.ts',
 			'src/vs/base/node/grpcServer.ts',
+			// npm run mcp:check-schema (the static checks).
+			'build/mcp/',
 			'test/mcp-conformance/',
 			'test/mcp-grpc/',
 			// The jobs install the root dependencies.

@@ -816,6 +816,7 @@
 				}
 			},
 			"version": "v0.5.2",
+			"description": "Test data only: the vendored proto of its gRPC transport (mcp_zig_transport_v1.proto) and test/mcp-conformance/requirements-2026-07-28.json, converted from its docs/spec/requirements.zon (the normative sentences of the MCP 2026-07-28 specification).",
 			"developmentDependency": true,
 			"license": "Apache-2.0"
 		}

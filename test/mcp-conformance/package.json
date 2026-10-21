@@ -1,7 +1,7 @@
 {
   "name": "code-oss-dev-mcp-conformance",
   "version": "0.1.0",
-  "description": "Runs the official MCP conformance suite against VS Code's MCP client (and, later, its gateway).",
+  "description": "Runs the official MCP conformance suite against VS Code's MCP client and its MCP gateway.",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -10,10 +10,11 @@
     "server": "node run.ts server",
     "all": "node run.ts all",
     "check-matrix": "node run.ts check-matrix",
+    "render-matrix": "node run.ts render-matrix",
     "test": "node --test run.test.ts"
   },
   "devDependencies": {
-    "@modelcontextprotocol/conformance": "0.2.0-alpha.11",
+    "@modelcontextprotocol/conformance": "0.2.0-alpha.12",
     "yaml": "2.8.2"
   }
 }

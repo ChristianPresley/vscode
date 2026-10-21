@@ -1,9 +1,11 @@
 name: MCP Conformance
 
-# Runs the official MCP conformance suite against VS Code's MCP client (and,
-# once it lands, the MCP gateway fixture) with test/mcp-conformance/run.ts, and
-# the static checks of the MCP code. pr.yml calls it once per OS with `affected`
-# from the `mcp` rule of .github/actions/detect-changes/detect.ts.
+# Runs the official MCP conformance suite against VS Code's MCP client and the
+# MCP gateway fixture (the client and server legs of test/mcp-conformance/run.ts),
+# and the static checks of the MCP code. pr.yml calls it once per OS with
+# `affected` from the `mcp` rule of .github/actions/detect-changes/detect.ts;
+# the push paths below are the same list (test/mcp-conformance/run.test.ts
+# checks that they agree).
 
 on:
   workflow_call:
@@ -33,6 +35,7 @@ on:
       - 'src/vs/workbench/api/node/extHostMcpNode.ts'
       - 'src/vs/workbench/api/node/extHostMcpGrpc.ts'
       - 'src/vs/workbench/api/node/mcpConformance*.ts'
+      - 'src/vs/workbench/api/common/mcpOAuthClientFactory.ts'
       - 'src/vs/workbench/api/browser/mainThreadMcp.ts'
       - 'src/vs/base/common/oauth.ts'
       - 'src/vs/base/common/oauthClient.ts'
@@ -40,8 +43,11 @@ on:
       - 'src/vs/base/common/jsonSchemaValidator/**'
       - 'src/vs/base/common/protobuf/**'
       - 'src/vs/base/common/grpc/**'
+      - 'src/vs/base/common/sseParser.ts'
+      - 'src/vs/base/common/envfile.ts'
       - 'src/vs/base/node/grpcChannel.ts'
       - 'src/vs/base/node/grpcServer.ts'
+      - 'build/mcp/**'
       - 'test/mcp-conformance/**'
       - 'test/mcp-grpc/**'
       - 'package.json'

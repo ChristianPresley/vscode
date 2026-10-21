@@ -6,22 +6,26 @@
 /**
  * Tests of the harness with the suite stubbed out: how the options map to the
  * suite's flags, the not-scored loop, timeouts, the baseline refusal on CI,
- * the leftover-client kill, the output parsing, the baseline update and the
- * matrix check. Run with `node --test test/mcp-conformance/run.test.ts`.
+ * the leftover-client kill, the output parsing, the baseline update, the
+ * matrix and requirement-mapping check and the rendering of the matrix; also
+ * that the files naming the suite name its pinned version and that the CI
+ * path filters of the MCP checks cover the MCP sources. Run with `node --test test/mcp-conformance/run.test.ts`.
  */
 
 import assert from 'node:assert';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, suite, test } from 'node:test';
 import {
-	applyTimingReruns, BaselineUpdater, checkMatrix, CLIENT_MAIN, clientCommand, countChecks, countClientTimeouts, createKillTree, DEFAULT_OUT, DEFAULT_TIMEOUT_MS,
-	entryScenario, failingCheckIds, HERE, type IBaselineEntries, type ICheckMatrixInput, type IHarnessDeps, type IInvocation, type IInvocationResult,
-	INVOCATION_TIMEOUT_FACTOR, type IOptions, isExitCrashAfterPassingVerdict, type IPlanContext, type IRequirementSet, type ISuiteRun, killLeftovers, main, type Env, parseArgs,
-	parseBaselineFile, parseBaselineVerdict, parseCounts, parseMatrix, parseReadyLine, parseRequirementSet, PID_DIR_ENV, planLeg, planScenario, planScored,
-	planUnscored, readResults, resultScenario, ROOT, runInvocation, scoredBaseline, SUITE_BIN, UNSCORED_BASELINE, updatedEntries,
+	applyTimingReruns, AUTHORIZATION_SERVER_SCENARIOS, BaselineUpdater, checkMatrix, CLIENT_MAIN, clientCommand, clientExitProblems, countChecks, countClientTimeouts, createKillTree, DEFAULT_OUT, DEFAULT_TIMEOUT_MS,
+	entryScenario, extractTestNames, failingCheckIds, HERE, type IBaselineEntries, type ICheckMatrixInput, type IHarnessDeps, type IInvocation, type IInvocationResult,
+	INVOCATION_TIMEOUT_FACTOR, type IOptions, isExitCrashAfterPassingVerdict, type IPlanContext, type IRequirementSet, type ISuiteRun, killLeftovers, main, type Env, nodeProcessFlags, parseArgs,
+	parseBaselineFile, parseBaselineVerdict, parseClientExits, parseCounts, parseGatewayThreats, parseMatrix, parseReadyLine, parseRequirementSet, parseScenarioDrivers, parseSuiteInventory, PID_DIR_ENV, planLeg, planScenario, planScored,
+	planUnscored, readCheckMatrixInput, readResults, renderConformanceMatrix, resultScenario, ROOT, runInvocation, scanTestDeclarations, scoredBaseline, skippedChecks, SUITE_BIN, SUITE_DIR, suiteProcessArgs, UNSCORED_BASELINE, updatedEntries,
 } from './run.ts';
+import { convertRequirements, formatRequirementsJson, parseZon, readZonAtCommit, requirementsRevision, ZonEnum, type ZonRead } from './tools/convert-requirements.ts';
 
 const CWD = path.resolve(path.sep, 'work');
 
@@ -117,7 +121,7 @@ suite('options', () => {
 		assert.match(parseError(['client', '--timeout', '0']), /--timeout takes a positive number/);
 	});
 
-	test('the server leg is skipped unless asked for or given a URL', () => {
+	test('the server leg runs by default; --skip-server skips it', () => {
 		assert.strictEqual(options(['server']).skipServer, false);
 		assert.strictEqual(options(['server', '--skip-server']).skipServer, true);
 		assert.strictEqual(options(['server', '--skip-server=false']).skipServer, false);
@@ -152,8 +156,23 @@ suite('options', () => {
 
 suite('flag mapping', () => {
 	test('the client command is node with the absolute client path, or the root-relative one when the root has whitespace', () => {
-		assert.strictEqual(clientCommand(path.join(path.sep, 'repo')), `node ${path.join(path.sep, 'repo', CLIENT_MAIN).split(path.sep).join('/')}`);
-		assert.strictEqual(clientCommand(path.join(path.sep, 'my repo')), `node ${CLIENT_MAIN}`);
+		assert.strictEqual(clientCommand(path.join(path.sep, 'repo'), 'linux'), `node ${path.join(path.sep, 'repo', CLIENT_MAIN).split(path.sep).join('/')}`);
+		assert.strictEqual(clientCommand(path.join(path.sep, 'my repo'), 'linux'), `node ${CLIENT_MAIN}`);
+	});
+
+	test('on Windows the suite, its client and the gateway fixture run with --no-wasm-dynamic-tiering (libuv aborts the exit otherwise); elsewhere without', () => {
+		assert.deepStrictEqual(nodeProcessFlags('win32'), ['--no-wasm-dynamic-tiering']);
+		assert.deepStrictEqual(nodeProcessFlags('linux'), []);
+		assert.deepStrictEqual(nodeProcessFlags('darwin'), []);
+		assert.strictEqual(clientCommand(path.join(path.sep, 'repo'), 'win32'), `node --no-wasm-dynamic-tiering ${path.join(path.sep, 'repo', CLIENT_MAIN).split(path.sep).join('/')}`);
+		assert.strictEqual(clientCommand(path.join(path.sep, 'my repo'), 'win32'), `node --no-wasm-dynamic-tiering ${CLIENT_MAIN}`);
+		assert.deepStrictEqual(suiteProcessArgs(['client', '--requirements', '2026-07-28'], 'win32'), ['--no-wasm-dynamic-tiering', SUITE_BIN, 'client', '--requirements', '2026-07-28']);
+		assert.deepStrictEqual(suiteProcessArgs(['client'], 'linux'), [SUITE_BIN, 'client']);
+		// Node refuses the flag in NODE_OPTIONS, which is why it goes on each command line.
+		const refused = spawnSync(process.execPath, ['-e', ''], { env: { ...process.env, NODE_OPTIONS: '--no-wasm-dynamic-tiering' }, encoding: 'utf8' });
+		assert.notStrictEqual(refused.status, 0);
+		assert.match(refused.stderr, /not allowed in NODE_OPTIONS/);
+		assert.strictEqual(spawnSync(process.execPath, ['--no-wasm-dynamic-tiering', '-e', ''], { encoding: 'utf8' }).status, 0);
 	});
 
 	test('a scored client run is --requirements with the scored baseline and the timeout, never --scenario or --spec-version', () => {
@@ -427,6 +446,7 @@ suite('suite output', () => {
 			counts: undefined,
 			verdict: { expected: [], stale: [], unexpected },
 			clientTimeouts: 0,
+			clientExits: [],
 			passed,
 			note: undefined,
 		});
@@ -442,6 +462,129 @@ suite('suite output', () => {
 		const stillFailing = make('scored', undefined, false, ['sse-retry:client-sse-retry-timing']);
 		applyTimingReruns([stillFailing, make('timing', 'sse-retry', false)]);
 		assert.strictEqual(stillFailing.passed, false);
+
+		const crashedClient = { ...make('scored', undefined, false, ['sse-retry:client-sse-retry-timing']), clientExits: ['the client of tools_call exited with code 1'] };
+		applyTimingReruns([crashedClient, make('timing', 'sse-retry', true)]);
+		assert.strictEqual(crashedClient.passed, false, 'a timing re-run never excuses a client exit');
+	});
+});
+
+/** The report the suite writes for a client that exited non-zero (see the function that runs one client scenario in its dist/index.js). */
+function clientExitReport(exitCode: number, client: { stdout?: string; stderr?: string }, timeoutMs?: number): string {
+	return [
+		`\nClient exited with code ${exitCode}\n`,
+		client.stdout ? `\nStdout:\n${client.stdout}\n` : '',
+		client.stderr ? `\nStderr:\n${client.stderr}\n` : '',
+		timeoutMs !== undefined ? `\nClient timed out after ${timeoutMs}ms\n` : '',
+	].join('');
+}
+
+suite('client exits', () => {
+	const RETRY_LIMIT = { stdout: '', stderr: '[mcp-conformance] info: Scenario auth/scope-retry-limit against http://localhost:1/mcp\n[mcp-conformance] error: step_up_limit\n' };
+	const TOOLS = { stdout: '', stderr: '[mcp-conformance] info: Scenario tools_call against http://localhost:2/mcp\nTypeError: boom\n    at x (file:///y.js:1:1)' };
+	const DPOP = { stdout: 'unexpected stdout', stderr: '[mcp-conformance] info: Scenario auth/dpop against http://localhost:3/mcp\n' };
+	const clients = new Map([['auth/scope-retry-limit', RETRY_LIMIT], ['tools_call', TOOLS], ['auth/dpop', DPOP], ['request-metadata', { stdout: '', stderr: '[mcp-conformance] info: Scenario request-metadata\n' }]]);
+
+	test('each report is matched to its scenario by the output it quotes, interleaved with other scenarios', () => {
+		const output = [
+			'Running requirements 2026-07-28 (4 scenarios) in parallel...',
+			'Starting scenario: tools_call',
+			'Starting scenario: auth/scope-retry-limit',
+			clientExitReport(1, RETRY_LIMIT),
+			'Results saved to /out/auth/scope-retry-limit-2026-10-20T14-55-42-051Z',
+			clientExitReport(1, DPOP),
+			'\u001b[31m' + clientExitReport(134, TOOLS, 60000).replace(/\n/g, '\r\n') + '\u001b[0m',
+			'Total: 3 passed, 0 failed, 0 warnings',
+		].join('\n');
+		assert.deepStrictEqual(parseClientExits(output, clients), [
+			{ scenario: 'auth/scope-retry-limit', exitCode: 1, timedOut: false },
+			{ scenario: 'tools_call', exitCode: 134, timedOut: true },
+			{ scenario: 'auth/dpop', exitCode: 1, timedOut: false },
+		]);
+	});
+
+	test('a report without output, and a timeout of a client that exited with 0, belong to no scenario', () => {
+		assert.deepStrictEqual(parseClientExits(`${clientExitReport(3, {})}\nClient timed out after 400ms\n`, clients), [
+			{ scenario: undefined, exitCode: 3, timedOut: false },
+			{ scenario: undefined, exitCode: undefined, timedOut: true },
+		]);
+		assert.deepStrictEqual(parseClientExits('Total: 3 passed, 0 failed, 0 warnings\n', clients), []);
+	});
+
+	test('a non-zero exit fails unless the scenario allows a client error or is baselined whole; a timeout always fails', () => {
+		const invocation = { scope: ['tools_call', 'auth/scope-retry-limit', 'request-metadata'], clientErrorAllowed: ['auth/scope-retry-limit'] };
+		assert.deepStrictEqual(clientExitProblems([
+			{ scenario: 'auth/scope-retry-limit', exitCode: 1, timedOut: false },
+			{ scenario: 'tools_call', exitCode: 1, timedOut: false },
+			{ scenario: 'auth/dpop', exitCode: 1, timedOut: false },
+			{ scenario: 'request-metadata', exitCode: 0, timedOut: true },
+		], invocation, new Set()), [
+			'the client of tools_call exited with code 1',
+			'the client of request-metadata timed out',
+		], 'auth/dpop is outside the scope of the invocation: its own run judges it');
+		assert.deepStrictEqual(clientExitProblems([{ scenario: 'auth/scope-retry-limit', exitCode: 1, timedOut: true }], invocation, new Set()), ['the client of auth/scope-retry-limit timed out']);
+		assert.deepStrictEqual(clientExitProblems([{ scenario: 'tools_call', exitCode: 1, timedOut: true }], invocation, new Set(['tools_call'])), [], 'baselined whole');
+		assert.deepStrictEqual(clientExitProblems([{ scenario: undefined, exitCode: 2, timedOut: false }, { scenario: undefined, exitCode: undefined, timedOut: true }], invocation, new Set()), [
+			'a client (of a scenario the harness cannot tell) exited with code 2',
+			'a client (of a scenario the harness cannot tell) timed out',
+		]);
+		assert.deepStrictEqual(clientExitProblems([{ scenario: undefined, exitCode: 1, timedOut: false }], { scope: ['auth/scope-retry-limit'], clientErrorAllowed: ['auth/scope-retry-limit'] }, new Set()), [], 'a single-scenario run owns every report');
+		assert.deepStrictEqual(clientExitProblems([{ scenario: undefined, exitCode: 1, timedOut: false }], { scope: ['tools_call'], clientErrorAllowed: [] }, new Set()), ['the client of tools_call exited with code 1']);
+	});
+
+	test('the suite\'s scenarios that allow a client error are read from its bundle', () => {
+		const bundle = 'var A=class{constructor(){this.name=`auth/scope-retry-limit`,this.source={introducedIn:`2025-11-25`},this.description=`x`,this.allowClientError=!0,this.checks=[]}async start(e){}};'
+			+ 'var B=class extends C{constructor(...e){super(...e),this.name=`http-invalid-tool-headers`,this.allowClientError=!0}getChecks(){}};'
+			+ 'var D=class{constructor(){this.name=`tools_call`,this.checks=[]}async start(){this.allowClientError=!0}};'
+			+ 'var E=class{constructor(){this.name="initialize"}};';
+		assert.deepStrictEqual([...parseSuiteInventory(bundle).clientErrorAllowed], ['auth/scope-retry-limit', 'http-invalid-tool-headers']);
+	});
+
+	test('a client that crashes after its checks are recorded fails the invocation, even when the suite passed it', async () => {
+		const dir = mkdtempSync(path.join(tmpdir(), 'mcp-conformance-exit-'));
+		try {
+			const ctx: IPlanContext = { ...context(['client', '--requirements', '2026-07-28', '--out', dir]), clientErrorAllowed: new Set(['auth/metadata-default']) };
+			const [invocation] = planScored('client', ctx);
+			assert.deepStrictEqual(invocation.clientErrorAllowed, ['auth/metadata-default']);
+			const write = (scenario: string, client: { stdout: string; stderr: string }) => {
+				const folder = path.join(invocation.outDir, `${scenario}-2026-10-20T14-55-42-051Z`);
+				mkdirSync(folder, { recursive: true });
+				writeFileSync(path.join(folder, 'checks.json'), JSON.stringify([{ id: 'x', status: 'SUCCESS' }]));
+				writeFileSync(path.join(folder, 'stdout.txt'), client.stdout);
+				writeFileSync(path.join(folder, 'stderr.txt'), client.stderr);
+			};
+			const passing = 'Total: 3 passed, 0 failed, 0 warnings\n\nBaseline check passed: all failures are expected.\n';
+			const run = (output: string) => runInvocation(invocation, {}, stubDeps({
+				runSuite: async () => {
+					write('tools_call', TOOLS);
+					write('auth/metadata-default', RETRY_LIMIT);
+					return { exitCode: 0, output, timedOut: false };
+				},
+			}));
+
+			const crashed = await run(clientExitReport(134, TOOLS) + passing);
+			assert.strictEqual(crashed.passed, false);
+			assert.deepStrictEqual(crashed.clientExits, ['the client of tools_call exited with code 134']);
+			assert.match(crashed.note ?? '', /the client of tools_call exited with code 134/);
+
+			const allowed = await run(clientExitReport(1, RETRY_LIMIT) + passing);
+			assert.strictEqual(allowed.passed, true, 'auth/metadata-default allows a client error here');
+			assert.deepStrictEqual(allowed.clientExits, []);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test('the server leg has no client to judge', async () => {
+		const dir = mkdtempSync(path.join(tmpdir(), 'mcp-conformance-exit-'));
+		try {
+			const [invocation] = planScored('server', context(['server', '--requirements', '2026-07-28', '--out', dir]));
+			const result = await runInvocation(invocation, {}, stubDeps({ runSuite: async () => ({ exitCode: 0, output: clientExitReport(1, {}), timedOut: false }) }));
+			assert.strictEqual(result.passed, true);
+			assert.deepStrictEqual(result.clientExits, []);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -511,7 +654,35 @@ suite('check-matrix', () => {
 		]),
 	].join('\n');
 
-	function input(overrides: Partial<ICheckMatrixInput> = {}): ICheckMatrixInput {
+	const TEST_FILE = [
+		'suite(\'s\', () => {',
+		'\ttest(\'some test\', () => { });',
+		'\ttest("a client\\\'s \\"quoted\\" test", () => { });',
+		'\ttest(`a ${kind} template`, () => { });',
+		'});',
+	].join('\n');
+
+	const REQUIREMENTS = {
+		source: { name: 'example/sdk', repo: 'https://example.com/sdk', version: 'v1', path: 'requirements.zon', license: 'MIT' },
+		specification: { commit: 'abc', site: 'https://example.com/spec' },
+		requirements: [
+			{ id: 'basic#001', page: 'basic', section: 'Messages', anchor: 'messages', level: 'must', party: 'both', text: 'Messages MUST be JSON-RPC.' },
+			{ id: 'basic#002', page: 'basic', section: 'Messages', anchor: 'messages', level: 'should', party: 'client', text: 'Clients SHOULD do a | thing.' },
+			{ id: 'basic#003', page: 'basic', section: 'Messages', anchor: '', level: 'may', party: 'server', text: 'Servers MAY <do> it.' },
+			{ id: 'server/tools#001', page: 'server/tools', section: 'Tools', anchor: 'tools', level: 'must_not', party: 'server', text: 'Servers MUST NOT lie.' },
+		],
+	};
+
+	function mappings(): Record<string, unknown>[] {
+		return [
+			{ id: 'basic#001', status: 'tested', tests: [{ file: 'src/a.test.ts', test: 'some test' }], scenarios: [{ leg: 'client', revision: '2026-07-28', scenario: 'tools_call' }] },
+			{ id: 'basic#002', status: 'gap', reason: 'not yet' },
+			{ id: 'basic#003', status: 'n-a', reason: 'does not apply' },
+			{ id: 'server/tools#001', status: 'deviation', reason: 'on purpose', tests: [{ file: 'src/a.test.ts', test: 'a client\'s "quoted" test' }], scenarios: [{ leg: 'server', revision: '2026-07-28', scenario: 'tools-list', check: 'tools-list' }] },
+		];
+	}
+
+	function input(overrides: Partial<ICheckMatrixInput> = {}, mappingList: Record<string, unknown>[] = mappings()): ICheckMatrixInput {
 		const baselines = new Map<string, IBaselineEntries>([
 			[scoredBaseline('client', '2026-07-28'), { client: ['auth/metadata-default:token-request'], server: [] }],
 			[scoredBaseline('client', '2025-11-25'), { client: ['auth/metadata-default:token-request'], server: [] }],
@@ -523,19 +694,21 @@ suite('check-matrix', () => {
 			matrix: parseMatrix(MATRIX),
 			sets: SETS,
 			baselines,
-			requirementFiles: new Map([['requirements-2026-07-28.json', { requirements: [{ id: 'r1' }, { id: 'r2' }, { id: 'r3' }] }]]),
+			requirementFiles: new Map([['requirements-2026-07-28.json', REQUIREMENTS]]),
 			requirementTests: {
 				harness: '@modelcontextprotocol/conformance@0.2.0-alpha.11',
 				requirements: 'requirements-2026-07-28.json',
-				mappings: [
-					{ id: 'r1', status: 'tested', tests: ['conformance:client/tools_call', 'src/a.test.ts:some test'] },
-					{ id: 'r2', status: 'gap', reason: 'M5' },
-				],
+				mappings: mappingList,
 			},
 			pinnedSuiteVersion: '0.2.0-alpha.11',
-			fileExists: file => file === 'src/a.test.ts',
+			readFile: file => file === 'src/a.test.ts' ? TEST_FILE : undefined,
+			suite: { checkIds: new Set(['tools-list', 'token-request']), scenarios: new Set(AUTHORIZATION_SERVER_SCENARIOS.map(row => row.scenario)), clientErrorAllowed: new Set() },
 			...overrides,
 		};
+	}
+
+	function withMappings(change: (list: Record<string, unknown>[]) => Record<string, unknown>[]): ICheckMatrixInput {
+		return input({}, change(mappings()));
 	}
 
 	test('a consistent matrix has no problems', () => {
@@ -580,30 +753,299 @@ suite('check-matrix', () => {
 		]);
 	});
 
-	test('tested requirements cite existing files and driven scenarios; the others need a reason', () => {
+	test('a requirement without a mapping fails, whatever its level; a removed requirement leaves its mapping unknown', () => {
+		assert.deepStrictEqual(checkMatrix(withMappings(list => list.filter(mapping => mapping.id !== 'basic#001'))), [
+			'requirement-tests.json: the MUST requirement basic#001 is not mapped',
+		]);
+		assert.deepStrictEqual(checkMatrix(withMappings(list => list.filter(mapping => mapping.id !== 'basic#003'))), [
+			'requirement-tests.json: the MAY requirement basic#003 is not mapped',
+		]);
+		const requirementFiles = new Map([['requirements-2026-07-28.json', { ...REQUIREMENTS, requirements: REQUIREMENTS.requirements.filter(requirement => requirement.id !== 'basic#002') }]]);
+		assert.deepStrictEqual(checkMatrix(input({ requirementFiles })), ['requirement-tests.json: basic#002 is not a requirement of requirements-2026-07-28.json']);
+	});
+
+	test('a MUST or MUST NOT cannot be a gap; gap, n-a, partial and deviation need a reason', () => {
+		const problems = checkMatrix(withMappings(list => [
+			{ id: 'basic#001', status: 'gap', reason: 'later' },
+			{ id: 'basic#002', status: 'gap' },
+			{ id: 'basic#003', status: 'n-a', tests: [{ file: 'src/a.test.ts', test: 'some test' }] },
+			{ id: 'server/tools#001', status: 'partial', tests: [{ file: 'src/a.test.ts', test: 'some test' }] },
+			...list.slice(4),
+		]));
+		assert.deepStrictEqual(problems, [
+			'requirement-tests.json: basic#001 is a MUST requirement and cannot be a gap: cite a test or a scenario, or give an n-a reason',
+			'requirement-tests.json: basic#002 is gap without a reason',
+			'requirement-tests.json: basic#003 is n-a without a reason',
+			'requirement-tests.json: basic#003 is n-a but cites tests or scenarios',
+			'requirement-tests.json: server/tools#001 is partial without a reason',
+		]);
+	});
+
+	test('tested, partial and a deviation of a MUST cite something; a deviation of a SHOULD may cite nothing', () => {
+		const problems = checkMatrix(withMappings(list => [
+			{ id: 'basic#001', status: 'tested' },
+			{ id: 'basic#002', status: 'deviation', reason: 'on purpose' },
+			list[2],
+			{ id: 'server/tools#001', status: 'deviation', reason: 'on purpose' },
+		]));
+		assert.deepStrictEqual(problems, [
+			'requirement-tests.json: basic#001 is tested but cites no test or scenario',
+			'requirement-tests.json: server/tools#001 is deviation but cites no test or scenario',
+		]);
+	});
+
+	test('a cited test must be declared by the cited file, which must exist', () => {
+		const problems = checkMatrix(withMappings(list => [
+			{ ...list[0], tests: [{ file: 'src/a.test.ts', test: 'some other test' }, { file: 'src/missing.test.ts', test: 'some test' }, { file: 'src/a.test.ts', test: 'a ${kind} template' }, 'src/a.test.ts:some test'] },
+			...list.slice(1),
+		]));
+		assert.deepStrictEqual(problems, [
+			'requirement-tests.json: basic#001: a test must be { "file": "<repository-relative path>", "test": "<test name>" }, not "src/a.test.ts:some test"',
+			'requirement-tests.json: basic#001 cites the test "some other test", which src/a.test.ts does not declare',
+			'requirement-tests.json: basic#001 cites src/missing.test.ts, which does not exist',
+		]);
+	});
+
+	test('a cited scenario must be listed by the requirement set of its leg and revision, have a driven row, and name a known check', () => {
+		const problems = checkMatrix(withMappings(list => [
+			{
+				...list[0], scenarios: [
+					{ leg: 'client', revision: '2026-07-28', scenario: 'initialize' },
+					{ leg: 'server', revision: '2026-07-28', scenario: 'tools_call' },
+					{ leg: 'client', revision: '2026-07-28', scenario: 'auth/metadata-default' },
+					{ leg: 'client', revision: '2026-07-28', scenario: 'auth/metadata-default', check: 'token-request' },
+					{ leg: 'client', revision: '2026-07-28', scenario: 'auth/metadata-default', check: 'pkce-s256-method-used' },
+					{ leg: 'client', revision: '2026-07-28', scenario: 'tools_call', check: 'no-such-check' },
+					{ leg: 'authorization', revision: '2026-07-28', scenario: 'authorization-code-grant' },
+				],
+			},
+			...list.slice(1),
+		]));
+		assert.deepStrictEqual(problems, [
+			'requirement-tests.json: basic#001: a scenario must be { "leg": "client" | "server", "revision": "2026-07-28" | "2025-11-25", "scenario": "<name>", "check"?: "<check id>" }, not {"leg":"authorization","revision":"2026-07-28","scenario":"authorization-code-grant"}',
+			'requirement-tests.json: basic#001 cites the scenario client 2026-07-28 initialize, which requirements/2026-07-28.yaml does not list for the client leg',
+			'requirement-tests.json: basic#001 cites the scenario server 2026-07-28 tools_call, which requirements/2026-07-28.yaml does not list for the server leg',
+			'requirement-tests.json: basic#001 cites client 2026-07-28 auth/metadata-default, whose requirement-matrix.md row is gap (cite a check that is not baselined)',
+			'requirement-tests.json: basic#001 cites client 2026-07-28 auth/metadata-default (token-request), whose requirement-matrix.md row is gap (cite a check that is not baselined)',
+			'requirement-tests.json: basic#001 cites the check pkce-s256-method-used, which the suite does not define',
+			'requirement-tests.json: basic#001 cites the check no-such-check, which the suite does not define',
+		]);
+	});
+
+	test('the harness, the requirements file and the statuses must be valid; an id is mapped once', () => {
 		const problems = checkMatrix(input({
 			requirementTests: {
 				harness: '@modelcontextprotocol/conformance@0.1.0',
 				requirements: 'requirements-2026-07-28.json',
-				mappings: [
-					{ id: 'r1', tests: ['src/missing.test.ts', 'conformance:client/auth/metadata-default', 'conformance:server/tools-list'] },
-					{ id: 'r2', status: 'gap' },
-					{ id: 'r3', status: 'tested' },
-					{ id: 'r4', status: 'maybe', reason: 'x' },
-					{ id: 'r1', status: 'n-a', reason: 'x' },
-				],
+				mappings: [...mappings(), { id: 'basic#001', status: 'tested', tests: [{ file: 'src/a.test.ts', test: 'some test' }] }, { id: 'basic#004', status: 'maybe' }, { status: 'tested' }],
 			},
 		}));
 		assert.deepStrictEqual(problems, [
 			'requirement-tests.json: harness @modelcontextprotocol/conformance@0.1.0 is not the pinned @modelcontextprotocol/conformance@0.2.0-alpha.11',
-			'requirement-tests.json: r1 cites src/missing.test.ts, which does not exist',
-			'requirement-tests.json: r1 cites conformance:client/auth/metadata-default, which no driven requirement-matrix.md row covers',
-			'requirement-tests.json: r2 is gap without a reason',
-			'requirement-tests.json: r3 is tested but cites no test',
-			'requirement-tests.json: r4 is not a requirement of requirements-2026-07-28.json',
-			'requirement-tests.json: r4: status maybe is not one of tested, gap, n-a',
-			'requirement-tests.json: r1 is mapped twice',
+			'requirement-tests.json: basic#004: status maybe is not one of tested, partial, deviation, gap, n-a',
+			'requirement-tests.json: a mapping without an id',
+			'requirement-tests.json: basic#001 is mapped twice',
 		]);
+		assert.deepStrictEqual(checkMatrix(input({ requirementTests: { harness: '@modelcontextprotocol/conformance@0.2.0-alpha.11', requirements: 'nope.json', mappings: [] } })), [
+			'requirement-tests.json: requirements names nope.json, which is not a requirements file of this folder',
+		]);
+	});
+
+	test('the suite must still define the authorization-server scenarios the matrix marks n/a', () => {
+		assert.deepStrictEqual(checkMatrix(input({ suite: { checkIds: new Set(['tools-list']), scenarios: new Set(['authorization-code-grant']), clientErrorAllowed: new Set() } })), [
+			'the suite defines no authorization-server scenario authorization-server-metadata-endpoint',
+		]);
+	});
+
+	test('the rendered matrix must be current', () => {
+		const rendered = renderConformanceMatrix(input());
+		assert.deepStrictEqual(checkMatrix(input({ renderedMatrix: rendered })), []);
+		assert.deepStrictEqual(checkMatrix(input({ renderedMatrix: rendered.replace(/\n/g, '\r\n') })), [], 'line endings do not matter');
+		assert.deepStrictEqual(checkMatrix(input({ renderedMatrix: rendered.replace('Servers MUST NOT lie.', 'Servers MUST NOT fib.') })), ['docs/mcp-conformance-matrix.md is not current: run node test/mcp-conformance/run.ts render-matrix']);
+		assert.deepStrictEqual(checkMatrix(input({ renderedMatrix: null })), ['docs/mcp-conformance-matrix.md is missing: run node test/mcp-conformance/run.ts render-matrix']);
+		// a removed mapping changes the rendering too
+		const withoutMapping = withMappings(list => list.filter(mapping => mapping.id !== 'server/tools#001'));
+		assert.ok(checkMatrix({ ...withoutMapping, renderedMatrix: rendered }).includes('docs/mcp-conformance-matrix.md is not current: run node test/mcp-conformance/run.ts render-matrix'));
+	});
+
+	test('the typed-binding table names the tunnel and typed services that mcpGrpcProto.ts defines', () => {
+		const proto = 'src/vs/platform/mcp/common/mcpGrpcProto.ts';
+		const header = `| Feature | Tunnel (\`${sourceConstant(proto, 'TUNNEL_PACKAGE')}.Mcp\`) | Typed (\`${sourceConstant(proto, 'TYPED_PACKAGE')}.Mcp\`) |`;
+		assert.ok(renderConformanceMatrix(input()).split('\n').includes(header), header);
+	});
+
+	test('the rendering has the summary, the deviations, the scenarios of every leg and revision, and one row per requirement', () => {
+		const rendered = renderConformanceMatrix(input());
+		assert.match(rendered, /^# MCP conformance matrix\n/);
+		assert.match(rendered, /\| MUST NOT \| 1 \| 0 \| 0 \| 1 \| 0 \| 0 \|/);
+		assert.match(rendered, /\| \*\*All\*\* \| 4 \| 1 \| 0 \| 1 \| 1 \| 1 \|/);
+		assert.match(rendered, /\| `server\/tools#001` \| server \| MUST NOT \| Servers MUST NOT lie\. \| on purpose \|/);
+		for (const heading of ['### Client leg, 2026-07-28 (5 scenarios)', '### Client leg, 2025-11-25 (6 scenarios)', '### Server leg, 2026-07-28 (3 scenarios)', '### Server leg, 2025-11-25 (2 scenarios)', '### Authorization-server leg', '### [basic](https://example.com/spec/basic) (3)', '### [server/tools](https://example.com/spec/server/tools) (1)']) {
+			assert.ok(rendered.includes(heading), heading);
+		}
+		assert.match(rendered, /\| `tools_call` \| scored \| driven \| 1 \| +\|/);
+		assert.match(rendered, /\| `authorization-code-grant` \| n\/a \|/);
+		assert.match(rendered, /Clients SHOULD do a \\\| thing\. \| \*Reason:\* not yet \|/);
+		assert.match(rendered, /Servers MAY &lt;do&gt; it\./);
+		assert.match(rendered, /`a\.test\.ts` some test<br>conformance client 2026-07-28 `tools_call` \|/);
+		assert.ok(rendered.endsWith('\n'));
+	});
+
+	test('test names are the string literals passed to test() and it(), with their escapes resolved', () => {
+		assert.deepStrictEqual([...extractTestNames(TEST_FILE)], ['some test', 'a client\'s "quoted" test', 'a ${kind} template']);
+		assert.deepStrictEqual([...extractTestNames('it(\'one\', () => {}); test.skip("two", () => {}); contest(\'no\'); test(name, () => {}); /abc/.test(\'x\');')], ['one']);
+	});
+
+	test('the test scan knows skipped and only tests, skipped suites, and ignores comments, strings and regular expressions', () => {
+		const source = [
+			'suite(\'runs\', () => {',
+			'\ttest(\'a\', () => { const r = /[)(]/; assert.ok(r.test(\'(\')); });',
+			'\ttest.skip(\'b\', () => { });',
+			'\ttest.todo(\'c\');',
+			'\ttest.only(\'d\', () => { });',
+			'\t// test(\'commented\', () => { });',
+			'\tconst text = \'test("in a string")\';',
+			'\ttest(`e ${1 / 2} ${`nested ${\'(\'}`}`, () => { const x = 4 / 2 / 1; });',
+			'\tsuite.skip(\'skipped suite\', () => {',
+			'\t\ttest(\'f\', () => { suite(\'inner\', () => { test(\'g\', () => { }); }); });',
+			'\t});',
+			'\t(PORT ? suite : suite.skip)(\'chosen at run time\', function () {',
+			'\t\ttest(\'h\', function () { this.skip(); });',
+			'\t});',
+			'\tsuite.only(\'only suite\', () => { it(\'i\', () => { }); });',
+			'\ttest(\'j\', { skip: !ENABLED && \'set ENABLED\' }, () => { });',
+			'});',
+		].join('\n');
+		assert.deepStrictEqual(scanTestDeclarations(source), [
+			{ name: 'a', skipped: false, only: false },
+			{ name: 'b', skipped: true, only: false },
+			{ name: 'c', skipped: true, only: false },
+			{ name: 'd', skipped: false, only: true },
+			{ name: 'e ${1 / 2} ${`nested ${\'(\'}`}', skipped: false, only: false },
+			{ name: 'f', skipped: true, only: false },
+			{ name: 'g', skipped: true, only: false },
+			{ name: 'h', skipped: false, only: false },
+			{ name: 'i', skipped: false, only: true },
+			{ name: 'j', skipped: false, only: false },
+		]);
+	});
+
+	test('a cited test must run: not skipped, not in a skipped suite, not marked only', () => {
+		const files = new Map([['src/b.test.ts', 'suite(\'s\', () => { test.skip(\'skipped\', () => { }); test.only(\'only\', () => { }); });\nsuite.skip(\'t\', () => { test(\'in a skipped suite\', () => { }); });\ntest(\'twice\', () => { });\nsuite.skip(\'u\', () => { test(\'twice\', () => { }); });']]);
+		const cited = withMappings(list => [
+			{ ...list[0], tests: [{ file: 'src/b.test.ts', test: 'skipped' }, { file: 'src/b.test.ts', test: 'only' }, { file: 'src/b.test.ts', test: 'in a skipped suite' }, { file: 'src/b.test.ts', test: 'twice' }] },
+			...list.slice(1),
+		]);
+		const problems = checkMatrix({ ...cited, readFile: file => files.get(file) ?? (file === 'src/a.test.ts' ? TEST_FILE : undefined) });
+		assert.deepStrictEqual(problems, [
+			'requirement-tests.json: basic#001 cites the test "skipped", which src/b.test.ts skips (test.skip, test.todo or a suite.skip around it): a skipped test covers nothing',
+			'requirement-tests.json: basic#001 cites the test "only", which src/b.test.ts marks .only (the test or its suite): remove the .only',
+			'requirement-tests.json: basic#001 cites the test "in a skipped suite", which src/b.test.ts skips (test.skip, test.todo or a suite.skip around it): a skipped test covers nothing',
+		], 'a name that also runs somewhere in the file is fine');
+	});
+
+	test('a driven row must have no baseline entries', () => {
+		const baselines = new Map(input().baselines);
+		baselines.set(scoredBaseline('server', '2026-07-28'), { client: [], server: ['tools-list:tools-list'] });
+		assert.deepStrictEqual(checkMatrix(input({ baselines })), [
+			'requirement-matrix.md:7: server 2026-07-28 tools-list is driven (every check passes) but expected-failures-server-2026-07-28.yml has server entries for it: make the row a gap or remove the entries',
+		]);
+	});
+
+	test('a requirements file must be the conversion of its zig-sdk source at the commit it names; an unreadable source is a notice', () => {
+		const zon = [
+			'.{',
+			'    .repo = "https://example.com/spec",',
+			'    .commit = "abc",',
+			'    .path = "docs/specification/2026-07-28",',
+			'    .fixture = "f",',
+			'    .requirements = .{',
+			...REQUIREMENTS.requirements.map(requirement => `        .{ .id = "${requirement.id}", .page = "${requirement.page}", .line = 1, .section = "${requirement.section}", .anchor = "${requirement.anchor}", .level = .${requirement.level}, .keywords = .{"MUST"}, .party = .${requirement.party}, .text = "${requirement.text}" },`),
+			'    },',
+			'}',
+		].join('\n');
+		const source = { version: 'v1', commit: 'c0ffee' };
+		const converted = convertRequirements(zon, source);
+		const requirementFiles = new Map([['requirements-2026-07-28.json', converted]]);
+		const sources = (text: string) => new Map<string, ZonRead>([['requirements-2026-07-28.json', { kind: 'text', text }]]);
+		assert.deepStrictEqual(checkMatrix(input({ requirementFiles, requirementSources: sources(zon) })), []);
+		const changed = checkMatrix(input({ requirementFiles, requirementSources: sources(zon.replace('Servers MUST NOT lie.', 'Servers MUST NOT fib.')) }));
+		assert.strictEqual(changed.length, 1, changed.join('\n'));
+		assert.match(changed[0], /^requirements-2026-07-28\.json is not what tools\/convert-requirements\.ts produces from docs\/spec\/requirements\.zon at c0ffee \(it differs in 1 requirement\(s\), e\.g\. server\/tools#001\): run node test\/mcp-conformance\/tools\/convert-requirements\.ts --commit c0ffee$/);
+		const shorter = { ...converted, requirements: (converted.requirements as { id: string }[]).filter(requirement => requirement.id !== 'basic#002') };
+		assert.match(checkMatrix(input({ requirementFiles: new Map([['requirements-2026-07-28.json', shorter]]), requirementSources: sources(zon) })).join('\n'), /\(it lacks 1 requirement\(s\), e\.g\. basic#002\)/);
+		assert.match(checkMatrix(input({ requirementFiles, requirementSources: sources('.{ .oops') })).join('\n'), /does not convert/);
+		const unavailable = input({ requirementFiles, requirementSources: new Map([['requirements-2026-07-28.json', { kind: 'unavailable', reason: 'there is no zig-sdk checkout at /x (set ZIG_SDK_DIR)' }]]) });
+		assert.deepStrictEqual(checkMatrix(unavailable), []);
+		assert.deepStrictEqual(skippedChecks(unavailable), ['notice: not checking that requirements-2026-07-28.json is the conversion of its zig-sdk source: there is no zig-sdk checkout at /x (set ZIG_SDK_DIR)']);
+	});
+
+	test('gateway-threats.md: every threat cites tests that run or driven scenarios', () => {
+		const threats = [
+			'# Threats',
+			'',
+			'## 1. Loopback only',
+			'',
+			'- `src/a.test.ts`: some test',
+			'- conformance server 2026-07-28 `tools-list`',
+			'',
+			'## 2. Nothing cited',
+			'',
+			'Some prose.',
+			'',
+			'## 3. Wrong citations',
+			'',
+			'- `src/a.test.ts`: no such test',
+			'- conformance client 2026-07-28 `auth/metadata-default`',
+		].join('\n');
+		assert.deepStrictEqual(parseGatewayThreats(threats).map(threat => [threat.title, threat.line, threat.tests.length, threat.scenarios.length]), [['1. Loopback only', 3, 1, 1], ['2. Nothing cited', 8, 0, 0], ['3. Wrong citations', 12, 1, 1]]);
+		assert.deepStrictEqual(checkMatrix(input({ gatewayThreats: threats })), [
+			'gateway-threats.md:8 (2. Nothing cited) cites no test or conformance scenario',
+			'gateway-threats.md:12 (3. Wrong citations) cites the test "no such test", which src/a.test.ts does not declare',
+			'gateway-threats.md:12 (3. Wrong citations) cites client 2026-07-28 auth/metadata-default, whose requirement-matrix.md row is gap, not driven',
+		]);
+		assert.deepStrictEqual(checkMatrix(input({ gatewayThreats: null })), ['gateway-threats.md is missing']);
+	});
+
+	test('the client\'s driver tables must list exactly the client scenarios of the requirement sets', () => {
+		const drivers = (scored: string, unscored: string) => [
+			'export const MCP_REVISION_2026_07_28 = \'2026-07-28\';',
+			'export const MCP_REVISION_2025_11_25 = \'2025-11-25\';',
+			'const BOTH: readonly string[] = [MCP_REVISION_2026_07_28, MCP_REVISION_2025_11_25];',
+			'const ONLY_2026: readonly string[] = [MCP_REVISION_2026_07_28];',
+			'const ONLY_2025: readonly string[] = [MCP_REVISION_2025_11_25];',
+			`export const SCORED_CLIENT_SCENARIOS: ReadonlyMap<string, readonly string[]> = new Map<string, readonly string[]>([${scored}]);`,
+			`export const UNSCORED_CLIENT_SCENARIOS: readonly string[] = [${unscored}];`,
+		].join('\n');
+		const matching = drivers('[\'tools_call\', BOTH], [\'request-metadata\', ONLY_2026], [\'auth/metadata-default\', BOTH], [\'initialize\', ONLY_2025], [\'sse-retry\', ONLY_2025],', '\'auth/dpop\', \'json-schema-2020-12-preservation\'');
+		assert.deepStrictEqual(parseScenarioDrivers(matching)?.scored.get('initialize'), ['2025-11-25']);
+		assert.deepStrictEqual(checkMatrix(input({ scenarioDrivers: matching })), []);
+		assert.deepStrictEqual(checkMatrix(input({ scenarioDrivers: drivers('[\'tools_call\', ONLY_2026], [\'request-metadata\', BOTH], [\'auth/metadata-default\', BOTH], [\'initialize\', ONLY_2025], [\'sse-retry\', ONLY_2025]', '\'json-schema-2020-12-preservation\', \'auth/gone\'') })), [
+			'src/vs/workbench/api/node/mcpConformanceScenarios.ts: UNSCORED_CLIENT_SCENARIOS does not list auth/dpop, which requirements/2026-07-28.yaml runs without scoring',
+			'src/vs/workbench/api/node/mcpConformanceScenarios.ts: SCORED_CLIENT_SCENARIOS does not list tools_call for 2025-11-25, which requirements/2025-11-25.yaml scores',
+			'src/vs/workbench/api/node/mcpConformanceScenarios.ts: UNSCORED_CLIENT_SCENARIOS does not list auth/dpop, which requirements/2025-11-25.yaml runs without scoring',
+			'src/vs/workbench/api/node/mcpConformanceScenarios.ts: SCORED_CLIENT_SCENARIOS lists request-metadata for 2025-11-25, which requirements/2025-11-25.yaml does not score',
+			'src/vs/workbench/api/node/mcpConformanceScenarios.ts: UNSCORED_CLIENT_SCENARIOS lists auth/gone, which no requirement set runs without scoring',
+		]);
+		assert.deepStrictEqual(checkMatrix(input({ scenarioDrivers: null })), ['src/vs/workbench/api/node/mcpConformanceScenarios.ts: no SCORED_CLIENT_SCENARIOS and UNSCORED_CLIENT_SCENARIOS tables to compare with the suite\'s requirement sets']);
+	});
+
+	test('the grpc_server.zig parity rows cite tests that run, and the rendering has the table', () => {
+		const step = { step: '1. `:method`', zig: '405', gateway: '405', tests: [{ file: 'src/a.test.ts', test: 'some test' }] };
+		assert.deepStrictEqual(checkMatrix(input({ grpcServerParity: [step] })), []);
+		assert.deepStrictEqual(checkMatrix(input({ grpcServerParity: [{ ...step, tests: [{ file: 'src/a.test.ts', test: 'gone' }] }] })), [
+			'the grpc_server.zig parity row 1. `:method` cites the test "gone", which src/a.test.ts does not declare',
+		]);
+		const rendered = renderConformanceMatrix(input());
+		assert.ok(rendered.includes('## The gateway gRPC listener: `grpc_server.zig` parity'));
+		assert.match(rendered, /\| 1\. `:method` \| not `POST`: HTTP 405 \| the same \(with `allow: POST`\) \| `grpcServer\.test\.ts` a request that is not a POST gets HTTP 405, one without a gRPC content type 415 \|/);
+		assert.match(rendered, /\| `grpc_server\.zig` parity \(the gateway gRPC listener\) \| in \|/);
+	});
+
+	test('the suite inventory is read from the literal check ids and scenario names of its bundle', () => {
+		const inventory = parseSuiteInventory('t.push({id:`tools-list`,name:`x`}); this.name=`server-stateless`; {id: \'MCP-Tools\'} this.name = "auth/dpop"');
+		assert.deepStrictEqual([...inventory.checkIds], ['tools-list']);
+		assert.deepStrictEqual([...inventory.scenarios], ['server-stateless', 'auth/dpop']);
 	});
 
 	test('the requirement sets parse the way the suite writes them', () => {
@@ -612,7 +1054,26 @@ suite('check-matrix', () => {
 		assert.throws(() => parseRequirementSet('2026-07-28', 'client: tools_call\n'), /must be a list of strings/);
 		assert.deepStrictEqual(parseBaselineFile('# only a comment\n'), { client: [], server: [] });
 	});
+
+	const installed = existsSync(SUITE_BIN);
+
+	test('the repository\'s matrix, mapping and rendered matrix agree, and fail without one MUST mapping or one requirement', { skip: !installed && 'the suite is not installed' }, () => {
+		const real = readCheckMatrixInput();
+		assert.deepStrictEqual(checkMatrix(real), []);
+		assert.ok(isRecord(real.requirementTests) && Array.isArray(real.requirementTests.mappings));
+		const tests = real.requirementTests as { mappings: { id: string }[] };
+		const file = real.requirementFiles.get('requirements-2026-07-28.json') as { requirements: { id: string; level: string }[] };
+		const must = file.requirements.find(requirement => requirement.level === 'must')!;
+		const withoutMust = { ...real, renderedMatrix: undefined, requirementTests: { ...tests, mappings: tests.mappings.filter(mapping => mapping.id !== must.id) } };
+		assert.deepStrictEqual(checkMatrix(withoutMust), [`requirement-tests.json: the MUST requirement ${must.id} is not mapped`]);
+		const withoutRow = { ...real, renderedMatrix: undefined, requirementSources: undefined, requirementFiles: new Map([['requirements-2026-07-28.json', { ...file, requirements: file.requirements.filter(requirement => requirement.id !== must.id) }]]) };
+		assert.deepStrictEqual(checkMatrix(withoutRow), [`requirement-tests.json: ${must.id} is not a requirement of requirements-2026-07-28.json`]);
+	});
 });
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 
 function stubDeps(overrides: Partial<IHarnessDeps> = {}): IHarnessDeps {
 	return {
@@ -690,5 +1151,336 @@ suite('main', () => {
 		assert.strictEqual(code, 1);
 		assert.deepStrictEqual(runs.map(args => flag(args, '--requirements') ?? flag(args, '--scenario')), ['2025-11-25', 'sse-retry']);
 		assert.strictEqual(flag(runs[0], '--command'), clientCommand(ROOT));
+	});
+
+	test('the installed suite: the scenarios that allow a client error are the ones that must refuse the server', { skip: !installed && 'the suite is not installed' }, () => {
+		const inventory = parseSuiteInventory(readFileSync(path.join(SUITE_DIR, 'dist', 'index.js'), 'utf8'));
+		assert.deepStrictEqual([...inventory.clientErrorAllowed].sort(), [
+			'auth/iss-normalized', 'auth/iss-supported-missing', 'auth/iss-unexpected', 'auth/iss-wrong-issuer',
+			'auth/metadata-issuer-mismatch', 'auth/resource-mismatch', 'auth/scope-retry-limit', 'http-invalid-tool-headers',
+		]);
+	});
+});
+
+suite('requirements conversion', () => {
+	test('ZON: structs, tuples, enum literals, integers, comments and every string escape', () => {
+		const document = parseZon([
+			'// a comment',
+			'.{',
+			'    .text = "a \\"quote\\", a \\\\ backslash, \\x41, \\u{1F600}, tab\\tnewline\\n\\\'",',
+			'    .dash = "x \\xe2\\x80\\x94 y \\xe2\\x88\\x922^53",',
+			'    .raw = "already — UTF-8",',
+			'    .level = .must_not,',
+			'    .line = 42,',
+			'    .list = .{ "MUST", "SHOULD", },',
+			'    .empty = .{},',
+			'    .nested = .{ .{ .a = 1 }, .{ .a = -2 } },',
+			'}',
+		].join('\n'));
+		assert.deepStrictEqual(document, {
+			text: 'a "quote", a \\ backslash, A, \u{1F600}, tab\tnewline\n\'',
+			dash: 'x \u2014 y \u22122^53',
+			raw: 'already \u2014 UTF-8',
+			level: new ZonEnum('must_not'),
+			line: 42,
+			list: ['MUST', 'SHOULD'],
+			empty: [],
+			nested: [{ a: 1 }, { a: -2 }],
+		});
+	});
+
+	test('ZON errors name the line', () => {
+		assert.throws(() => parseZon('.{\n    .a = "\\xe2",\n}'), /requirements\.zon:2: a string literal is not valid UTF-8/);
+		assert.throws(() => parseZon('.{\n    .a = "\\q",\n}'), /requirements\.zon:2: unknown escape \\q/);
+		assert.throws(() => parseZon('.{ .a = 1, .a = 2 }'), /\.a is set twice/);
+		assert.throws(() => parseZon('.{ .a = 1 } x'), /unexpected text after the document/);
+		assert.throws(() => parseZon('.{ .a = "open'), /unterminated string literal/);
+	});
+
+	const ZON = [
+		'// Generated by zig build extract-requirements. Do not edit.',
+		'.{',
+		'    .repo = "https://github.com/modelcontextprotocol/modelcontextprotocol",',
+		'    .commit = "046fa30",',
+		'    .path = "docs/specification/2026-07-28",',
+		'    .fixture = "test/fixtures/mcp_spec_2026_07_28",',
+		'    .requirements = .{',
+		'        .{',
+		'            .id = "basic#022-5fe4ec",',
+		'            .page = "basic",',
+		'            .line = 7,',
+		'            .section = "Error Codes",',
+		'            .anchor = "error-codes",',
+		'            .level = .must_not,',
+		'            .keywords = .{"MUST NOT"},',
+		'            .party = .both,',
+		'            .text = "Implementations MUST NOT emit `-32002` \\xe2\\x80\\x94 resource not found.",',
+		'        },',
+		'    },',
+		'}',
+		'',
+	].join('\n');
+
+	test('a requirements.zon converts to the JSON of the harness, multi-byte escapes decoded as UTF-8', () => {
+		const converted = convertRequirements(ZON, { version: 'v0.5.2', commit: '03b8049' });
+		assert.deepStrictEqual({ ...converted, $comment: undefined }, {
+			$comment: undefined,
+			revision: '2026-07-28',
+			source: { name: 'ChristianPresley/zig-sdk', repo: 'https://github.com/ChristianPresley/zig-sdk', version: 'v0.5.2', commit: '03b8049', path: 'docs/spec/requirements.zon', license: 'Apache-2.0' },
+			specification: { repo: 'https://github.com/modelcontextprotocol/modelcontextprotocol', commit: '046fa30', path: 'docs/specification/2026-07-28', license: 'MIT AND Apache-2.0', site: 'https://modelcontextprotocol.io/specification/2026-07-28' },
+			requirements: [{ id: 'basic#022-5fe4ec', page: 'basic', line: 7, section: 'Error Codes', anchor: 'error-codes', level: 'must_not', keywords: ['MUST NOT'], party: 'both', text: 'Implementations MUST NOT emit `-32002` \u2014 resource not found.' }],
+		});
+		assert.match(String(converted.$comment), /^The normative sentences of the MCP 2026-07-28 specification, .* Generated by node test\/mcp-conformance\/tools\/convert-requirements\.ts /);
+		const json = formatRequirementsJson(converted);
+		assert.ok(json.endsWith('}\n') && json.includes('\n\t"revision": "2026-07-28",\n'));
+		assert.ok(!/[\u0080-\u009f]/.test(json), 'no C1 characters (the mojibake of a per-byte decode)');
+		assert.strictEqual(requirementsRevision('docs/specification/2025-11-25'), '2025-11-25');
+		assert.throws(() => requirementsRevision('docs/specification/draft'), /does not end in a specification revision/);
+	});
+
+	test('the conversion refuses entries it cannot map', () => {
+		assert.throws(() => convertRequirements(ZON.replace('.level = .must_not', '.level = .must_maybe'), { version: 'v', commit: 'c' }), /basic#022-5fe4ec: \.level must be one of/);
+		assert.throws(() => convertRequirements(ZON.replace('.party = .both', '.party = "both"'), { version: 'v', commit: 'c' }), /\.party must be one of/);
+		assert.throws(() => convertRequirements(ZON.replace('        },\n    },', '        },\n' + ZON.slice(ZON.indexOf('        .{'), ZON.indexOf('    },\n}')) + '    },'), { version: 'v', commit: 'c' }), /basic#022-5fe4ec is listed twice/);
+	});
+
+	test('the zon is read from the checkout\'s history at the commit, never from its working tree', () => {
+		const calls: (readonly string[])[] = [];
+		const read = readZonAtCommit('/zig-sdk', '03b8049', (cwd, args) => {
+			calls.push([cwd, ...args]);
+			return { status: 0, stdout: Buffer.from(ZON, 'utf8') };
+		});
+		assert.deepStrictEqual(calls, [['/zig-sdk', 'show', '03b8049:docs/spec/requirements.zon']]);
+		assert.deepStrictEqual(read, { kind: 'text', text: ZON });
+		assert.deepStrictEqual(readZonAtCommit('/zig-sdk', 'nope', () => ({ status: 128, stdout: Buffer.alloc(0) })), { kind: 'unavailable', reason: '/zig-sdk is not a zig-sdk checkout with commit nope' });
+		assert.strictEqual(readZonAtCommit('/zig-sdk', 'c', () => ({ status: 0, stdout: Buffer.from([0x22, 0xe2, 0x22]) })).kind, 'unavailable');
+	});
+
+	test('the vendored requirements file is the conversion of the zig-sdk source it names', () => {
+		const file = JSON.parse(readFileSync(path.join(HERE, 'requirements-2026-07-28.json'), 'utf8'));
+		assert.ok(!/[\u0080-\u009f]/.test(JSON.stringify(file)), 'no mojibake');
+		const zigSdk = process.env.ZIG_SDK_DIR ?? path.resolve(ROOT, '..', 'zig-sdk');
+		const read = existsSync(zigSdk) ? readZonAtCommit(zigSdk, file.source.commit) : undefined;
+		if (read?.kind !== 'text') {
+			return; // no checkout: check-matrix reports a notice
+		}
+		assert.deepStrictEqual(convertRequirements(read.text, { version: file.source.version, commit: file.source.commit }), file);
+	});
+});
+
+suite('wrapper scripts', () => {
+	async function usage(): Promise<string[]> {
+		const logs: string[] = [];
+		assert.strictEqual(await main(['--help'], {}, stubDeps({ log: line => logs.push(line) })), 0);
+		return logs.join('\n').split('\n');
+	}
+
+	test('scripts/test-mcp-conformance.sh and .bat take every subcommand of run.ts and describe the subcommands and options as its usage does', async () => {
+		const lines = await usage();
+		const subcommands = /<([^>]+)>/.exec(lines[0])?.[1].split('|') ?? [];
+		assert.ok(subcommands.includes('render-matrix'), lines[0]);
+		const described = lines.filter(line => line.startsWith('  '));
+		for (const [name, unescape, accepted] of [
+			['test-mcp-conformance.sh', (text: string) => text, (text: string) => /^case "\$1" in\r?\n\t([^)]+)\) ;;/m.exec(text)?.[1].split('|') ?? []],
+			['test-mcp-conformance.bat', (text: string) => text.replace(/\^(.)/g, '$1'), (text: string) => [...text.matchAll(/^if \/i "%~1"=="([^"]+)" set SUBCOMMAND=1\r?$/gm)].map(match => match[1])],
+		] as const) {
+			const text = readFileSync(path.join(ROOT, 'scripts', name), 'utf8');
+			assert.deepStrictEqual(accepted(text), subcommands, `${name} passes every subcommand through`);
+			const helpLines = text.split(/\r?\n/).map(line => /^\s*echo "?(.*?)"?$/.exec(line)?.[1]).filter((line): line is string => line !== undefined).map(unescape);
+			assert.ok(helpLines.some(line => line.includes(`[${subcommands.join('|')}]`)), `${name}: the usage line names every subcommand`);
+			assert.deepStrictEqual(described.filter(line => !helpLines.includes(line)), [], `${name}: help lines that differ from run.ts --help`);
+		}
+	});
+});
+
+suite('pinned suite version', () => {
+	test('the files that name a version of the conformance suite name the one package.json pins', () => {
+		const packageJson = JSON.parse(readFileSync(path.join(HERE, 'package.json'), 'utf8')) as { devDependencies: Record<string, string> };
+		const pinned = packageJson.devDependencies['@modelcontextprotocol/conformance'];
+		for (const file of ['src/vs/platform/mcp/test/node/fixtures/mcp-schema-2025-11-25/README.md', 'test/mcp-conformance/requirement-matrix.md']) {
+			const named = [...readFileSync(path.join(ROOT, file), 'utf8').matchAll(/@modelcontextprotocol\/conformance@(\d[^\s`'"),;]*)/g)].map(match => match[1]);
+			assert.ok(named.length > 0, `${file} names the suite`);
+			assert.deepStrictEqual([...new Set(named)], [pinned], file);
+		}
+	});
+});
+
+/** A string constant of a source file, read as text (the harness imports nothing outside its folder). */
+function sourceConstant(file: string, name: string): string {
+	const match = new RegExp(`export const ${name} = '([^']+)';`).exec(readFileSync(path.join(ROOT, file), 'utf8'));
+	assert.ok(match, `${file} defines ${name}`);
+	return match[1];
+}
+
+suite('gRPC docs', () => {
+	const PROTO = 'src/vs/platform/mcp/common/mcpGrpcProto.ts';
+	const DOCS = ['test/mcp-conformance/README.md', 'test/mcp-grpc/README.md', ...readdirSync(path.join(HERE, 'docs')).filter(name => name.endsWith('.md')).map(name => `test/mcp-conformance/docs/${name}`)];
+
+	test('the docs name the tunnel package that mcpGrpcProto.ts defines', () => {
+		const tunnel = sourceConstant(PROTO, 'TUNNEL_PACKAGE');
+		const problems: string[] = [];
+		for (const file of DOCS) {
+			for (const match of readFileSync(path.join(ROOT, file), 'utf8').matchAll(/\bmcp(?:\.[a-z0-9_]+)+\.v\d+\b/g)) {
+				if (match[0] !== tunnel) {
+					problems.push(`${file}: ${match[0]} is not the tunnel package ${tunnel}`);
+				}
+			}
+		}
+		assert.deepStrictEqual(problems, []);
+	});
+
+	test('the docs describe keepAliveMs as the mcp.json schema and the code do: pings only while a call is open, 0 is off, unset pings only while a listen stream is open', () => {
+		const grpc = readFileSync(path.join(ROOT, 'src/vs/workbench/api/node/extHostMcpGrpc.ts'), 'utf8');
+		const min = /export const MIN_GRPC_KEEPALIVE_MS = ([\d_]+);/.exec(grpc);
+		const extra = /export const DEFAULT_GRPC_LISTEN_KEEPALIVE_MS = MIN_GRPC_KEEPALIVE_MS \+ ([\d_]+);/.exec(grpc);
+		assert.ok(min && extra, 'extHostMcpGrpc.ts defines the keepalive intervals');
+		const listenMs = Number(min[1].replace(/_/g, '')) + Number(extra[1].replace(/_/g, ''));
+		const unset = `a ping is sent every ${Math.floor(listenMs / 60_000)} minutes and ${listenMs % 60_000 / 1000} seconds only while a \`subscriptions/listen\` stream is open`;
+		const entries: readonly [string, RegExp][] = [
+			['src/vs/workbench/contrib/mcp/common/mcpConfiguration.ts', /'app\.mcp\.json\.grpc\.keepAliveMs', ".*$/m],
+			['test/mcp-conformance/docs/release-notes.md', /^- `keepAliveMs`:.*$/m],
+			['test/mcp-conformance/docs/vscode-docs-mcp.md', /^\| `keepAliveMs` \|.*$/m],
+		];
+		const problems: string[] = [];
+		for (const [file, pattern] of entries) {
+			const entry = pattern.exec(readFileSync(path.join(ROOT, file), 'utf8'))?.[0];
+			if (!entry) {
+				problems.push(`${file} does not document keepAliveMs`);
+				continue;
+			}
+			for (const [what, text] of [['the default', unset], ['no pings on an idle connection', 'only while at least one call is open'], ['0 is off', '`0` sends no pings']]) {
+				if (!entry.includes(text)) {
+					problems.push(`${file}: ${what} (${text}) is missing`);
+				}
+			}
+		}
+		assert.deepStrictEqual(problems, []);
+	});
+});
+
+suite('CI path filters', () => {
+	const WORKFLOW = '.github/workflows/mcp-conformance.yml';
+	const DETECT = '.github/actions/detect-changes/detect.ts';
+
+	/** The paths of the `mcp` rule of detect-changes (read as text: the harness imports nothing outside its folder). */
+	function mcpRule(): readonly string[] {
+		const text = readFileSync(path.join(ROOT, DETECT), 'utf8');
+		const rule = /\boutput: 'mcp',\s*paths: \[([^\]]*)\]/.exec(text);
+		assert.ok(rule, `${DETECT} has an mcp rule`);
+		const paths = [...rule[1].replace(/\/\/[^\n]*/g, '').matchAll(/'([^']+)'/g)].map(match => match[1]);
+		assert.ok(paths.length > 0, `${DETECT}: the mcp rule lists paths`);
+		return paths;
+	}
+
+	/** Whether a rule entry covers a file, as detect-changes matches them: an entry ending in `/` is a folder, any other one a file. */
+	function matchesAny(file: string, entries: readonly string[]): boolean {
+		return entries.some(entry => entry.endsWith('/') ? file.startsWith(entry) : file === entry);
+	}
+
+	/** The `on.push.paths` globs of the workflow. */
+	function pushPaths(): string[] {
+		const lines = readFileSync(path.join(ROOT, WORKFLOW), 'utf8').split(/\r?\n/);
+		const push = lines.findIndex(line => /^ {2}push:\s*$/.test(line));
+		const start = lines.findIndex((line, index) => index > push && /^ {4}paths:\s*$/.test(line));
+		assert.ok(push !== -1 && start !== -1, `${WORKFLOW} has on.push.paths`);
+		const globs: string[] = [];
+		for (const line of lines.slice(start + 1)) {
+			const entry = /^ {6}- '([^']+)'\s*$/.exec(line);
+			if (!entry) {
+				break;
+			}
+			globs.push(entry[1]);
+		}
+		return globs;
+	}
+
+	/** A GitHub Actions path glob (`**` any path, `*` any name) as a regular expression. */
+	function globRegExp(glob: string): RegExp {
+		const source = glob.split('**').map(part => part.split('*').map(text => text.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*')).join('.*');
+		return new RegExp(`^${source}$`);
+	}
+
+	/** A file that a rule entry covers: the entry itself, or a file inside it for a folder. */
+	function sampleOf(entry: string): string {
+		return entry.endsWith('/') ? `${entry}sub/file.ts` : entry;
+	}
+
+	/** The non-test TypeScript files under a repository folder. */
+	function sourceFiles(folder: string): string[] {
+		const files: string[] = [];
+		const walk = (relative: string) => {
+			for (const entry of readdirSync(path.join(ROOT, relative), { withFileTypes: true })) {
+				const child = `${relative}/${entry.name}`;
+				if (entry.isDirectory()) {
+					if (entry.name !== 'test') {
+						walk(child);
+					}
+				} else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.d.ts') && !entry.name.endsWith('.test.ts')) {
+					files.push(child);
+				}
+			}
+		};
+		walk(folder);
+		return files;
+	}
+
+	/** The source files of src/vs that the mcp rule does not cover although every file that imports them is covered by it. */
+	function importedOnlyByMcpCode(covered: (file: string) => boolean): string[] {
+		const importers = new Map<string, Set<string>>();
+		const IMPORT = /(?:\bfrom\s+|\bimport\s*\(\s*|\bimport\s+)'(\.{1,2}\/[^']+)'/g;
+		for (const file of sourceFiles('src/vs')) {
+			for (const match of readFileSync(path.join(ROOT, file), 'utf8').matchAll(IMPORT)) {
+				const target = path.posix.normalize(path.posix.join(path.posix.dirname(file), match[1])).replace(/\.js$/, '.ts');
+				const set = importers.get(target) ?? new Set<string>();
+				set.add(file);
+				importers.set(target, set);
+			}
+		}
+		return [...importers].filter(([target, from]) => target.endsWith('.ts') && !covered(target) && [...from].every(covered)).map(([target]) => target).sort();
+	}
+
+	test('the push paths of mcp-conformance.yml are the mcp rule of detect-changes', () => {
+		const rule = mcpRule();
+		const globs = pushPaths();
+		const problems = [
+			...rule.filter(entry => !globs.some(glob => globRegExp(glob).test(sampleOf(entry)))).map(entry => `${entry} is in the mcp rule but no push path matches it`),
+			...globs.filter(glob => !rule.some(entry => globRegExp(glob).test(sampleOf(entry)))).map(glob => `push path ${glob} matches nothing of the mcp rule`),
+		];
+		assert.deepStrictEqual(problems, []);
+	});
+
+	test('the mcp rule and the push paths cover the MCP sources outside the MCP folders: the extension host\'s MCP files, the schema check, the shared parsers and what only MCP code imports', () => {
+		const rule = mcpRule();
+		const covered = (file: string) => matchesAny(file, rule);
+		const required = new Set<string>([
+			// Shared with other features; the Streamable HTTP transport parses its event streams with it.
+			'src/vs/base/common/sseParser.ts',
+		]);
+		for (const file of sourceFiles('src/vs/workbench/api')) {
+			if (/\/(mcp|extHostMcp|mainThreadMcp)[^/]*\.ts$/.test(file)) {
+				required.add(file);
+			}
+		}
+		const packageJson = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as { scripts: Record<string, string> };
+		const schemaCheck = packageJson.scripts['mcp:check-schema'] ?? '';
+		for (const script of schemaCheck.matchAll(/\bbuild\/\S+\.ts\b/g)) {
+			required.add(script[0]);
+		}
+		assert.ok([...required].some(file => file.startsWith('build/')), 'npm run mcp:check-schema runs a build script');
+		for (const file of importedOnlyByMcpCode(covered)) {
+			required.add(file);
+		}
+		const globs = pushPaths().map(globRegExp);
+		const problems: string[] = [];
+		for (const file of [...required].sort()) {
+			assert.ok(existsSync(path.join(ROOT, file)), file);
+			if (!covered(file)) {
+				problems.push(`${file} is not in the mcp rule of ${DETECT}`);
+			}
+			if (!globs.some(glob => glob.test(file))) {
+				problems.push(`${file} is not in the push paths of ${WORKFLOW}`);
+			}
+		}
+		assert.deepStrictEqual(problems, []);
 	});
 });
