@@ -20,6 +20,7 @@ import { LATEST_MCP_PROTOCOL_VERSION, META_CLIENT_CAPABILITIES, META_PROTOCOL_VE
 import { MCP } from '../common/modelContextProtocol.js';
 import { IMcpGatewayDispatchContext, IMcpGatewayNotification, McpGatewayDispatcher } from './mcpGatewayDispatcher.js';
 import { IMcpGatewayListenStream, McpGatewayListenRegistry } from './mcpGatewayListenRegistry.js';
+import { isRateLimitedError, mcpGatewayClientKey } from './mcpGatewayRateLimit.js';
 import { notificationMessage } from './mcpGatewaySession.js';
 
 /**
@@ -35,18 +36,27 @@ import { notificationMessage } from './mcpGatewaySession.js';
  *   long-lived call.
  * - The typed service `model_context_protocol.Mcp` (eight unary RPCs).
  *
- * A call names its route with the {@link GRPC_ROUTE_METADATA_KEY} metadata;
- * a call without it goes to the only route when there is exactly one, so
- * unmodified clients (the zig-sdk example client, grpc-js) can connect to a
- * single-server gateway. The base server ({@link GrpcServer}) checks the
- * method, content type, path, encoding, `:authority` (loopback only) and
- * `grpc-timeout` first; then the route is looked up (NOT_FOUND) before the
- * dispatcher sees anything. Errors found before a request runs end the call
+ * A call names its route with the {@link GRPC_ROUTE_METADATA_KEY} metadata.
+ * The listener is shared by every gateway and client of the process that
+ * asked for gRPC (`McpGatewayService` opens it only for them, and serves
+ * only their routes on it), and on
+ * a loopback port any local process can connect: the random route id is the
+ * access control, exactly as in the HTTP path `/gateway/<routeId>`. A call
+ * without the metadata, or with an unknown route, is NOT_FOUND (trailers
+ * only). Only test fixtures turn on
+ * {@link IMcpGatewayGrpcListenerOptions.allowDefaultRoute}, so that
+ * unmodified clients (the zig-sdk example client) reach a single-route
+ * gateway. The base server ({@link GrpcServer}) checks the method, content
+ * type, path, encoding, `:authority` (loopback only) and `grpc-timeout`
+ * first; then the route is looked up (NOT_FOUND) before the request message
+ * is read or the dispatcher sees anything. Errors found before a request runs end the call
  * with headers only: `grpc-status` from the JSON-RPC code, `grpc-message`,
  * `mcp-error-code` and (up to 4096 bytes) `mcp-error-bin`. On the tunnel, an
  * error of a request that ran is an ordinary JSON-RPC error response with
  * status 0, as in the zig-sdk; the typed binding has no place for it but the
- * trailers.
+ * trailers. A request over the route's rate limit (`McpGatewayRateLimitedError`,
+ * refused before it runs) ends with RESOURCE_EXHAUSTED on both bindings, its
+ * `-32603` error with `data.reason: 'rate_limited'` in the trailers.
  */
 
 /** The request metadata that names the gateway route of a call. */
@@ -55,6 +65,14 @@ export const GRPC_ROUTE_METADATA_KEY = 'mcp-gateway-route';
 export interface IMcpGatewayGrpcListenerOptions {
 	/** Overrides of the transport limits (tests use small ones). */
 	readonly server?: Omit<IGrpcServerOptions, 'isAllowedAuthority' | 'log'>;
+	/**
+	 * Lets a call without the {@link GRPC_ROUTE_METADATA_KEY} metadata reach
+	 * the only route when the listener serves exactly one. For test fixtures
+	 * only (the conformance entry point, the interop tests): without the route
+	 * id as a secret, any local process that finds the port reaches the server.
+	 * Off by default; the product never turns it on.
+	 */
+	readonly allowDefaultRoute?: boolean;
 }
 
 interface IGrpcRoute {
@@ -136,7 +154,19 @@ export function endWithRpcError(call: IGrpcServerCall, binding: GrpcBinding, err
 	if (bin.length <= MAX_ERROR_BIN_BYTES) {
 		trailers[MCP_ERROR_BIN_TRAILER] = bin;
 	}
-	call.end(grpcStatusForJsonRpcCode(error.code, binding), error.message, trailers);
+	// A rate-limited request is -32603 in JSON-RPC terms but RESOURCE_EXHAUSTED in gRPC's, on both bindings.
+	const status = isRateLimitedError(error) ? GrpcStatus.RESOURCE_EXHAUSTED : grpcStatusForJsonRpcCode(error.code, binding);
+	call.end(status, error.message, trailers);
+}
+
+/**
+ * The rate-limit identity of a gRPC client: its address and `_meta` client
+ * info (as `modernClientKey` for HTTP), so that the calls of one client
+ * share their buckets whatever HTTP/2 connection they use; a fixed-size
+ * hash ({@link mcpGatewayClientKey}), whatever the client info claims.
+ */
+export function grpcClientKey(remoteAddress: string | undefined, clientInfo: MCP.Implementation | undefined): string {
+	return mcpGatewayClientKey(['grpc', remoteAddress ?? '', clientInfo?.name ?? null, clientInfo?.version ?? null]);
 }
 
 export class McpGatewayGrpcListener extends Disposable {
@@ -144,12 +174,14 @@ export class McpGatewayGrpcListener extends Disposable {
 	private readonly _routes = new Map<string, IGrpcRoute>();
 	private _nextTypedId = 1;
 	private _warnedDestructiveHint = false;
+	private readonly _allowDefaultRoute: boolean;
 
 	constructor(
 		private readonly _logger: ILogger,
 		options: IMcpGatewayGrpcListenerOptions = {},
 	) {
 		super();
+		this._allowDefaultRoute = options.allowDefaultRoute === true;
 		this._server = this._register(new GrpcServer({
 			...options.server,
 			isAllowedAuthority: isLoopbackAuthority,
@@ -243,7 +275,10 @@ export class McpGatewayGrpcListener extends Disposable {
 		}
 	}
 
-	/** The route of a call, or undefined after ending the call with NOT_FOUND. */
+	/**
+	 * The route of a call, or undefined after ending the call with NOT_FOUND
+	 * (trailers only: nothing of the call has been read or sent yet).
+	 */
 	private _resolveRoute(call: IGrpcServerCall): IGrpcRoute | undefined {
 		const requested = call.metadata[GRPC_ROUTE_METADATA_KEY]?.trim();
 		if (requested) {
@@ -254,12 +289,11 @@ export class McpGatewayGrpcListener extends Disposable {
 			}
 			return route;
 		}
-		if (this._routes.size === 1) {
+		if (this._allowDefaultRoute && this._routes.size === 1) {
 			return this._routes.values().next().value;
 		}
-		call.end(GrpcStatus.NOT_FOUND, this._routes.size === 0
-			? 'The gateway serves no routes'
-			: `The gateway serves ${this._routes.size} routes: name one with the '${GRPC_ROUTE_METADATA_KEY}' metadata`);
+		this._logger.debug(`[McpGateway][gRPC] ${call.path}: refused a call without the '${GRPC_ROUTE_METADATA_KEY}' metadata`);
+		call.end(GrpcStatus.NOT_FOUND, `The call names no gateway route: send the route id of the server's grpcAddress as the '${GRPC_ROUTE_METADATA_KEY}' metadata`);
 		return undefined;
 	}
 
@@ -275,6 +309,7 @@ export class McpGatewayGrpcListener extends Disposable {
 			headers: call.metadata,
 			token: call.token,
 			notify,
+			clientKey: grpcClientKey(call.remoteAddress, meta.clientInfo),
 		};
 	}
 
@@ -362,6 +397,11 @@ export class McpGatewayGrpcListener extends Disposable {
 				this._logger.error(`[McpGateway][gRPC][route ${route.routeId}] ${request.method} failed`, error);
 			}
 			const rpcError = error instanceof McpGatewayRpcError ? error : new McpGatewayRpcError(MCP.INTERNAL_ERROR, errorText(error));
+			if (isRateLimitedError(rpcError)) {
+				// Refused before the request ran (nothing was sent): RESOURCE_EXHAUSTED, the error in the trailers.
+				endWithRpcError(call, 'tunnel', rpcError, request.id);
+				return;
+			}
 			response = errorResponse(request.id, rpcError.code, rpcError.message, rpcError.data);
 		}
 		if (call.isEnded) {
@@ -391,6 +431,8 @@ export class McpGatewayGrpcListener extends Disposable {
 					call.end(GrpcStatus.OK);
 				}
 			},
+			// No `cancel`: no notifications/cancelled reaches a gRPC listen stream (the tunnel drops notifications);
+			// a gRPC client cancels it with RST_STREAM, which ends the call (see the token listener below).
 		};
 		let registration: IDisposable;
 		try {

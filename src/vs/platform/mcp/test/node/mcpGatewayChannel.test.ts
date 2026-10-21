@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { timeout } from '../../../../base/common/async.js';
+import { DeferredPromise, timeout } from '../../../../base/common/async.js';
 import { VSBuffer } from '../../../../base/common/buffer.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { CancellationError, isCancellationError } from '../../../../base/common/errors.js';
@@ -14,7 +14,7 @@ import { URI } from '../../../../base/common/uri.js';
 import { ChannelClient, ChannelServer, Client, IChannel, IMessagePassingProtocol, IPCServer, IServerChannel } from '../../../../base/parts/ipc/common/ipc.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLoggerService } from '../../../log/common/log.js';
-import { IMcpGatewayDto, IMcpGatewayInfo, IMcpGatewayInvokeContext, IMcpGatewayProgress, IMcpGatewayServerCapabilities, IMcpGatewayServerDescriptor, IMcpGatewayServerInfo, IMcpGatewayService, IMcpGatewayToolInvoker, McpGatewayToolBrokerChannelName } from '../../common/mcpGateway.js';
+import { IMcpGatewayCreateArgs, IMcpGatewayCreateOptions, IMcpGatewayDto, IMcpGatewayInfo, IMcpGatewayInvokeContext, IMcpGatewayProgress, IMcpGatewayServerCapabilities, IMcpGatewayServerDescriptor, IMcpGatewayServerInfo, IMcpGatewayService, IMcpGatewayToolInvoker, McpGatewayToolBrokerChannelName } from '../../common/mcpGateway.js';
 import { MCP } from '../../common/modelContextProtocol.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { McpGatewayChannel } from '../../node/mcpGatewayChannel.js';
@@ -64,6 +64,25 @@ suite('McpGatewayChannel', () => {
 		const invoker = fixture.gatewayService.invokers[0];
 		assert.deepStrictEqual(invoker.listServers(), [serverA]);
 		assert.deepStrictEqual(broker.calls.map(c => c.command), ['listServers']);
+	});
+
+	test('asks the gateway service for gRPC only when the client sent grpc: true', async () => {
+		const fixture = createFixture();
+		connect(fixture, 'client1');
+		const variants: (IMcpGatewayCreateArgs | Record<string, unknown> | undefined)[] = [
+			undefined,
+			{},
+			{ chatSessionResource: gatewaySession },
+			{ grpc: false },
+			{ grpc: 'true' },
+			{ grpc: 1 },
+			{ grpc: true },
+			{ chatSessionResource: gatewaySession, grpc: true },
+		];
+		for (const args of variants) {
+			await fixture.channel.call<IMcpGatewayDto>('client1', 'createGateway', args);
+		}
+		assert.deepStrictEqual(fixture.gatewayService.options, [undefined, undefined, undefined, undefined, undefined, undefined, { grpc: true }, { grpc: true }]);
 	});
 
 	test('forwards each command with its arguments and returns the broker\'s answer', async () => {
@@ -339,6 +358,28 @@ suite('McpGatewayChannel', () => {
 		assert.ok(!broker.hasListeners('onToolLog'));
 	});
 
+	test('a client that disconnects while its gateway is created leaves no gateway behind', async () => {
+		const fixture = createFixture();
+		connect(fixture, 'client1');
+		const gate = new DeferredPromise<void>();
+		fixture.gatewayService.gate = gate.p;
+
+		const created = fixture.channel.call<IMcpGatewayDto>('client1', 'createGateway', { grpc: true });
+		await fixture.gatewayService.firstCreateGateway.p;
+		fixture.ipcServer.disconnect('client1');
+		assert.deepStrictEqual([fixture.gatewayService.disposedForClients, fixture.gatewayService.disposedGateways], [['client1'], []], 'the disconnect cleanup ran before the gateway existed');
+
+		gate.complete();
+		await assert.rejects(created, isCancellationError);
+		assert.deepStrictEqual(fixture.gatewayService.disposedGateways, ['gateway-1'], 'disposed once created, so its routes do not hold the ports open');
+
+		// A gateway of a client that stays connected is kept.
+		connect(fixture, 'client2');
+		fixture.gatewayService.gate = undefined;
+		await fixture.channel.call<IMcpGatewayDto>('client2', 'createGateway', {});
+		assert.deepStrictEqual(fixture.gatewayService.disposedGateways, ['gateway-1']);
+	});
+
 	test('rejects unknown commands and events', async () => {
 		const fixture = createFixture();
 		await assert.rejects(fixture.channel.call('client1', 'noSuchCommand'), /Invalid call: noSuchCommand/);
@@ -549,17 +590,29 @@ class TestGatewayService extends Disposable implements IMcpGatewayService {
 	private readonly _onDidChangeServers = this._register(new Emitter<readonly IMcpGatewayServerInfo[]>());
 	readonly servers: readonly IMcpGatewayServerInfo[] = [{ label: 'Server A', address: URI.parse('http://127.0.0.1:1/gateway/route-a') }];
 	readonly invokers: IMcpGatewayToolInvoker[] = [];
+	/** The options of each `createGateway`, in order. */
+	readonly options: (IMcpGatewayCreateOptions | undefined)[] = [];
 	readonly disposedForClients: unknown[] = [];
 	readonly disposedGateways: string[] = [];
 	failure: Error | undefined;
+	/** When set, `createGateway` waits for it once called, as the real one waits for the HTTP start and the gRPC bind. */
+	gate: Promise<void> | undefined;
+	/** Completes when `createGateway` is first called (before it waits for {@link gate}). */
+	readonly firstCreateGateway = new DeferredPromise<void>();
 
-	async createGateway<TContext>(_context: TContext, toolInvoker?: IMcpGatewayToolInvoker): Promise<IMcpGatewayInfo> {
+	async createGateway<TContext>(_context: TContext, toolInvoker?: IMcpGatewayToolInvoker, options?: IMcpGatewayCreateOptions): Promise<IMcpGatewayInfo> {
 		if (this.failure) {
 			throw this.failure;
 		}
 		assert.ok(toolInvoker);
 		this.invokers.push(toolInvoker);
-		return { gatewayId: `gateway-${this.invokers.length}`, servers: this.servers, onDidChangeServers: this._onDidChangeServers.event };
+		this.options.push(options);
+		if (!this.firstCreateGateway.isSettled) {
+			this.firstCreateGateway.complete();
+		}
+		const gatewayId = `gateway-${this.invokers.length}`;
+		await this.gate;
+		return { gatewayId, servers: this.servers, onDidChangeServers: this._onDidChangeServers.event };
 	}
 
 	disposeGatewaysForClient<TContext>(context: TContext): void {

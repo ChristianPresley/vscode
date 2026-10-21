@@ -10,13 +10,14 @@ import { Disposable } from '../../../base/common/lifecycle.js';
 import { generateUuid } from '../../../base/common/uuid.js';
 import { ILogger } from '../../log/common/log.js';
 import { IMcpGatewayCacheHints, IMcpGatewayInputRequired, IMcpGatewayInvokeContext, IMcpGatewayServerCapabilities, IMcpGatewaySingleServerInvoker } from '../common/mcpGateway.js';
-import { applyModernEnvelope, GATEWAY_SERVER_INFO, hasClientCapability, honorSubscriptionFilter, IModernRequestMeta, McpGatewayRpcError, McpInputRequestCapability, requiredCapabilityForInputRequest, validateInputResponses, validateModernRequestMeta, validateStandardHeaders } from '../common/mcpGatewayProtocol.js';
+import { applyModernEnvelope, clientCapabilitiesOf, GATEWAY_SERVER_INFO, hasClientCapability, honorSubscriptionFilter, IModernRequestMeta, McpGatewayRpcError, McpInputRequestCapability, requiredCapabilitiesForInputRequest, validateInputResponses, validateModernRequestMeta, validateStandardHeaders } from '../common/mcpGatewayProtocol.js';
 import { LATEST_MCP_PROTOCOL_VERSION, McpProtocolEra } from '../common/mcpProtocolVersions.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
 import { McpTasks } from '../common/modelContextProtocolTasks.js';
+import { IMcpGatewayRateLimits, McpGatewayRateLimitedError, McpGatewayRateLimiter } from './mcpGatewayRateLimit.js';
 import { McpGatewaySealedState } from './mcpGatewaySealedState.js';
-import { clientDeclaresTasks, IMcpGatewayTaskInvokeContext, IMcpGatewayTaskOptions, IMcpGatewayTaskRunInput, isStartTaskResult, McpGatewayTaskStore, missingTasksExtensionError, taskOptionsOf, taskSupportOf, withoutTaskSupport } from './mcpGatewayTasks.js';
+import { clientDeclaresTasks, IMcpGatewayTaskInvokeContext, IMcpGatewayTaskOptions, IMcpGatewayTaskOrigin, IMcpGatewayTaskRunInput, isStartTaskResult, McpGatewayTaskBody, McpGatewayTaskStore, missingTasksExtensionError, taskOptionsOf, taskOriginOf, taskSupportOf, withoutTaskSupport } from './mcpGatewayTasks.js';
 
 /** The most input rounds the gateway runs for one request. */
 export const MAX_GATEWAY_INPUT_ROUNDS = 10;
@@ -64,6 +65,11 @@ export interface IMcpGatewayDispatchContext {
 	/** 2025-11-25 sessions: closes the request's SSE stream for polling (see {@link IMcpGatewayInvokeContext.closeSseStream}). */
 	readonly closeSseStream?: () => void;
 	readonly chatSessionResource?: string;
+	/**
+	 * Who sent the request, for the rate limits ({@link IMcpGatewayDispatcherOptions.rateLimits}):
+	 * requests with the same key share their buckets. Undefined: the route's one shared key.
+	 */
+	readonly clientKey?: string;
 }
 
 export interface IMcpGatewayDispatcherOptions {
@@ -78,6 +84,13 @@ export interface IMcpGatewayDispatcherOptions {
 	 * {@link IMcpGatewayTaskCapableInvoker}). Without either, no task is created.
 	 */
 	readonly tasks?: IMcpGatewayTaskOptions;
+	/**
+	 * The per-client limits of `tools/call` and `completion/complete` on this
+	 * route, for both eras and every transport; absent limits have their
+	 * defaults (`DEFAULT_MCP_GATEWAY_RATE_LIMITS`). A request over its
+	 * limit gets {@link McpGatewayRateLimitedError} and never reaches the server.
+	 */
+	readonly rateLimits?: IMcpGatewayRateLimits;
 }
 
 export type ModernRequestPreparation =
@@ -97,18 +110,20 @@ function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** The `ClientCapabilities` shape a `-32021` error names as `data.requiredCapabilities`. */
-export function requiredCapabilitiesFor(capability: McpInputRequestCapability): MCP.ClientCapabilities {
-	switch (capability) {
-		case 'elicitation':
-			return { elicitation: {} };
-		case 'elicitation.url':
-			return { elicitation: { url: {} } };
-		case 'sampling':
-			return { sampling: {} };
-		case 'roots':
-			return { roots: {} };
-	}
+/**
+ * The `-32021` error of an input request that needs client capabilities the
+ * client did not declare: `data.requiredCapabilities` lists the missing ones
+ * (basic: "lists the missing capabilities"). 2025-11-25 sessions get the same
+ * error, before the gateway sends anything to the client: the bridge never
+ * asks a client for what it cannot answer.
+ */
+export function missingClientCapabilityError(method: string, inputRequest: string, missing: readonly McpInputRequestCapability[]): McpGatewayRpcError {
+	const names = missing.map(capability => `"${capability}"`).join(', ');
+	return new McpGatewayRpcError(
+		MCP.MISSING_REQUIRED_CLIENT_CAPABILITY,
+		`The upstream server asked the client for ${method} ("${inputRequest}"), which needs the client ${missing.length === 1 ? 'capability' : 'capabilities'} ${names}; the client did not declare ${missing.length === 1 ? 'it' : 'them'}`,
+		{ requiredCapabilities: clientCapabilitiesOf(missing), capability: missing[missing.length - 1], inputRequest },
+	);
 }
 
 /**
@@ -124,6 +139,7 @@ export class McpGatewayDispatcher extends Disposable {
 	private readonly _serverInfo: MCP.Implementation;
 	/** The tasks of this route; undefined when the route serves no Tasks extension. */
 	private readonly _tasks: McpGatewayTaskStore | undefined;
+	private readonly _rateLimiter: McpGatewayRateLimiter;
 
 	constructor(
 		private readonly _routeId: string,
@@ -134,6 +150,7 @@ export class McpGatewayDispatcher extends Disposable {
 	) {
 		super();
 		this._serverInfo = _options.serverInfo ?? GATEWAY_SERVER_INFO;
+		this._rateLimiter = new McpGatewayRateLimiter(_options.rateLimits);
 		this._register(_invoker.onDidChangeTools(() => { this._tools = undefined; }));
 		const taskOptions = _options.tasks ?? taskOptionsOf(_invoker);
 		this._tasks = taskOptions ? this._register(new McpGatewayTaskStore(taskOptions, _logger, `[McpGateway][route ${_routeId}]`)) : undefined;
@@ -297,10 +314,29 @@ export class McpGatewayDispatcher extends Disposable {
 		return meta;
 	}
 
-	/** Runs a request. Returns the result object (enveloped for modern clients); throws {@link McpGatewayRpcError}. */
+	/** The rate limits of the route (tests and diagnostics). */
+	get rateLimiter(): McpGatewayRateLimiter {
+		return this._rateLimiter;
+	}
+
+	/**
+	 * Runs a request. Returns the result object (enveloped for modern
+	 * clients); throws {@link McpGatewayRpcError}, and
+	 * {@link McpGatewayRateLimitedError} before anything runs when the
+	 * client is over the method's rate limit.
+	 */
 	async dispatch(ctx: IMcpGatewayDispatchContext, method: string, params: unknown): Promise<object> {
 		if (!this.supportsMethod(method, ctx.era)) {
 			throw new McpGatewayRpcError(MCP.METHOD_NOT_FOUND, `Method not found: ${method}`);
+		}
+		const decision = this._rateLimiter.take(method, ctx.clientKey ?? '');
+		if (!decision.admitted) {
+			if (decision.first) {
+				this._logger.warn(decision.scope === 'route'
+					? `[McpGateway][route ${this._routeId}] Rate limit: the route is over its route-wide limit, refusing ${method} requests of every client for now (retry in ${decision.retryAfterMs} ms)`
+					: `[McpGateway][route ${this._routeId}] Rate limit: refusing ${method} requests of a client for now (retry in ${decision.retryAfterMs} ms)`);
+			}
+			throw new McpGatewayRateLimitedError(method, decision.retryAfterMs, decision.scope);
 		}
 		const result = await this._dispatchInner(ctx, method, isObject(params) ? params : {});
 		return ctx.era === 'modern' ? applyModernEnvelope(method, result, this._serverInfo, this.cacheHints) : result;
@@ -342,8 +378,8 @@ export class McpGatewayDispatcher extends Disposable {
 						return result;
 					}
 					if (tasks && optedIn) {
-						const base = invokeCtx;
-						return tasks.create(name, run => this._runTaskBody(name, args, base, run), { inputResponses: invokeCtx.inputResponses, requestState: invokeCtx.requestState });
+						// The task outlives this request: its body keeps copies of plain values, never the request context.
+						return tasks.create(name, this._taskBody(name, args, taskOriginOf(invokeCtx)), { inputResponses: invokeCtx.inputResponses, requestState: invokeCtx.requestState });
 					}
 					// No task for this request: the body runs at once, inside the request.
 					const synthetic: IMcpGatewayTaskInvokeContext = { ...invokeCtx, task: { taskId: generateUuid(), synthetic: true } };
@@ -470,18 +506,25 @@ export class McpGatewayDispatcher extends Disposable {
 	}
 
 	/**
+	 * The body of a task, kept by the task store until the task's TTL. Built in
+	 * its own method so that the closure's scope holds only these arguments:
+	 * a closure created inside {@link _dispatchInner} would keep that
+	 * function's whole scope alive, the dispatch context (`notify`, headers,
+	 * the response stream) included.
+	 */
+	private _taskBody(name: string, args: Record<string, unknown>, origin: IMcpGatewayTaskOrigin): McpGatewayTaskBody {
+		return run => this._runTaskBody(name, args, origin, run);
+	}
+
+	/**
 	 * One run of a task body: the tool again, inside its task, with the answers
 	 * collected so far. Its progress and log messages have no stream to go to
 	 * (the request that created the task is over) and are dropped. An input
 	 * request the creating client cannot answer fails the task with `-32021`.
 	 */
-	private async _runTaskBody(name: string, args: Record<string, unknown>, base: IMcpGatewayInvokeContext, run: IMcpGatewayTaskRunInput): Promise<MCPLegacy.CallToolResult | IMcpGatewayInputRequired> {
+	private async _runTaskBody(name: string, args: Record<string, unknown>, origin: IMcpGatewayTaskOrigin, run: IMcpGatewayTaskRunInput): Promise<MCPLegacy.CallToolResult | IMcpGatewayInputRequired> {
 		const context: IMcpGatewayTaskInvokeContext = {
-			protocolVersion: base.protocolVersion,
-			clientCapabilities: base.clientCapabilities,
-			clientInfo: base.clientInfo,
-			logLevel: base.logLevel,
-			chatSessionResource: base.chatSessionResource,
+			...origin,
 			inputResponses: run.inputResponses,
 			requestState: run.requestState,
 			token: run.token,
@@ -489,20 +532,26 @@ export class McpGatewayDispatcher extends Disposable {
 		};
 		const result = await this._invoker.callTool(name, args, context);
 		if (isGatewayInputRequired(result)) {
-			this._checkInputRequests(base.clientCapabilities, result.inputRequests ?? {});
+			this._checkInputRequests(origin.clientCapabilities, result.inputRequests ?? {});
 		}
 		return result;
 	}
 
-	/** Every input request must be one the client can answer: else `-32603` (unknown kind) or `-32021`. */
+	/**
+	 * Every input request must be one the client can answer: else `-32603`
+	 * (unknown kind) or `-32021` ({@link missingClientCapabilityError}), for
+	 * instance a tool-enabled sampling request to a client without
+	 * `sampling.tools`.
+	 */
 	private _checkInputRequests(clientCapabilities: MCP.ClientCapabilities, inputRequests: MCP.InputRequests): void {
 		for (const [key, request] of Object.entries(inputRequests)) {
-			const capability = requiredCapabilityForInputRequest(request.method, request.params);
-			if (!capability) {
+			const required = requiredCapabilitiesForInputRequest(request.method, request.params);
+			if (!required) {
 				throw new McpGatewayRpcError(MCP.INTERNAL_ERROR, `Upstream asked for an unsupported input request (${request.method}) in "${key}"`);
 			}
-			if (!hasClientCapability(clientCapabilities, capability)) {
-				throw new McpGatewayRpcError(MCP.MISSING_REQUIRED_CLIENT_CAPABILITY, `This request needs the client capability "${capability}", which the client did not declare`, { requiredCapabilities: requiredCapabilitiesFor(capability), capability, inputRequest: key });
+			const missing = required.filter(capability => !hasClientCapability(clientCapabilities, capability));
+			if (missing.length > 0) {
+				throw missingClientCapabilityError(request.method, key, missing);
 			}
 		}
 	}

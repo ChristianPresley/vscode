@@ -7,7 +7,7 @@ import { JsonRpcId } from '../../../base/common/jsonRpcProtocol.js';
 import { Disposable, DisposableStore, IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
 import { ILogger } from '../../log/common/log.js';
 import { IMcpGatewaySingleServerInvoker } from '../common/mcpGateway.js';
-import { McpGatewayRpcError } from '../common/mcpGatewayProtocol.js';
+import { IMcpGatewayCancellable, McpGatewayRpcError } from '../common/mcpGatewayProtocol.js';
 import { META_SUBSCRIPTION_ID } from '../common/mcpProtocolVersions.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { IMcpGatewayNotification, McpGatewayDispatcher } from './mcpGatewayDispatcher.js';
@@ -18,14 +18,31 @@ export const MAX_LISTEN_STREAMS = 64;
 /** The response stream of one `subscriptions/listen` request. */
 export interface IMcpGatewayListenStream {
 	notify(notification: IMcpGatewayNotification): void;
-	/** Writes the final (graceful) result of the listen request and closes the stream. */
+	/** Writes the final (graceful) result of the listen request and closes the stream (the server ends the subscription). */
 	complete(result: object): void;
+	/**
+	 * Closes the stream without a result: the client cancelled the listen
+	 * request with `notifications/cancelled`, and a server SHOULD NOT answer a
+	 * cancelled request (basic/patterns/cancellation). Only a stream that such
+	 * a notification can reach has it (Streamable HTTP); the others are not
+	 * among the {@link McpGatewayListenRegistry.cancellables} (a gRPC client
+	 * cancels with RST_STREAM, which ends the call itself).
+	 */
+	cancel?(): void;
 }
 
-interface IListenEntry {
+/** An open listen stream that a `notifications/cancelled` can reach ({@link McpGatewayListenRegistry.cancellables}). */
+export interface IMcpGatewayListenCancellable extends IMcpGatewayCancellable {
+	/** Closes the stream without a result ({@link IMcpGatewayListenStream.cancel}). */
+	cancel(): void;
+}
+
+interface IListenEntry extends IMcpGatewayCancellable {
 	readonly requestId: JsonRpcId;
 	/** Who opened the stream (see the route's client key); a cancellation of another client does not reach it. */
 	readonly owner: string | undefined;
+	/** The address part of {@link owner} (the `peer` of the sender of the listen request). */
+	readonly peer: string | undefined;
 	readonly filter: MCP.SubscriptionFilter;
 	readonly stream: IMcpGatewayListenStream;
 	readonly subscriptions: DisposableStore;
@@ -83,12 +100,12 @@ export class McpGatewayListenRegistry extends Disposable {
 	 * `-32603` {@link McpGatewayRpcError} when {@link MAX_LISTEN_STREAMS}
 	 * streams are already open.
 	 */
-	register(requestId: JsonRpcId, requested: MCP.SubscriptionFilter, stream: IMcpGatewayListenStream, owner?: string): IDisposable {
+	register(requestId: JsonRpcId, requested: MCP.SubscriptionFilter, stream: IMcpGatewayListenStream, owner?: string, peer?: string): IDisposable {
 		if (this._entries.size >= MAX_LISTEN_STREAMS) {
 			throw new McpGatewayRpcError(MCP.INTERNAL_ERROR, `Too many open subscriptions/listen streams (limit ${MAX_LISTEN_STREAMS})`);
 		}
 		const filter = this._dispatcher.honoredFilter(requested);
-		const entry: IListenEntry = { requestId, owner, filter, stream, subscriptions: new DisposableStore(), closed: false };
+		const entry: IListenEntry = { requestId, owner, peer, filter, stream, subscriptions: new DisposableStore(), closed: false };
 		this._entries.add(entry);
 		stream.notify({ method: 'notifications/subscriptions/acknowledged', params: { _meta: { [META_SUBSCRIPTION_ID]: requestId }, notifications: filter } });
 		this._logger.debug(`[McpGateway][listen ${String(requestId)}] Opened with filter ${JSON.stringify(filter)} (open streams: ${this._entries.size})`);
@@ -100,15 +117,16 @@ export class McpGatewayListenRegistry extends Disposable {
 	}
 
 	/**
-	 * Closes every stream opened with this request id gracefully, only those
-	 * of `owner` when it is given; returns false when none is open.
+	 * The open streams with this request id that a `notifications/cancelled`
+	 * can reach (those with {@link IMcpGatewayListenStream.cancel}), each with
+	 * its sender and a way to close it without a result. The route picks the
+	 * targets among them and its requests in flight together
+	 * (`cancellationTargets` of mcpGatewayProtocol.ts).
 	 */
-	close(requestId: JsonRpcId, owner?: string): boolean {
-		const entries = this._find(requestId).filter(entry => owner === undefined || entry.owner === owner);
-		for (const entry of entries) {
-			this._close(entry);
-		}
-		return entries.length > 0;
+	cancellables(requestId: JsonRpcId): IMcpGatewayListenCancellable[] {
+		return this._find(requestId)
+			.filter(entry => entry.stream.cancel !== undefined)
+			.map(entry => ({ owner: entry.owner, peer: entry.peer, cancel: () => this._close(entry, false) }));
 	}
 
 	/** Closes every stream gracefully (server shutdown). */
@@ -151,7 +169,8 @@ export class McpGatewayListenRegistry extends Disposable {
 		}
 	}
 
-	private _close(entry: IListenEntry): void {
+	/** Closes a stream: with the graceful result when the server ends it, without one when the client cancelled it. */
+	private _close(entry: IListenEntry, graceful = true): void {
 		if (entry.closed) {
 			return;
 		}
@@ -159,7 +178,12 @@ export class McpGatewayListenRegistry extends Disposable {
 		this._entries.delete(entry);
 		entry.subscriptions.dispose();
 		entry.registration?.dispose();
-		this._logger.debug(`[McpGateway][listen ${String(entry.requestId)}] Closed (open streams: ${this._entries.size})`);
-		entry.stream.complete({ resultType: 'complete', _meta: { [META_SUBSCRIPTION_ID]: entry.requestId } });
+		this._logger.debug(`[McpGateway][listen ${String(entry.requestId)}] ${graceful ? 'Closed' : 'Cancelled by the client'} (open streams: ${this._entries.size})`);
+		if (graceful) {
+			entry.stream.complete({ resultType: 'complete', _meta: { [META_SUBSCRIPTION_ID]: entry.requestId } });
+		} else {
+			// Only reached through `cancellables`, which offers only streams that can be cancelled.
+			entry.stream.cancel?.();
+		}
 	}
 }

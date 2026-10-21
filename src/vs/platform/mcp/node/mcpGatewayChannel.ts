@@ -3,12 +3,13 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { CancellationError } from '../../../base/common/errors.js';
 import { Emitter, Event } from '../../../base/common/event.js';
 import { Disposable, DisposableMap, DisposableStore, toDisposable } from '../../../base/common/lifecycle.js';
 import { generateUuid } from '../../../base/common/uuid.js';
 import { IChannel, IPCServer, IServerChannel } from '../../../base/parts/ipc/common/ipc.js';
 import { ILogger, ILoggerService } from '../../log/common/log.js';
-import { IMcpGatewayInfo, IMcpGatewayInvokeContext, IMcpGatewayServerCapabilities, IMcpGatewayServerDescriptor, IMcpGatewayServerInfo, IMcpGatewayService, IMcpGatewayToolInvoker, McpGatewayToolBrokerChannelName } from '../common/mcpGateway.js';
+import { IMcpGatewayCreateArgs, IMcpGatewayInfo, IMcpGatewayInvokeContext, IMcpGatewayServerCapabilities, IMcpGatewayServerDescriptor, IMcpGatewayServerInfo, IMcpGatewayService, IMcpGatewayToolInvoker, McpGatewayToolBrokerChannelName } from '../common/mcpGateway.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
 
@@ -81,7 +82,7 @@ export class McpGatewayChannel<TContext> extends Disposable implements IServerCh
 
 		switch (command) {
 			case 'createGateway': {
-				const { chatSessionResource } = (args as { chatSessionResource?: string } | undefined) ?? {};
+				const { chatSessionResource, grpc } = (args as IMcpGatewayCreateArgs | undefined) ?? {};
 				const brokerChannel = ipcChannelForContext(this._ipcServer, ctx);
 
 				// Fetch initial server list before creating the gateway (IPC is async, but the invoker interface is sync)
@@ -91,10 +92,19 @@ export class McpGatewayChannel<TContext> extends Disposable implements IServerCh
 				let result: IMcpGatewayInfo;
 				try {
 					const invoker = this._createInvoker(ctx, brokerChannel, currentServers, chatSessionResource, gatewayStore, logger);
-					result = await this.mcpGatewayService.createGateway(ctx, invoker);
+					// Only an explicit opt-in opens the gRPC listener.
+					result = await this.mcpGatewayService.createGateway(ctx, invoker, grpc === true ? { grpc: true } : undefined);
 				} catch (error) {
 					gatewayStore.dispose();
 					throw error;
+				}
+				if (!this._isConnected(ctx)) {
+					// The client disconnected while the gateway was created (the server list, the HTTP start, the gRPC bind):
+					// its disconnect cleanup ran before the gateway existed, so nothing else would ever dispose it.
+					logger?.info(`[McpGateway][Channel] Client ${ctx} disconnected while gateway ${result.gatewayId} was created, disposing it`);
+					gatewayStore.dispose();
+					await this.mcpGatewayService.disposeGateway(result.gatewayId);
+					throw new CancellationError();
 				}
 				// Forward server change events via IPC
 				gatewayStore.add(result.onDidChangeServers(servers => {
@@ -136,6 +146,11 @@ export class McpGatewayChannel<TContext> extends Disposable implements IServerCh
 		throw new Error(`Invalid call: ${command}`);
 	}
 
+	/** Whether the client is still connected (`onDidRemoveConnection` fires after it left `connections`). */
+	private _isConnected(ctx: TContext): boolean {
+		return this._ipcServer.connections.some(c => c.ctx === ctx);
+	}
+
 	/**
 	 * Builds the gateway's invoker on top of the client's tool broker channel.
 	 * Progress and log notifications of tool calls arrive as broker events
@@ -155,7 +170,7 @@ export class McpGatewayChannel<TContext> extends Disposable implements IServerCh
 		}));
 
 		const chatSessionResourceFor = (context: IMcpGatewayInvokeContext | undefined) => context?.chatSessionResource ?? gatewayChatSessionResource;
-		const isClientConnected = () => this._ipcServer.connections.some(c => c.ctx === ctx);
+		const isClientConnected = () => this._isConnected(ctx);
 
 		return {
 			onDidChangeServers: Event.map(brokerChannel.listen<readonly IMcpGatewayServerDescriptor[]>('onDidChangeServers'), servers => {

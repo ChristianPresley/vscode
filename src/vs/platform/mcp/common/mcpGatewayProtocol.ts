@@ -222,17 +222,39 @@ export function validateInputResponses(value: unknown): McpGatewayRpcError | und
 	return undefined;
 }
 
-export type McpInputRequestCapability = 'elicitation' | 'elicitation.url' | 'sampling' | 'roots';
+export type McpInputRequestCapability = 'elicitation' | 'elicitation.url' | 'sampling' | 'sampling.tools' | 'sampling.context' | 'roots';
 
-/** The client capability an input request needs before a server may issue it. */
-export function requiredCapabilityForInputRequest(method: string, params: unknown): McpInputRequestCapability | undefined {
+function isPresent(value: unknown): boolean {
+	return value !== undefined && value !== null;
+}
+
+/**
+ * Every client capability an input request needs before a server may issue
+ * it; undefined for a method that is no input request. A
+ * `sampling/createMessage` with `tools` or `toolChoice` also needs
+ * `sampling.tools` (client/sampling: servers MUST NOT send tool-enabled
+ * sampling requests to clients that did not declare it), and one with an
+ * `includeContext` other than `none` also needs `sampling.context` (the
+ * deprecated values SHOULD NOT be used without it).
+ */
+export function requiredCapabilitiesForInputRequest(method: string, params: unknown): readonly McpInputRequestCapability[] | undefined {
 	switch (method) {
 		case 'elicitation/create':
-			return isObject(params) && params.mode === 'url' ? 'elicitation.url' : 'elicitation';
-		case 'sampling/createMessage':
-			return 'sampling';
+			return [isObject(params) && params.mode === 'url' ? 'elicitation.url' : 'elicitation'];
+		case 'sampling/createMessage': {
+			const required: McpInputRequestCapability[] = ['sampling'];
+			if (isObject(params)) {
+				if (isPresent(params.includeContext) && params.includeContext !== 'none') {
+					required.push('sampling.context');
+				}
+				if (isPresent(params.tools) || isPresent(params.toolChoice)) {
+					required.push('sampling.tools');
+				}
+			}
+			return required;
+		}
 		case 'roots/list':
-			return 'roots';
+			return ['roots'];
 		default:
 			return undefined;
 	}
@@ -249,18 +271,66 @@ export function hasClientCapability(capabilities: MCP.ClientCapabilities | undef
 			return capabilities.elicitation?.url !== undefined;
 		case 'sampling':
 			return capabilities.sampling !== undefined;
+		case 'sampling.tools':
+			return isObject(capabilities.sampling) && capabilities.sampling.tools !== undefined;
+		case 'sampling.context':
+			return isObject(capabilities.sampling) && capabilities.sampling.context !== undefined;
 		case 'roots':
 			return capabilities.roots !== undefined;
 	}
 }
 
+/**
+ * The `ClientCapabilities` shape of a list of capabilities, as a `-32021`
+ * error names them in `data.requiredCapabilities` (`sampling.tools` and
+ * `sampling.context` merge into one `sampling` object).
+ */
+export function clientCapabilitiesOf(capabilities: readonly McpInputRequestCapability[]): MCP.ClientCapabilities {
+	const out: MCP.ClientCapabilities = {};
+	for (const capability of capabilities) {
+		switch (capability) {
+			case 'elicitation':
+				out.elicitation ??= {};
+				break;
+			case 'elicitation.url':
+				out.elicitation = { ...out.elicitation, url: {} };
+				break;
+			case 'sampling':
+				out.sampling ??= {};
+				break;
+			case 'sampling.tools':
+				out.sampling = { ...out.sampling, tools: {} };
+				break;
+			case 'sampling.context':
+				out.sampling = { ...out.sampling, context: {} };
+				break;
+			case 'roots':
+				out.roots ??= {};
+				break;
+		}
+	}
+	return out;
+}
+
 const SUBSCRIPTION_FILTER_FLAGS = ['toolsListChanged', 'promptsListChanged', 'resourcesListChanged'] as const;
 
 /**
- * Checks the shape of a `subscriptions/listen` filter: an object whose list
- * flags, when present, are booleans and whose `resourceSubscriptions`, when
- * present, is an array of strings. Unknown keys are ignored. Returns the
- * `-32602` error to answer, or undefined when the filter is well-formed.
+ * The most distinct URIs one `subscriptions/listen` filter may subscribe to
+ * (each one is a subscription the gateway opens on the server behind it), as
+ * the zig-sdk's `max_resource_subscription_uris`.
+ */
+export const MAX_LISTEN_RESOURCE_SUBSCRIPTIONS = 1024;
+
+/** The most characters of a `subscriptions/listen` filter as compact JSON, as the zig-sdk's `max_filter_bytes`. */
+export const MAX_LISTEN_FILTER_LENGTH = 64 * 1024;
+
+/**
+ * Checks a `subscriptions/listen` filter: an object whose list flags, when
+ * present, are booleans and whose `resourceSubscriptions`, when present, is
+ * an array of strings (unknown keys are ignored; `-32602` otherwise), within
+ * the gateway's limits ({@link MAX_LISTEN_RESOURCE_SUBSCRIPTIONS} distinct
+ * URIs, {@link MAX_LISTEN_FILTER_LENGTH} characters; `-32603` otherwise, as
+ * for too many open streams). Returns the error to answer, or undefined.
  */
 export function validateSubscriptionFilter(value: unknown): McpGatewayRpcError | undefined {
 	if (!isObject(value)) {
@@ -275,6 +345,14 @@ export function validateSubscriptionFilter(value: unknown): McpGatewayRpcError |
 	if (uris !== undefined && (!Array.isArray(uris) || !uris.every(uri => typeof uri === 'string'))) {
 		return new McpGatewayRpcError(MCP.INVALID_PARAMS, 'notifications.resourceSubscriptions must be an array of strings');
 	}
+	const distinct = Array.isArray(uris) ? new Set(uris).size : 0;
+	if (distinct > MAX_LISTEN_RESOURCE_SUBSCRIPTIONS) {
+		return new McpGatewayRpcError(MCP.INTERNAL_ERROR, `Too many resource subscriptions in one subscriptions/listen filter: ${distinct} (limit ${MAX_LISTEN_RESOURCE_SUBSCRIPTIONS})`);
+	}
+	const length = JSON.stringify(value).length;
+	if (length > MAX_LISTEN_FILTER_LENGTH) {
+		return new McpGatewayRpcError(MCP.INTERNAL_ERROR, `The subscriptions/listen filter is too large: ${length} characters (limit ${MAX_LISTEN_FILTER_LENGTH})`);
+	}
 	return undefined;
 }
 
@@ -282,7 +360,8 @@ export function validateSubscriptionFilter(value: unknown): McpGatewayRpcError |
  * The filter a server honours for a `subscriptions/listen` request: every
  * requested kind the server can actually produce (per its capabilities).
  * Defensive about the shape: a flag counts only when it is `true`, and only
- * the string entries of an actual `resourceSubscriptions` array are kept.
+ * the string entries of an actual `resourceSubscriptions` array are kept,
+ * each URI once (one subscription per URI).
  */
 export function honorSubscriptionFilter(requested: MCP.SubscriptionFilter, serverCapabilities: MCP.ServerCapabilities): MCP.SubscriptionFilter {
 	const honoured: MCP.SubscriptionFilter = {};
@@ -299,7 +378,7 @@ export function honorSubscriptionFilter(requested: MCP.SubscriptionFilter, serve
 		honoured.resourcesListChanged = true;
 	}
 	const requestedUris: unknown = requested.resourceSubscriptions;
-	const uris = Array.isArray(requestedUris) ? requestedUris.filter((uri): uri is string => typeof uri === 'string') : [];
+	const uris = Array.isArray(requestedUris) ? [...new Set(requestedUris.filter((uri): uri is string => typeof uri === 'string'))] : [];
 	if (uris.length > 0 && serverCapabilities.resources?.subscribe) {
 		honoured.resourceSubscriptions = uris;
 	}
@@ -340,6 +419,45 @@ export const FIRST_PRIMING_PROTOCOL_VERSION = '2025-11-25';
  */
 export function legacyVersionSupportsPriming(protocolVersion: string | undefined): boolean {
 	return protocolVersion !== undefined && LEGACY_MCP_PROTOCOL_VERSIONS.includes(protocolVersion) && protocolVersion >= FIRST_PRIMING_PROTOCOL_VERSION;
+}
+
+/**
+ * Who sent a stateless (2026-07-28) message, for `notifications/cancelled`:
+ * the client's key (its address and its `_meta` client info), its address
+ * alone, and whether the message named the client (carried client info).
+ */
+export interface IMcpGatewayMessageSender {
+	readonly key: string;
+	readonly peer: string;
+	readonly named: boolean;
+}
+
+/** Something a cancellation can reach (an in-flight request, a listen stream), with the sender of the request that opened it. */
+export interface IMcpGatewayCancellable {
+	/** The {@link IMcpGatewayMessageSender.key} of the request. */
+	readonly owner: string | undefined;
+	/** The {@link IMcpGatewayMessageSender.peer} of the request. */
+	readonly peer: string | undefined;
+}
+
+/**
+ * The entries with one request id that a `notifications/cancelled` of
+ * `sender` reaches. A cancellation that names its client reaches only that
+ * client's entries. Notifications need not carry `_meta` while requests
+ * SHOULD carry the client info, so one that names no client may come from
+ * any client of its address, one that names itself in its requests or one
+ * that never does: it reaches the entries of the one client of its address
+ * that has entries with the id, and when several clients of the address
+ * have one (a client without client info among them or not), it is
+ * ambiguous and reaches none (it never cancels another client's request).
+ */
+export function cancellationTargets<T extends IMcpGatewayCancellable>(entries: Iterable<T>, sender: IMcpGatewayMessageSender): T[] {
+	const candidates = [...entries];
+	if (sender.named) {
+		return candidates.filter(entry => entry.owner === sender.key);
+	}
+	const sameAddress = candidates.filter(entry => entry.peer === sender.peer);
+	return new Set(sameAddress.map(entry => entry.owner)).size === 1 ? sameAddress : [];
 }
 
 /** The `_meta` client info of a message (request or notification), when it is well-formed. */

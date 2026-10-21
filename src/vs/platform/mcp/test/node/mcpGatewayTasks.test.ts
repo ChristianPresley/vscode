@@ -4,13 +4,14 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import * as inspector from 'inspector';
 import { DeferredPromise, timeout } from '../../../../base/common/async.js';
-import { CancellationToken } from '../../../../base/common/cancellation.js';
+import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { CancellationError } from '../../../../base/common/errors.js';
 import { Event } from '../../../../base/common/event.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { IMcpGatewayInputRequired, IMcpGatewaySingleServerInvoker } from '../../common/mcpGateway.js';
+import { IMcpGatewayInputRequired, IMcpGatewayInvokeContext, IMcpGatewaySingleServerInvoker } from '../../common/mcpGateway.js';
 import { McpGatewayRpcError } from '../../common/mcpGatewayProtocol.js';
 import { LATEST_MCP_PROTOCOL_VERSION, META_SERVER_INFO } from '../../common/mcpProtocolVersions.js';
 import { MCP } from '../../common/modelContextProtocol.js';
@@ -19,7 +20,7 @@ import { McpTasks } from '../../common/modelContextProtocolTasks.js';
 import { CONFORMANCE_SERVER_INFO, CONFORMANCE_TASK_OPTIONS, McpGatewayConformanceInvoker } from '../../node/mcpGatewayConformanceInvoker.js';
 import { IMcpGatewayDispatchContext, McpGatewayDispatcher, McpGatewayResourceNotFoundError } from '../../node/mcpGatewayDispatcher.js';
 import { McpGatewaySealedState } from '../../node/mcpGatewaySealedState.js';
-import { clientDeclaresTasks, IMcpGatewayTaskRunInput, isStartTaskResult, McpGatewayTaskBody, McpGatewayTaskStore, startTaskResult, taskOptionsOf, taskRunOf, taskSupportOf, withoutTaskSupport } from '../../node/mcpGatewayTasks.js';
+import { clientDeclaresTasks, IMcpGatewayTaskCapableInvoker, IMcpGatewayTaskRunInput, isStartTaskResult, McpGatewayTaskBody, McpGatewayTaskStore, startTaskResult, taskOptionsOf, taskOriginOf, taskRunOf, taskSupportOf, withoutTaskSupport } from '../../node/mcpGatewayTasks.js';
 
 const TASKS: MCP.ClientCapabilities = { extensions: { [McpTasks.EXTENSION_ID]: {} } };
 const ALL_WITH_TASKS: MCP.ClientCapabilities = { elicitation: { form: {}, url: {} }, sampling: {}, roots: {}, extensions: { [McpTasks.EXTENSION_ID]: {} } };
@@ -234,6 +235,19 @@ suite('MCP - GatewayTaskStore', () => {
 		assert.deepStrictEqual(withoutTaskSupport({ name: 't', inputSchema: { type: 'object' }, execution: { taskSupport: 'optional' } }), { name: 't', inputSchema: { type: 'object' } });
 		const invoker = store.add(new McpGatewayConformanceInvoker());
 		assert.deepStrictEqual(taskOptionsOf(invoker), CONFORMANCE_TASK_OPTIONS);
+		const origin = taskOriginOf({
+			protocolVersion: LATEST_MCP_PROTOCOL_VERSION,
+			clientCapabilities: TASKS,
+			clientInfo: { name: 'client', version: '1' },
+			logLevel: 'info',
+			chatSessionResource: 'chat-1',
+			progressToken: 'p',
+			onProgress: () => { },
+			onLog: () => { },
+			closeSseStream: () => { },
+			token: CancellationToken.None,
+		});
+		assert.deepStrictEqual(origin, { protocolVersion: LATEST_MCP_PROTOCOL_VERSION, clientCapabilities: TASKS, clientInfo: { name: 'client', version: '1' }, logLevel: 'info', chatSessionResource: 'chat-1' }, 'plain values only');
 	});
 });
 
@@ -454,4 +468,85 @@ suite('MCP - GatewayDispatcher - Tasks extension', () => {
 		const bridged = await dispatcher.dispatch(context(ALL_WITH_TASKS, 'legacy'), 'tools/call', { name: 'confirm_delete', arguments: { filename: 'b.txt' } }) as MCPLegacy.CallToolResult;
 		assert.strictEqual(textOf(bridged), 'Deleted b.txt', 'the input round is bridged as a server request');
 	});
+
+	test('a running task keeps nothing of the request that created it: its context, notify, stream and token can go', async () => {
+		const release = new DeferredPromise<void>();
+		const bodyContexts: IMcpGatewayInvokeContext[] = [];
+		const invoker: IMcpGatewayTaskCapableInvoker = {
+			tasks: { ttlMs: 60_000, pollIntervalMs: 100 },
+			onDidChangeTools: Event.None,
+			onDidChangeResources: Event.None,
+			listTools: async () => [{ name: 'job', inputSchema: { type: 'object' }, execution: { taskSupport: 'optional' } }],
+			callTool: async (_name, _args, invokeContext) => {
+				if (!invokeContext || !taskRunOf(invokeContext)) {
+					return startTaskResult();
+				}
+				bodyContexts.push(invokeContext);
+				// A body that reports progress and logs: nothing may reach the stream of the request that is over.
+				invokeContext.onProgress?.({ progress: 1 });
+				invokeContext.onLog?.('info', 'from the task');
+				await release.p;
+				return text('done');
+			},
+			listResources: async () => [],
+			readResource: async uri => { throw new McpGatewayResourceNotFoundError(uri); },
+			listResourceTemplates: async () => [],
+		};
+		const dispatcher = createDispatcher(invoker);
+		const notified: string[] = [];
+
+		/** Creates the task in a request that then ends; only weak references to the request's objects survive. */
+		async function createInRequest() {
+			const cts = new CancellationTokenSource();
+			const notify = (notification: { readonly method: string }) => { notified.push(notification.method); };
+			const requestContext: IMcpGatewayDispatchContext = {
+				...context(),
+				logLevel: 'debug',
+				progressToken: 'p-1',
+				headers: { 'mcp-method': 'tools/call' },
+				token: cts.token,
+				notify,
+				closeSseStream: () => { },
+			};
+			const created = await dispatcher.dispatch(requestContext, 'tools/call', { name: 'job', arguments: {} }) as Record<string, unknown>;
+			assert.strictEqual(created.resultType, 'task');
+			cts.dispose(true); // the request is over
+			return { taskId: created.taskId as string, requestContext: new WeakRef(requestContext), notify: new WeakRef(notify) };
+		}
+
+		const { taskId, requestContext, notify } = await createInRequest();
+		assert.strictEqual(bodyContexts.length, 1, 'the body runs');
+		await timeout(0); // weak references stay alive until the end of the job that created them
+		await collectGarbage();
+		assert.strictEqual(requestContext.deref(), undefined, 'the request context is not retained by the running task');
+		assert.strictEqual(notify.deref(), undefined, 'notify is not retained by the running task');
+
+		const [body] = bodyContexts;
+		for (const key of ['onProgress', 'onLog', 'closeSseStream', 'progressToken', 'headers', 'notify']) {
+			assert.strictEqual(Object.prototype.hasOwnProperty.call(body, key), false, key);
+		}
+		assert.strictEqual(body.token.isCancellationRequested, false, 'the body runs on the token of the task, not the request');
+		assert.strictEqual(body.logLevel, 'debug');
+		assert.deepStrictEqual(body.clientCapabilities, ALL_WITH_TASKS);
+		assert.deepStrictEqual(notified, []);
+		release.complete();
+		const done = await poll(dispatcher, taskId);
+		assert.strictEqual(done.status, 'completed');
+		assert.strictEqual(textOf(done.result), 'done');
+	});
 });
+
+/** Forces a full garbage collection: with `globalThis.gc` when the runner exposes it, else through an in-process inspector session. */
+async function collectGarbage(): Promise<void> {
+	if (typeof globalThis.gc === 'function') {
+		globalThis.gc();
+		return;
+	}
+	const session = new inspector.Session();
+	session.connect();
+	try {
+		await new Promise<void>((resolve, reject) => session.post('HeapProfiler.collectGarbage', error => error ? reject(error) : resolve()));
+	} finally {
+		session.disconnect();
+	}
+}

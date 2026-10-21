@@ -14,7 +14,15 @@
  * - the zig-sdk example client (`grpc_client`, tunnel only, calls `add`) runs
  *   against the default route when `MCP_ZIG_GRPC_CLIENT` names its binary,
  * - curl makes a raw HTTP/2 prior-knowledge tunnel call, as in the zig-sdk
- *   CI, when it has HTTP/2.
+ *   CI, when it has HTTP/2 (the request message is over 2^14 bytes, so its
+ *   length is a three-byte varint), and the trailers must say
+ *   `grpc-status: 0`.
+ *
+ * The conformance entry point is a test fixture: its listener lets calls
+ * without the `mcp-gateway-route` metadata reach its only route
+ * (`allowDefaultRoute`), which the zig-sdk client needs. The product's
+ * listener requires the metadata on every call; the unit tests in
+ * `src/vs/platform/mcp/test/node/mcpGatewayGrpc.test.ts` cover that mode.
  *
  * Needs `npm run transpile-client` first; runs only with
  * `MCP_GATEWAY_GRPC_INTEROP=1` so that `npm test` of this package does not
@@ -263,28 +271,114 @@ function curlHasHttp2(): boolean {
 	return result.status === 0 && /^Features:.*\bHTTP2\b/m.test(result.stdout ?? '');
 }
 
-test('curl calls the tunnel over HTTP/2 with prior knowledge', { skip: (!ENABLED && 'set MCP_GATEWAY_GRPC_INTEROP=1') || (!curlHasHttp2() && 'curl without HTTP/2') }, () => {
-	const body = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'server/discover', params: { _meta: { 'io.modelcontextprotocol/protocolVersion': PROTOCOL_VERSION, 'io.modelcontextprotocol/clientCapabilities': {} } } }), 'utf8');
-	assert.ok(body.length < 1 << 14);
-	// JsonRpcMessage: field 1, length-delimited (a two-byte varint length), then the gRPC length prefix.
-	const message = Buffer.concat([Buffer.from([0x0a, (body.length & 0x7f) | 0x80, body.length >> 7]), body]);
+/** A protobuf base-128 varint. */
+function encodeVarint(value: number): Buffer {
+	assert.ok(Number.isSafeInteger(value) && value >= 0, `a varint needs a non-negative integer: ${value}`);
+	const bytes: number[] = [];
+	let rest = value;
+	while (rest >= 0x80) {
+		bytes.push((rest % 0x80) | 0x80);
+		rest = Math.floor(rest / 0x80);
+	}
+	bytes.push(rest);
+	return Buffer.from(bytes);
+}
+
+/** Reads a varint at `offset`: its value and the offset after it. */
+function decodeVarint(buffer: Buffer, offset: number): { readonly value: number; readonly next: number } {
+	let value = 0;
+	let factor = 1;
+	for (let i = offset; i < buffer.length; i++) {
+		value += (buffer[i] & 0x7f) * factor;
+		if ((buffer[i] & 0x80) === 0) {
+			return { value, next: i + 1 };
+		}
+		factor *= 0x80;
+	}
+	throw new Error('truncated varint');
+}
+
+/** `mcp.zig.transport.v1.JsonRpcMessage { bytes jsonrpc = 1; }` with a length prefix (5 bytes: flag, big-endian length). */
+function framedJsonRpcMessage(json: string): Buffer {
+	const body = Buffer.from(json, 'utf8');
+	const message = Buffer.concat([Buffer.from([0x0a]), encodeVarint(body.length), body]);
 	const prefix = Buffer.alloc(5);
 	prefix.writeUInt32BE(message.length, 1);
+	return Buffer.concat([prefix, message]);
+}
+
+/** The JSON-RPC messages of a tunnel response body (length-prefixed JsonRpcMessages). */
+function unframeJsonRpcMessages(data: Buffer): JsonObject[] {
+	const messages: JsonObject[] = [];
+	for (let offset = 0; offset < data.length;) {
+		assert.strictEqual(data[offset], 0, 'uncompressed');
+		const length = data.readUInt32BE(offset + 1);
+		const message = data.subarray(offset + 5, offset + 5 + length);
+		assert.strictEqual(message[0], 0x0a, 'field 1, length-delimited');
+		const { value, next } = decodeVarint(message, 1);
+		messages.push(JSON.parse(message.subarray(next, next + value).toString('utf8')) as JsonObject);
+		offset += 5 + length;
+	}
+	return messages;
+}
+
+test('the JsonRpcMessage length is a varint of any size', () => {
+	assert.deepStrictEqual([...encodeVarint(0)], [0]);
+	assert.deepStrictEqual([...encodeVarint(127)], [0x7f]);
+	assert.deepStrictEqual([...encodeVarint(128)], [0x80, 0x01]);
+	assert.deepStrictEqual([...encodeVarint(300)], [0xac, 0x02]);
+	assert.deepStrictEqual([...encodeVarint(16_384)], [0x80, 0x80, 0x01], 'three bytes from 2^14 on');
+	assert.deepStrictEqual([...encodeVarint(2 ** 32)], [0x80, 0x80, 0x80, 0x80, 0x10]);
+	for (const size of [0, 1, 127, 128, 16_383, 16_384, 70_000]) {
+		const json = JSON.stringify({ pad: 'x'.repeat(Math.max(0, size - 10)) });
+		assert.deepStrictEqual(unframeJsonRpcMessages(framedJsonRpcMessage(json)), [JSON.parse(json)], `${json.length} bytes`);
+	}
+});
+
+/** The header blocks of a `curl -D` dump: the response headers first, then the trailers (if any), each a name → value map. */
+function headerBlocks(dump: string): Record<string, string>[] {
+	return dump.split(/\r?\n\r?\n/).filter(block => block.trim().length > 0).map(block => {
+		const fields: Record<string, string> = {};
+		for (const line of block.split(/\r?\n/)) {
+			const colon = line.indexOf(':');
+			if (colon > 0) {
+				fields[line.substring(0, colon).trim().toLowerCase()] = line.substring(colon + 1).trim();
+			}
+		}
+		return fields;
+	});
+}
+
+test('curl calls the tunnel over HTTP/2 with prior knowledge: messages, then grpc-status 0 in the trailers', { skip: (!ENABLED && 'set MCP_GATEWAY_GRPC_INTEROP=1') || (!curlHasHttp2() && 'curl without HTTP/2') }, () => {
+	// Over 2^14 bytes, so that the JsonRpcMessage length takes a three-byte varint.
+	const padding = 'p'.repeat(20_000);
+	const json = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'server/discover', params: { _meta: { 'io.modelcontextprotocol/protocolVersion': PROTOCOL_VERSION, 'io.modelcontextprotocol/clientCapabilities': {}, 'test/padding': padding } } });
+	assert.ok(json.length >= 1 << 14);
 	const dir = mkdtempSync(path.join(tmpdir(), 'mcp-gateway-curl-'));
 	try {
 		const callFile = path.join(dir, 'call.bin');
 		const responseFile = path.join(dir, 'response.bin');
-		writeFileSync(callFile, Buffer.concat([prefix, message]));
+		const headersFile = path.join(dir, 'headers.txt');
+		writeFileSync(callFile, framedJsonRpcMessage(json));
 		const result = spawnSync('curl', [
-			'-s', '--http2-prior-knowledge', '-o', responseFile, '-w', '%{http_code} %{content_type}',
+			'-s', '--http2-prior-knowledge', '-D', headersFile, '-o', responseFile, '-w', '%{http_code} %{content_type}',
 			'-H', 'content-type: application/grpc+proto', '-H', 'te: trailers',
 			'-H', `mcp-protocol-version: ${PROTOCOL_VERSION}`, '-H', 'mcp-method: server/discover',
+			'-H', `${ROUTE_METADATA}: ${gateway!.routeId}`,
 			'--data-binary', `@${callFile}`,
 			`http://127.0.0.1:${gateway!.port}/mcp.zig.transport.v1.Mcp/Call`,
 		], { encoding: 'utf8', timeout: 30_000 });
 		assert.strictEqual(result.status, 0, result.stderr);
 		assert.strictEqual(result.stdout, '200 application/grpc+proto');
-		assert.match(readFileSync(responseFile).toString('utf8'), /"supportedVersions"/);
+		const [headers, trailers] = headerBlocks(readFileSync(headersFile, 'utf8'));
+		assert.strictEqual(headers['grpc-status'], undefined, 'not a trailers-only response');
+		assert.ok(trailers, `curl reports the trailers: ${readFileSync(headersFile, 'utf8')}`);
+		assert.strictEqual(trailers['grpc-status'], '0');
+		const messages = unframeJsonRpcMessages(readFileSync(responseFile));
+		assert.strictEqual(messages.length, 1);
+		const discovered = messages[0].result as JsonObject;
+		assert.deepStrictEqual(discovered.supportedVersions, [PROTOCOL_VERSION]);
+		assert.deepStrictEqual((discovered._meta as JsonObject)['io.modelcontextprotocol/serverInfo'], SERVER_INFO);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

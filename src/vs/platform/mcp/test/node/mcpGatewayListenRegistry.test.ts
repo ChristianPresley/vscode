@@ -5,9 +5,11 @@
 
 import assert from 'assert';
 import { timeout } from '../../../../base/common/async.js';
+import { JsonRpcId } from '../../../../base/common/jsonRpcProtocol.js';
+import { IDisposable } from '../../../../base/common/lifecycle.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { McpGatewayRpcError } from '../../common/mcpGatewayProtocol.js';
+import { cancellationTargets, IMcpGatewayMessageSender, McpGatewayRpcError } from '../../common/mcpGatewayProtocol.js';
 import { META_SUBSCRIPTION_ID } from '../../common/mcpProtocolVersions.js';
 import { MCP } from '../../common/modelContextProtocol.js';
 import { CONFORMANCE_HIDDEN_PROMPT, CONFORMANCE_HIDDEN_TOOL, McpGatewayConformanceInvoker } from '../../node/mcpGatewayConformanceInvoker.js';
@@ -18,6 +20,8 @@ import { McpGatewaySealedState } from '../../node/mcpGatewaySealedState.js';
 class TestListenStream implements IMcpGatewayListenStream {
 	readonly notifications: IMcpGatewayNotification[] = [];
 	readonly results: object[] = [];
+	/** How often the stream was closed without a result. */
+	cancelled = 0;
 
 	notify(notification: IMcpGatewayNotification): void {
 		this.notifications.push(notification);
@@ -27,9 +31,26 @@ class TestListenStream implements IMcpGatewayListenStream {
 		this.results.push(result);
 	}
 
+	cancel(): void {
+		this.cancelled++;
+	}
+
 	get methods(): string[] {
 		return this.notifications.map(n => n.method);
 	}
+}
+
+/**
+ * What the route does with a `notifications/cancelled` of `sender` for the
+ * listen streams with `requestId` (it pools them with its requests in flight
+ * before it applies {@link cancellationTargets}); returns whether it reached one.
+ */
+function cancel(registry: McpGatewayListenRegistry, requestId: JsonRpcId, sender: IMcpGatewayMessageSender): boolean {
+	const targets = cancellationTargets(registry.cancellables(requestId), sender);
+	for (const target of targets) {
+		target.cancel();
+	}
+	return targets.length > 0;
 }
 
 suite('MCP - GatewayListenRegistry', () => {
@@ -96,51 +117,102 @@ suite('MCP - GatewayListenRegistry', () => {
 		registration.dispose();
 		assert.deepStrictEqual(stream.results, [{ resultType: 'complete', _meta: { [META_SUBSCRIPTION_ID]: 'abc' } }]);
 		assert.strictEqual(registry.size, 0);
-		assert.strictEqual(registry.close('abc'), false);
+		assert.deepStrictEqual([registry.has('abc'), registry.cancellables('abc').length], [false, 0], 'a closed stream is not cancellable');
 	});
 
-	test('close and closeAll complete every stream; stateless clients may reuse a request id', () => {
+	test('closeAll completes every stream; stateless clients may reuse a request id', () => {
 		const { registry } = setup();
 		const a = new TestListenStream();
 		const b = new TestListenStream();
 		const c = new TestListenStream();
-		registry.register(1, { toolsListChanged: true }, a);
-		registry.register(1, { toolsListChanged: true }, b);
-		registry.register(2, { toolsListChanged: true }, c);
+		const registrationA = registry.register(1, { toolsListChanged: true }, a, 'me', 'here');
+		registry.register(1, { toolsListChanged: true }, b, 'them', 'here');
+		registry.register(2, { toolsListChanged: true }, c, 'far', 'elsewhere');
 		assert.strictEqual(registry.size, 3);
-		assert.strictEqual(registry.close(1), true);
-		assert.strictEqual(a.results.length, 1);
-		assert.strictEqual(b.results.length, 1);
-		assert.strictEqual(c.results.length, 0);
+		assert.deepStrictEqual(registry.cancellables(1).map(stream => stream.owner), ['me', 'them'], 'both streams with id 1 are open');
+		registrationA.dispose();
+		assert.deepStrictEqual([a.results.length, b.results.length, c.results.length], [1, 0, 0], 'disposing a registration ends its stream only');
 		registry.closeAll();
-		assert.strictEqual(c.results.length, 1);
+		assert.deepStrictEqual([a.results.length, b.results.length, c.results.length], [1, 1, 1]);
+		assert.deepStrictEqual([a.cancelled, b.cancelled, c.cancelled], [0, 0, 0]);
 		assert.strictEqual(registry.size, 0);
 	});
 
-	test('close with an owner closes only that client\'s streams', () => {
+	test('a stream that a notifications/cancelled cannot reach (no cancel, a gRPC call) is not among the cancellables', () => {
 		const { registry } = setup();
+		const uncancellableResults: object[] = [];
+		const uncancellable: IMcpGatewayListenStream = {
+			notify: () => { },
+			complete: result => {
+				uncancellableResults.push(result);
+			},
+		};
+		const cancellable = new TestListenStream();
+		registry.register(1, { toolsListChanged: true }, uncancellable, 'me', 'here');
+		registry.register(1, { toolsListChanged: true }, cancellable, 'me', 'here');
+		assert.strictEqual(registry.size, 2);
+		assert.strictEqual(cancel(registry, 1, { key: 'me', peer: 'here', named: true }), true);
+		assert.deepStrictEqual([cancellable.cancelled, cancellable.results.length, uncancellableResults.length, registry.size], [1, 0, 0, 1], 'only the stream with cancel was cancelled');
+		assert.strictEqual(cancel(registry, 1, { key: 'me', peer: 'here', named: true }), false);
+		registry.closeAll();
+		assert.strictEqual(uncancellableResults.length, 1, 'the server ends it with the graceful result');
+	});
+
+	test('cancel closes the streams a cancellation of its sender reaches, without a result: its own, or without client info the only client of its address with the id', () => {
+		const { invoker, registry } = setup();
 		const mine = new TestListenStream();
 		const theirs = new TestListenStream();
-		registry.register(1, { toolsListChanged: true }, mine, 'me');
-		registry.register(1, { toolsListChanged: true }, theirs, 'them');
-		assert.strictEqual(registry.close(1, 'nobody'), false);
-		assert.strictEqual(registry.close(1, 'them'), true);
-		assert.deepStrictEqual([mine.results.length, theirs.results.length], [0, 1]);
-		assert.strictEqual(registry.size, 1);
+		const remote = new TestListenStream();
+		registry.register(1, { toolsListChanged: true }, mine, 'me', 'here');
+		registry.register(1, { toolsListChanged: true }, theirs, 'them', 'here');
+		registry.register(2, { toolsListChanged: true }, remote, 'far', 'elsewhere');
+		const nameless: IMcpGatewayMessageSender = { key: 'nameless', peer: 'here', named: false };
+		assert.strictEqual(cancel(registry, 1, nameless), false, 'ambiguous: two clients of the address have id 1');
+		assert.strictEqual(cancel(registry, 1, { key: 'them', peer: 'here', named: true }), true);
+		assert.deepStrictEqual([mine.cancelled, theirs.cancelled], [0, 1]);
+		assert.deepStrictEqual(theirs.results, [], 'a cancelled listen request gets no response');
+		assert.strictEqual(cancel(registry, 1, nameless), true, 'now only one client of the address has id 1');
+		assert.deepStrictEqual([mine.cancelled, mine.results.length], [1, 0]);
+		assert.strictEqual(cancel(registry, 2, nameless), false, 'another address');
+		assert.deepStrictEqual([remote.cancelled, remote.results.length], [0, 0]);
+		invoker.setToolHidden(CONFORMANCE_HIDDEN_TOOL, false);
+		assert.deepStrictEqual([mine.methods.length, theirs.methods.length, remote.methods.length], [1, 1, 2], 'a cancelled stream gets nothing more');
 		registry.closeAll();
+		assert.deepStrictEqual([mine.results.length, theirs.results.length, remote.results.length], [0, 0, 1], 'only the stream the server ends gets the graceful result');
+
+		// A client without client info that opened a stream itself is no exception: it is one of two clients of the address with the id, and the nameless cancellation may come from the other one.
+		const ownNameless = new TestListenStream();
+		const otherNamed = new TestListenStream();
+		registry.register(3, { toolsListChanged: true }, ownNameless, nameless.key, 'here');
+		registry.register(3, { toolsListChanged: true }, otherNamed, 'them', 'here');
+		assert.strictEqual(cancel(registry, 3, nameless), false, 'ambiguous: the nameless client and another client of the address have id 3');
+		assert.deepStrictEqual([ownNameless.cancelled, otherNamed.cancelled, registry.size], [0, 0, 2]);
+		registry.closeAll();
+	});
+
+	test('cancellables hands out the open streams of an id with their sender; cancelling one closes it without a result, once', () => {
+		const { registry } = setup();
+		const stream = new TestListenStream();
+		registry.register('L', { toolsListChanged: true }, stream, 'me', 'here');
+		const [cancellable, ...rest] = registry.cancellables('L');
+		assert.deepStrictEqual([cancellable.owner, cancellable.peer, rest.length, registry.cancellables('other').length], ['me', 'here', 0, 0]);
+		cancellable.cancel();
+		cancellable.cancel();
+		assert.deepStrictEqual([stream.cancelled, stream.results.length, registry.size, registry.cancellables('L').length], [1, 0, 0, 0]);
 	});
 
 	test(`the stream after ${MAX_LISTEN_STREAMS} open ones is refused with -32603`, () => {
 		const { registry } = setup();
 		const streams: TestListenStream[] = [];
+		const registrations: IDisposable[] = [];
 		for (let i = 0; i < MAX_LISTEN_STREAMS; i++) {
 			const stream = new TestListenStream();
 			streams.push(stream);
-			registry.register(i, { toolsListChanged: true }, stream);
+			registrations.push(registry.register(i, { toolsListChanged: true }, stream));
 		}
 		assert.throws(() => registry.register('one-too-many', { toolsListChanged: true }, new TestListenStream()), (error: unknown) => error instanceof McpGatewayRpcError && error.code === MCP.INTERNAL_ERROR);
 		assert.strictEqual(registry.size, MAX_LISTEN_STREAMS);
-		registry.close(0);
+		registrations[0].dispose();
 		const late = new TestListenStream();
 		registry.register('late', { toolsListChanged: true }, late);
 		assert.strictEqual(late.methods[0], 'notifications/subscriptions/acknowledged');

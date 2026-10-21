@@ -24,8 +24,43 @@ export interface IMcpGatewayServerDescriptor {
 export interface IMcpGatewayServerInfo {
 	readonly label: string;
 	readonly address: URI;
-	/** The gRPC listener address (`grpc://127.0.0.1:<port>`) when the gateway opened one. */
+	/**
+	 * The gRPC endpoint of the same server, only for a gateway created with
+	 * `{ grpc: true }` ({@link IMcpGatewayCreateOptions.grpc}) whose gRPC
+	 * listener could open: `grpc://127.0.0.1:<port>/<routeId>`. A client
+	 * connects to the authority (cleartext HTTP/2, loopback only) and calls
+	 * the JSON-RPC tunnel `mcp.zig.transport.v1.Mcp/Call` or the typed
+	 * service `model_context_protocol.Mcp`; every call must carry the route
+	 * id (the path without its leading slash) as the `mcp-gateway-route`
+	 * metadata, else it ends with NOT_FOUND. The route id is the same as in
+	 * the HTTP `address`, and as there it is what keeps other local
+	 * processes out.
+	 */
 	readonly grpcAddress?: URI;
+}
+
+/** Options of {@link IMcpGatewayService.createGateway}. */
+export interface IMcpGatewayCreateOptions {
+	/**
+	 * Also serve the gateway's servers over gRPC (loopback, cleartext h2c;
+	 * the JSON-RPC tunnel and the typed binding): they then carry a
+	 * `grpcAddress`. The gRPC listener opens for the first route that asks
+	 * for it and closes after the last one; without this option (the
+	 * default) a gateway is served over HTTP only and opens no gRPC port.
+	 * When the listener cannot open, the gateway is still created, served
+	 * over HTTP only (no `grpcAddress`; the reason is logged), and a later
+	 * request tries again. A gateway service that is not configured for gRPC
+	 * ignores it.
+	 */
+	readonly grpc?: boolean;
+}
+
+/** The argument of the `createGateway` call of the {@link McpGatewayChannelName} channel. */
+export interface IMcpGatewayCreateArgs {
+	/** The chat session the gateway's tool calls belong to (a URI string). */
+	readonly chatSessionResource?: string;
+	/** {@link IMcpGatewayCreateOptions.grpc} */
+	readonly grpc?: boolean;
 }
 
 /** What the gateway advertises for a server; derived from the invoker when it does not say. */
@@ -140,7 +175,7 @@ export interface IMcpGatewayService {
 
 	disposeGatewaysForClient<TContext>(context: TContext): void;
 
-	createGateway<TContext>(context: TContext, toolInvoker?: IMcpGatewayToolInvoker): Promise<IMcpGatewayInfo>;
+	createGateway<TContext>(context: TContext, toolInvoker?: IMcpGatewayToolInvoker, options?: IMcpGatewayCreateOptions): Promise<IMcpGatewayInfo>;
 
 	disposeGateway(gatewayId: string): Promise<void>;
 }

@@ -13,11 +13,12 @@ import { Disposable, IDisposable, toDisposable } from '../../../base/common/life
 import { generateUuid } from '../../../base/common/uuid.js';
 import { ILogger } from '../../log/common/log.js';
 import { IMcpGatewaySingleServerInvoker } from '../common/mcpGateway.js';
-import { applyModernEnvelope, classifyEra, clientInfoFromMeta, errorResponse, httpStatusForRpcError, IMcpGatewayErrorResponse, IModernRequestMeta, LEGACY_TRANSPORT_ERROR, McpGatewayRpcError, validateLegacyProtocolVersionHeader, validateSubscriptionFilter } from '../common/mcpGatewayProtocol.js';
+import { applyModernEnvelope, cancellationTargets, classifyEra, clientInfoFromMeta, errorResponse, httpStatusForRpcError, IMcpGatewayCancellable, IMcpGatewayErrorResponse, IMcpGatewayMessageSender, IModernRequestMeta, LEGACY_TRANSPORT_ERROR, McpGatewayRpcError, validateLegacyProtocolVersionHeader, validateSubscriptionFilter } from '../common/mcpGatewayProtocol.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { IMcpGatewayDispatchContext, IMcpGatewayDispatcherOptions, IMcpGatewayNotification, McpGatewayDispatcher } from './mcpGatewayDispatcher.js';
 import { IMcpGatewaySseConnection, McpGatewayStreamKind } from './mcpGatewayEventLog.js';
 import { IMcpGatewayListenStream, McpGatewayListenRegistry } from './mcpGatewayListenRegistry.js';
+import { mcpGatewayClientKey } from './mcpGatewayRateLimit.js';
 import { McpGatewaySealedState } from './mcpGatewaySealedState.js';
 import { containsRequest, IMcpGatewayLegacyStreamOptions, IMcpGatewayMessageSink, IMcpGatewaySessionStream, isInitializeMessage, McpGatewaySession, notificationMessage } from './mcpGatewaySession.js';
 
@@ -34,6 +35,36 @@ export const MCP_SESSION_ID_HEADER = 'mcp-session-id';
 export const LEGACY_NOT_INITIALIZED = LEGACY_TRANSPORT_ERROR;
 /** The 2025-11-25 "session not found" code. */
 export const LEGACY_SESSION_NOT_FOUND = -32001;
+
+/**
+ * The most 2025-11-25 sessions one route keeps. Each `initialize` opens one,
+ * which lives until DELETE or its idle timeout, so a client that never
+ * closes its sessions (or a loop that opens them) would otherwise grow the
+ * gateway's memory without bound. At the limit, a new session replaces the
+ * idle session that was active least recently (its client gets 404 and
+ * initializes again, as the transport prescribes); when no session is idle,
+ * the `initialize` is refused with 503.
+ */
+export const MAX_LEGACY_SESSIONS = 256;
+
+/**
+ * The most bytes one SSE response keeps queued for a client that does not
+ * read them (2026-07-28 listen and request streams, 2025-11-25 GET and POST
+ * streams), as the gRPC listener's `maxBufferedSendBytes`. An event that
+ * would queue more drops the connection: ending the response would only
+ * queue behind the data. The client sees its stream end without a
+ * response; a 2026-07-28 request is cancelled, a legacy stream goes on in
+ * the session's replay log for a `Last-Event-ID` resume.
+ */
+export const MAX_BUFFERED_SSE_BYTES = 16 * 1024 * 1024;
+
+/** The options of a route: its dispatcher's, and the route's own limits (tests set small ones). */
+export interface IMcpGatewayRouteOptions extends IMcpGatewayDispatcherOptions {
+	/** Overrides {@link MAX_LEGACY_SESSIONS}. */
+	readonly maxLegacySessions?: number;
+	/** Overrides {@link MAX_BUFFERED_SSE_BYTES}. */
+	readonly maxBufferedSseBytes?: number;
+}
 
 const SSE_HEADERS: Readonly<Record<string, string>> = {
 	'Content-Type': 'text/event-stream',
@@ -71,22 +102,38 @@ export function lowercaseRequestHeaders(headers: http.IncomingHttpHeaders): Reco
 	return out;
 }
 
+type McpGatewaySocket = { readonly remoteAddress?: string; readonly remoteFamily?: string } | undefined;
+
 /**
  * Who sent a 2026-07-28 message, for `notifications/cancelled`. Stateless
  * clients have no session, and on HTTP/1.1 a cancellation arrives on another
  * connection than the request it cancels, so the socket cannot be the key
- * either. The rule: a cancellation reaches only the requests and listen
- * streams that came from the same remote address (and address family) with
- * the same `_meta` client info (name and version, or none on both). Two
- * processes on one machine that identify themselves identically count as
- * one client.
+ * either. The rule: a cancellation with client info reaches only the
+ * requests and listen streams that came from the same remote address (and
+ * address family) with the same `_meta` client info (name and version); one
+ * without client info reaches those of the only client of its address that
+ * has that request id, a client without client info included, and nothing
+ * when several have it ({@link cancellationTargets}). Two processes on
+ * one machine that identify themselves identically count as one client. The
+ * key is also the client's rate-limit identity; it is a fixed-size hash
+ * ({@link mcpGatewayClientKey}), whatever the client info claims.
  */
-export function modernClientKey(socket: { readonly remoteAddress?: string; readonly remoteFamily?: string } | undefined, clientInfo: MCP.Implementation | undefined): string {
-	return JSON.stringify([socket?.remoteFamily ?? '', socket?.remoteAddress ?? '', clientInfo?.name ?? null, clientInfo?.version ?? null]);
+export function modernClientKey(socket: McpGatewaySocket, clientInfo: MCP.Implementation | undefined): string {
+	return mcpGatewayClientKey(['http', socket?.remoteFamily ?? '', socket?.remoteAddress ?? '', clientInfo?.name ?? null, clientInfo?.version ?? null]);
+}
+
+/** The address part of {@link modernClientKey}: the remote address and family alone, whatever client info a message carries. */
+export function modernPeerKey(socket: McpGatewaySocket): string {
+	return mcpGatewayClientKey(['http', socket?.remoteFamily ?? '', socket?.remoteAddress ?? '']);
+}
+
+/** The sender of a 2026-07-28 message ({@link modernClientKey}, {@link modernPeerKey}). */
+export function modernSender(socket: McpGatewaySocket, clientInfo: MCP.Implementation | undefined): IMcpGatewayMessageSender {
+	return { key: modernClientKey(socket, clientInfo), peer: modernPeerKey(socket), named: clientInfo !== undefined };
 }
 
 /** The part of `http.ServerResponse` the writer uses (tests substitute a fake). */
-export type McpGatewayHttpResponse = Pick<http.ServerResponse, 'writeHead' | 'write' | 'end' | 'on' | 'off' | 'flushHeaders' | 'headersSent' | 'destroyed' | 'writableEnded'>;
+export type McpGatewayHttpResponse = Pick<http.ServerResponse, 'writeHead' | 'write' | 'end' | 'destroy' | 'on' | 'off' | 'flushHeaders' | 'headersSent' | 'destroyed' | 'writableEnded' | 'writableLength'>;
 
 export interface IMcpGatewayResponseWriterOptions {
 	/** Extra response headers (for instance `Mcp-Session-Id`). */
@@ -97,6 +144,8 @@ export interface IMcpGatewayResponseWriterOptions {
 	 * a comment (older revisions), and can carry server→client requests.
 	 */
 	readonly legacy?: IMcpGatewayLegacyStreamOptions;
+	/** Overrides {@link MAX_BUFFERED_SSE_BYTES}. */
+	readonly maxBufferedBytes?: number;
 }
 
 /** What a GET with `Last-Event-ID` resumed: a POST's response stream, a GET stream, nothing (unknown id) or nothing because another response carries it. */
@@ -129,7 +178,9 @@ const enum WriterState {
  * {@link onDidClose} fires exactly once when the HTTP response is over,
  * whoever ended it; {@link onDidAbort} fires (first) when the client went
  * away before the server finished. The writer disposes itself then, unless
- * it was detached for polling (its request still writes to the stream).
+ * it was detached (its request still writes to the stream): for polling, or
+ * because a legacy client left a POST's stream, which the 2025-11-25
+ * transport says is not a cancellation (no {@link onDidAbort} then).
  */
 export class McpGatewayResponseWriter extends Disposable implements IMcpGatewayMessageSink, IMcpGatewaySessionStream, IMcpGatewaySseConnection {
 	private readonly _onDidAbort = this._register(new Emitter<void>());
@@ -146,6 +197,7 @@ export class McpGatewayResponseWriter extends Disposable implements IMcpGatewayM
 	private _kind: McpGatewayStreamKind | undefined;
 	/** Whether this writer started its stream (and so completes a request stream). */
 	private _owner = false;
+	private readonly _maxBufferedBytes: number;
 
 	constructor(
 		private readonly _res: McpGatewayHttpResponse,
@@ -153,6 +205,8 @@ export class McpGatewayResponseWriter extends Disposable implements IMcpGatewayM
 		private readonly _options: IMcpGatewayResponseWriterOptions = {},
 	) {
 		super();
+		const limit = _options.maxBufferedBytes;
+		this._maxBufferedBytes = typeof limit === 'number' && limit > 0 ? limit : MAX_BUFFERED_SSE_BYTES;
 		this._kind = _options.legacy?.kind;
 		const onClose = () => this._handleClose();
 		_res.on('close', onClose);
@@ -186,10 +240,10 @@ export class McpGatewayResponseWriter extends Disposable implements IMcpGatewayM
 			this._streamId = legacy.log.open(legacy.kind, this);
 			if (legacy.priming()) {
 				// SEP-1699 priming event: an id for `Last-Event-ID` and the reconnection delay.
-				this._res.write(`id: ${legacy.log.cursor(this._streamId)}\nretry: ${LEGACY_SSE_RETRY_MS}\ndata: \n\n`);
+				this._send(`id: ${legacy.log.cursor(this._streamId)}\nretry: ${LEGACY_SSE_RETRY_MS}\ndata: \n\n`);
 			} else {
 				// Clients before 2025-11-25 cannot take an event with empty data.
-				this._res.write(': connected\n\n');
+				this._send(': connected\n\n');
 			}
 		}
 	}
@@ -279,8 +333,7 @@ export class McpGatewayResponseWriter extends Disposable implements IMcpGatewayM
 		this._state = WriterState.Detached;
 		this._keepAlive.cancel();
 		legacy.log.disconnect(this._streamId, this);
-		if (!this._res.destroyed && !this._res.writableEnded) {
-			this._res.write(`retry: ${LEGACY_SSE_RETRY_MS}\n\n`);
+		if (this._send(`retry: ${LEGACY_SSE_RETRY_MS}\n\n`)) {
 			this._res.end();
 		}
 		return true;
@@ -332,8 +385,8 @@ export class McpGatewayResponseWriter extends Disposable implements IMcpGatewayM
 
 	/** {@link IMcpGatewaySseConnection}: writes one logged event on this response. */
 	writeEvent(id: string, data: string): void {
-		if (this._state === WriterState.Streaming && !this._res.destroyed && !this._res.writableEnded) {
-			this._res.write(`id: ${id}\nevent: message\ndata: ${data}\n\n`);
+		if (this._state === WriterState.Streaming) {
+			this._send(`id: ${id}\nevent: message\ndata: ${data}\n\n`);
 		}
 	}
 
@@ -355,9 +408,29 @@ export class McpGatewayResponseWriter extends Disposable implements IMcpGatewayM
 		this._res.flushHeaders();
 		this._keepAlive.cancelAndSet(() => {
 			if (this._state === WriterState.Streaming && this.isOpen) {
-				this._res.write(': keepalive\n\n');
+				this._send(': keepalive\n\n');
 			}
 		}, SSE_KEEPALIVE_MS);
+	}
+
+	/**
+	 * Writes on the response, unless the client stopped reading it: when the
+	 * chunk would queue more than {@link MAX_BUFFERED_SSE_BYTES} the
+	 * connection is dropped instead (its `close` then ends the writer as a
+	 * client that went away). Returns whether the chunk was written.
+	 */
+	private _send(chunk: string): boolean {
+		if (this._res.destroyed || this._res.writableEnded) {
+			return false;
+		}
+		const queued = this._res.writableLength;
+		if (queued > 0 && queued + Buffer.byteLength(chunk, 'utf8') > this._maxBufferedBytes) {
+			this._logger.warn(`[McpGateway] The client does not read its event stream${this._streamId === undefined ? '' : ` ${this._streamId}`} (${queued} bytes queued, limit ${this._maxBufferedBytes} bytes): closing the connection`);
+			this._res.destroy();
+			return false;
+		}
+		this._res.write(chunk);
+		return true;
 	}
 
 	private _write(message: object): void {
@@ -369,8 +442,8 @@ export class McpGatewayResponseWriter extends Disposable implements IMcpGatewayM
 			}
 			return;
 		}
-		if (this._state === WriterState.Streaming && !this._res.destroyed && !this._res.writableEnded) {
-			this._res.write(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
+		if (this._state === WriterState.Streaming) {
+			this._send(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
 		}
 	}
 
@@ -384,9 +457,19 @@ export class McpGatewayResponseWriter extends Disposable implements IMcpGatewayM
 		if (legacy && this._streamId !== undefined) {
 			legacy.log.disconnect(this._streamId, this);
 		}
+		if (legacy && this._state === WriterState.Streaming && this._owner && this._kind === 'request') {
+			// 2025-11-25 and earlier: a client that drops a POST's stream has not cancelled
+			// its requests (it sends notifications/cancelled for that); it resumes with GET and
+			// Last-Event-ID. The stream goes on in the session's log, as after closeForPolling.
+			this._state = WriterState.Detached;
+			this._logger.debug(`[McpGateway] The client left request stream ${this._streamId}: its requests keep running, their messages are kept for a resume`);
+			this._onDidClose.fire();
+			return;
+		}
 		const aborted = this._state === WriterState.Pending || this._state === WriterState.Streaming;
 		if (aborted) {
-			// The client went away. The route cancels the request(s), so a request stream is complete too.
+			// The client went away. 2026-07-28: the route cancels the request; that is the
+			// cancellation signal. Legacy: nothing streamed, so there is nothing to resume.
 			this.end();
 			this._onDidAbort.fire();
 		}
@@ -423,10 +506,18 @@ export class McpGatewayResponseWriter extends Disposable implements IMcpGatewayM
 	}
 }
 
-interface IInflightRequest {
+interface IInflightRequest extends IMcpGatewayCancellable {
 	readonly cts: CancellationTokenSource;
 	/** The {@link modernClientKey} of the client that sent the request. */
 	readonly owner: string;
+	/** The {@link modernPeerKey} of the client that sent the request. */
+	readonly peer: string;
+}
+
+/** A listen stream or a request in flight that a `notifications/cancelled` may reach. */
+interface ICancellationCandidate extends IMcpGatewayCancellable {
+	readonly kind: 'listen stream' | 'request';
+	cancel(): void;
 }
 
 /**
@@ -448,6 +539,9 @@ export class McpGatewayRoute extends Disposable {
 	private readonly _onDidCloseResponse = this._register(new Emitter<void>());
 	/** Fires after an HTTP response of this route is over (diagnostics and tests). */
 	readonly onDidCloseResponse: Event<void> = this._onDidCloseResponse.event;
+	private readonly _maxLegacySessions: number;
+	/** The {@link IMcpGatewayResponseWriterOptions.maxBufferedBytes} of the route's SSE responses (undefined: the default). */
+	private readonly _maxBufferedSseBytes: number | undefined;
 
 	constructor(
 		public readonly routeId: string,
@@ -455,10 +549,13 @@ export class McpGatewayRoute extends Disposable {
 		private readonly _invoker: IMcpGatewaySingleServerInvoker,
 		sealedState: McpGatewaySealedState,
 		public label: string = '',
-		dispatcherOptions?: IMcpGatewayDispatcherOptions,
+		options?: IMcpGatewayRouteOptions,
 	) {
 		super();
-		this._dispatcher = this._register(new McpGatewayDispatcher(routeId, _logger, _invoker, sealedState, dispatcherOptions));
+		const limit = options?.maxLegacySessions;
+		this._maxLegacySessions = typeof limit === 'number' && Number.isInteger(limit) && limit > 0 ? limit : MAX_LEGACY_SESSIONS;
+		this._maxBufferedSseBytes = options?.maxBufferedSseBytes;
+		this._dispatcher = this._register(new McpGatewayDispatcher(routeId, _logger, _invoker, sealedState, options));
 		this._listen = this._register(new McpGatewayListenRegistry(this._dispatcher, _invoker, _logger));
 	}
 
@@ -586,6 +683,7 @@ export class McpGatewayRoute extends Disposable {
 		const writer = this._track(new McpGatewayResponseWriter(res, this._logger, {
 			headers: { 'Mcp-Session-Id': session.id },
 			legacy: session.streamOptions('standalone'),
+			maxBufferedBytes: this._maxBufferedSseBytes,
 		}));
 		const lastEventId = headers['last-event-id']?.trim();
 		if (lastEventId) {
@@ -652,7 +750,7 @@ export class McpGatewayRoute extends Disposable {
 	}
 
 	private async _handleModernPost(req: http.IncomingMessage, headers: Readonly<Record<string, string>>, message: unknown, res: http.ServerResponse): Promise<void> {
-		const writer = this._track(new McpGatewayResponseWriter(res, this._logger));
+		const writer = this._track(new McpGatewayResponseWriter(res, this._logger, { maxBufferedBytes: this._maxBufferedSseBytes }));
 		// Closing the response stream is the 2026-07-28 cancellation signal, also while the request is validated.
 		const cts = new CancellationTokenSource();
 		const abortListener = writer.onDidAbort(() => cts.cancel());
@@ -667,7 +765,7 @@ export class McpGatewayRoute extends Disposable {
 				return;
 			}
 			if (isNotification(message)) {
-				this._handleModernNotification(message, modernClientKey(req.socket, clientInfoFromMeta(message)));
+				this._handleModernNotification(message, modernSender(req.socket, clientInfoFromMeta(message)));
 				writer.accept();
 				return;
 			}
@@ -686,13 +784,13 @@ export class McpGatewayRoute extends Disposable {
 				writer.respondError(httpStatusForRpcError('modern', error.code), errorResponse(message.id, error.code, error.message, error.data));
 				return;
 			}
-			const owner = modernClientKey(req.socket, prepared.meta.clientInfo);
+			const sender = modernSender(req.socket, prepared.meta.clientInfo);
 			const params = isObject(message.params) ? message.params : {};
 			if (message.method === 'subscriptions/listen') {
-				keepOpen = this._openListenStream(message, params, writer, owner);
+				keepOpen = this._openListenStream(message, params, writer, sender);
 				return;
 			}
-			await this._dispatchModern(message, params, headers, prepared.meta, writer, cts, owner);
+			await this._dispatchModern(message, params, headers, prepared.meta, writer, cts, sender);
 		} catch (error) {
 			this._logger.error(`[McpGateway][route ${this.routeId}] Failed handling a request`, error);
 			if (writer.isOpen && !writer.isStreaming) {
@@ -707,8 +805,8 @@ export class McpGatewayRoute extends Disposable {
 		}
 	}
 
-	private async _dispatchModern(request: IJsonRpcRequest, params: Record<string, unknown>, headers: Readonly<Record<string, string>>, meta: IModernRequestMeta, writer: McpGatewayResponseWriter, cts: CancellationTokenSource, owner: string): Promise<void> {
-		const untrackInflight = this._trackInflight(request.id, { cts, owner });
+	private async _dispatchModern(request: IJsonRpcRequest, params: Record<string, unknown>, headers: Readonly<Record<string, string>>, meta: IModernRequestMeta, writer: McpGatewayResponseWriter, cts: CancellationTokenSource, sender: IMcpGatewayMessageSender): Promise<void> {
+		const untrackInflight = this._trackInflight(request.id, { cts, owner: sender.key, peer: sender.peer });
 		try {
 			const context: IMcpGatewayDispatchContext = {
 				era: 'modern',
@@ -725,6 +823,8 @@ export class McpGatewayRoute extends Disposable {
 						writer.notify(notification);
 					}
 				},
+				// The rate limits count a stateless client as its cancellations do.
+				clientKey: sender.key,
 			};
 			const result = await this._dispatcher.dispatch(context, request.method, params);
 			if (cts.token.isCancellationRequested) {
@@ -764,8 +864,18 @@ export class McpGatewayRoute extends Disposable {
 		});
 	}
 
-	/** A 2026-07-28 `notifications/cancelled`: it reaches only the listen streams and requests of the client that sent it ({@link modernClientKey}). */
-	private _handleModernNotification(notification: { readonly method: string; readonly params?: unknown }, owner: string): void {
+	/**
+	 * A 2026-07-28 `notifications/cancelled`: it reaches only the listen
+	 * streams and requests of the client that sent it ({@link modernClientKey};
+	 * without client info, the only client of its address with that id, see
+	 * {@link cancellationTargets}). The rule applies to the listen streams and
+	 * the requests in flight together: a nameless cancellation of an id that
+	 * two clients of the address use, one for a listen stream and the other
+	 * for a request, is ambiguous and cancels nothing. A cancelled listen
+	 * stream ends without a `subscriptions/listen` result, as any cancelled
+	 * request does.
+	 */
+	private _handleModernNotification(notification: { readonly method: string; readonly params?: unknown }, sender: IMcpGatewayMessageSender): void {
 		this._logger.debug(`[McpGateway][route ${this.routeId}] <-- notification: ${notification.method}`);
 		if (notification.method !== 'notifications/cancelled') {
 			return;
@@ -774,26 +884,23 @@ export class McpGatewayRoute extends Disposable {
 		if (typeof requestId !== 'string' && typeof requestId !== 'number') {
 			return;
 		}
-		if (this._listen.close(requestId, owner)) {
-			this._logger.info(`[McpGateway][route ${this.routeId}] Listen stream ${String(requestId)} cancelled by the client`);
-			return;
+		const candidates: ICancellationCandidate[] = [
+			...this._listen.cancellables(requestId).map((stream): ICancellationCandidate => ({ owner: stream.owner, peer: stream.peer, kind: 'listen stream', cancel: () => stream.cancel() })),
+			...[...this._inflight.get(requestId) ?? []].map((request): ICancellationCandidate => ({ owner: request.owner, peer: request.peer, kind: 'request', cancel: () => request.cts.cancel() })),
+		];
+		const targets = cancellationTargets(candidates, sender);
+		for (const target of targets) {
+			target.cancel();
+			this._logger.info(`[McpGateway][route ${this.routeId}] ${target.kind === 'request' ? 'Request' : 'Listen stream'} ${String(requestId)} cancelled by the client`);
 		}
-		let cancelled = 0;
-		for (const request of this._inflight.get(requestId) ?? []) {
-			if (request.owner === owner) {
-				request.cts.cancel();
-				cancelled++;
-			}
-		}
-		if (cancelled > 0) {
-			this._logger.info(`[McpGateway][route ${this.routeId}] Request ${String(requestId)} cancelled by the client`);
-		} else {
-			this._logger.debug(`[McpGateway][route ${this.routeId}] Ignored the cancellation of ${String(requestId)}: no request or listen stream of this client has that id`);
+		if (targets.length === 0) {
+			const ambiguous = !sender.named && new Set(candidates.filter(candidate => candidate.peer === sender.peer).map(candidate => candidate.owner)).size > 1;
+			this._logger.debug(`[McpGateway][route ${this.routeId}] Ignored the cancellation of ${String(requestId)}: ${ambiguous ? 'it names no client, and several clients of its address use that id' : 'no request or listen stream of this client has that id'}`);
 		}
 	}
 
 	/** Opens a `subscriptions/listen` stream; returns whether the response stays open. */
-	private _openListenStream(request: IJsonRpcRequest, params: Record<string, unknown>, writer: McpGatewayResponseWriter, owner: string): boolean {
+	private _openListenStream(request: IJsonRpcRequest, params: Record<string, unknown>, writer: McpGatewayResponseWriter, sender: IMcpGatewayMessageSender): boolean {
 		const filterError = validateSubscriptionFilter(params.notifications);
 		if (filterError) {
 			writer.respondError(httpStatusForRpcError('modern', filterError.code), errorResponse(request.id, filterError.code, filterError.message));
@@ -802,10 +909,12 @@ export class McpGatewayRoute extends Disposable {
 		const stream: IMcpGatewayListenStream = {
 			notify: notification => writer.notify(notification),
 			complete: result => writer.respond({ jsonrpc: '2.0', id: request.id, result: applyModernEnvelope('subscriptions/listen', result, this._dispatcher.serverInfo) }),
+			// The client cancelled the listen request: the stream ends without a response.
+			cancel: () => writer.end(),
 		};
 		let registration: IDisposable;
 		try {
-			registration = this._listen.register(request.id, params.notifications as MCP.SubscriptionFilter, stream, owner);
+			registration = this._listen.register(request.id, params.notifications as MCP.SubscriptionFilter, stream, sender.key, sender.peer);
 		} catch (error) {
 			const rpcError = error instanceof McpGatewayRpcError ? error : new McpGatewayRpcError(MCP.INTERNAL_ERROR, String(error));
 			writer.respondError(httpStatusForRpcError('modern', rpcError.code), errorResponse(request.id, rpcError.code, rpcError.message, rpcError.data));
@@ -836,9 +945,13 @@ export class McpGatewayRoute extends Disposable {
 			}
 		} else if (isInitializeMessage(message)) {
 			session = this._createSession();
+			if (!session) {
+				this._respondJson(res, 503, errorResponse(null, LEGACY_TRANSPORT_ERROR, `Service unavailable: the server has ${this._sessions.size} active sessions, the most it keeps; retry later`), { 'Retry-After': '1' });
+				return;
+			}
 		} else if (isNotification(message)) {
 			// A notification without a session has nothing to act on (a stateless client's cancellation, at most).
-			this._handleModernNotification(message, modernClientKey(req.socket, clientInfoFromMeta(message)));
+			this._handleModernNotification(message, modernSender(req.socket, clientInfoFromMeta(message)));
 			res.writeHead(202);
 			res.end();
 			return;
@@ -847,14 +960,17 @@ export class McpGatewayRoute extends Disposable {
 			return;
 		}
 
-		const cts = new CancellationTokenSource();
+		// No cancellation when the client goes away: 2025-11-25 says a disconnection SHOULD NOT
+		// be read as cancelling (the client sends notifications/cancelled, or resumes with GET
+		// and Last-Event-ID). A dropped stream detaches and keeps logging; a dropped JSON
+		// response just loses its answer. The session's end cancels what still runs.
 		const writer = this._track(new McpGatewayResponseWriter(res, this._logger, {
 			headers: { 'Mcp-Session-Id': session.id },
-			legacy: session.streamOptions('request', cts.token),
+			legacy: session.streamOptions('request'),
+			maxBufferedBytes: this._maxBufferedSseBytes,
 		}));
-		const abortListener = writer.onDidAbort(() => cts.cancel());
 		try {
-			const responses = await session.handleIncoming(message as JsonRpcMessage | JsonRpcMessage[], writer, headers, cts.token);
+			const responses = await session.handleIncoming(message as JsonRpcMessage | JsonRpcMessage[], writer, headers);
 			if (responses.length > 0) {
 				writer.respond(Array.isArray(message) ? responses : responses[0]);
 			} else if (containsRequest(message)) {
@@ -867,13 +983,16 @@ export class McpGatewayRoute extends Disposable {
 			this._logger.error(`[McpGateway][route ${this.routeId}] Failed handling a session request`, error);
 			writer.respondError(500, errorResponse(null, MCP.INTERNAL_ERROR, 'Internal server error'));
 		} finally {
-			abortListener.dispose();
-			cts.dispose();
 			writer.dispose();
 		}
 	}
 
-	private _createSession(): McpGatewaySession {
+	/** A new session, or undefined when the route is at its session limit and no session is idle ({@link MAX_LEGACY_SESSIONS}). */
+	private _createSession(): McpGatewaySession | undefined {
+		if (this._sessions.size >= this._maxLegacySessions && !this._closeLeastRecentlyActiveIdleSession()) {
+			this._logger.warn(`[McpGateway][route ${this.routeId}] Refused a new session: all ${this._sessions.size} sessions are active (limit ${this._maxLegacySessions})`);
+			return undefined;
+		}
 		const sessionId = generateUuid();
 		this._logger.info(`[McpGateway][route ${this.routeId}] Creating session ${sessionId}`);
 		const session = new McpGatewaySession(sessionId, this._logger, this._dispatcher, this._invoker, () => {
@@ -881,6 +1000,23 @@ export class McpGatewayRoute extends Disposable {
 		});
 		this._sessions.set(sessionId, session);
 		return session;
+	}
+
+	/** Disposes the idle session that was active least recently; false when no session is idle. */
+	private _closeLeastRecentlyActiveIdleSession(): boolean {
+		let oldest: McpGatewaySession | undefined;
+		for (const session of this._sessions.values()) {
+			if (session.isIdle && (!oldest || session.lastActiveAt < oldest.lastActiveAt)) {
+				oldest = session;
+			}
+		}
+		if (!oldest) {
+			return false;
+		}
+		this._logger.info(`[McpGateway][route ${this.routeId}] Closing idle session ${oldest.id} for a new one: the route keeps at most ${this._maxLegacySessions} sessions`);
+		oldest.dispose();
+		this._sessions.delete(oldest.id);
+		return true;
 	}
 
 	/** Reads the whole body; undefined when it exceeds {@link MAX_BODY_BYTES} (the rest is drained, not kept). */

@@ -4,12 +4,16 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { timeout } from '../../../../base/common/async.js';
+import { readFileSync } from 'fs';
+import { DeferredPromise, timeout } from '../../../../base/common/async.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { CancellationError } from '../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { IJsonRpcErrorResponse, IJsonRpcSuccessResponse, JsonRpcId } from '../../../../base/common/jsonRpcProtocol.js';
+import { compileJsonSchema, isCompiledJsonSchema } from '../../../../base/common/jsonSchemaValidator/index.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
+import { FileAccess } from '../../../../base/common/network.js';
+import { join } from '../../../../base/common/path.js';
 import { runWithFakedTimers } from '../../../../base/test/common/timeTravelScheduler.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
@@ -19,7 +23,14 @@ import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { CONFORMANCE_HIDDEN_TOOL, CONFORMANCE_INSTRUCTIONS, CONFORMANCE_SERVER_INFO, McpGatewayConformanceInvoker } from '../../node/mcpGatewayConformanceInvoker.js';
 import { IMcpGatewayNotification, McpGatewayDispatcher } from '../../node/mcpGatewayDispatcher.js';
 import { McpGatewaySealedState } from '../../node/mcpGatewaySealedState.js';
-import { containsRequest, IMcpGatewayRequestBroker, IMcpGatewaySessionStream, isInitializeMessage, LEGACY_SESSION_IDLE_TIMEOUT_MS, McpGatewaySession } from '../../node/mcpGatewaySession.js';
+import { containsRequest, IMcpGatewayRequestBroker, IMcpGatewaySessionStream, isInitializeMessage, LEGACY_SESSION_IDLE_TIMEOUT_MS, MAX_LEGACY_RESOURCE_SUBSCRIPTIONS, MAX_LEGACY_SUBSCRIPTION_URI_LENGTH, McpGatewaySession } from '../../node/mcpGatewaySession.js';
+
+/** Whether `value` is valid against `#/$defs/<typeName>` of a schema document. */
+function compileAndValidate(schema: { readonly $schema: string; readonly $defs: Record<string, unknown> }, typeName: string, value: unknown): boolean {
+	const compiled = compileJsonSchema({ $schema: schema.$schema, $defs: schema.$defs, $ref: `#/$defs/${typeName}` });
+	assert.ok(isCompiledJsonSchema(compiled));
+	return compiled.validate(value).valid;
+}
 
 /** A session stream that records what it carries; server requests get their ids from the session. */
 class TestStream extends Disposable implements IMcpGatewaySessionStream {
@@ -150,6 +161,47 @@ suite('MCP - GatewaySession', () => {
 		assert.strictEqual(session.protocolVersion, '2025-11-25');
 		assert.deepStrictEqual(session.clientCapabilities, { sampling: {} });
 		assert.strictEqual(session.isInitialized, false, 'initialized only after notifications/initialized');
+	});
+
+	test('the answers to a 2025-11-25 session validate against the 2025-11-25 schema: initialize (with and without instructions, with a title), ping, tools/list', async () => {
+		const fixtureRoot = FileAccess.asFileUri('vs/platform/mcp/test/node/fixtures/mcp-schema-2025-11-25').fsPath;
+		const schema = JSON.parse(readFileSync(join(fixtureRoot, 'schema.json'), 'utf8')) as { $schema: string; $defs: Record<string, unknown> };
+		const validatorOf = (typeName: string) => {
+			assert.ok(schema.$defs[typeName], `the schema defines ${typeName}`);
+			const compiled = compileJsonSchema({ $schema: schema.$schema, $defs: schema.$defs, $ref: `#/$defs/${typeName}` });
+			assert.ok(isCompiledJsonSchema(compiled), `${typeName} compiles: ${JSON.stringify(compiled)}`);
+			return (value: unknown, what: string) => {
+				const result = compiled.validate(value);
+				assert.ok(result.valid, `${what} is a valid ${typeName}: ${result.errors.map(e => `${e.instancePath} ${e.keyword}: ${e.message}`).join('; ')}`);
+			};
+		};
+		const initializeResult = validatorOf('InitializeResult');
+		const resultResponse = validatorOf('JSONRPCResultResponse');
+
+		const { session } = setup();
+		const responses = await session.handleIncoming({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: { sampling: {} }, clientInfo: { name: 'test-client', version: '1.0.0' } } });
+		resultResponse(responses[0], 'the initialize response');
+		initializeResult(resultOf(responses), 'the result with instructions');
+
+		// Without instructions, and with a server title.
+		const bare: IMcpGatewaySingleServerInvoker = { onDidChangeTools: Event.None, onDidChangeResources: Event.None, listTools: async () => [], callTool: async () => ({ content: [] }), listResources: async () => [], readResource: async () => ({ contents: [] }), listResourceTemplates: async () => [] };
+		const dispatcher = store.add(new McpGatewayDispatcher('route-2', logger, bare, new McpGatewaySealedState(), { serverInfo: { name: 'titled', title: 'Titled Server', version: '2.0.0' } }));
+		const titled = store.add(new McpGatewaySession('session-2', logger, dispatcher, bare, () => { }));
+		const titledResult = resultOf(await titled.handleIncoming({ jsonrpc: '2.0', id: 'init', method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {} } }));
+		assert.deepStrictEqual([titledResult.instructions, (titledResult.serverInfo as MCP.Implementation).title], [undefined, 'Titled Server']);
+		initializeResult(titledResult, 'the result without instructions');
+
+		await session.handleIncoming({ jsonrpc: '2.0', method: 'notifications/initialized' });
+		const ping = await session.handleIncoming({ jsonrpc: '2.0', id: 2, method: 'ping' });
+		resultResponse(ping[0], 'the ping response');
+		validatorOf('EmptyResult')(resultOf(ping), 'the ping result');
+		const tools = await session.handleIncoming({ jsonrpc: '2.0', id: 3, method: 'tools/list' });
+		resultResponse(tools[0], 'the tools/list response');
+		validatorOf('ListToolsResult')(resultOf(tools), 'the tools/list result');
+
+		// Negative control: the schema is strict enough to catch a broken result.
+		assert.strictEqual(compileAndValidate(schema, 'InitializeResult', { protocolVersion: '2025-11-25', capabilities: {} }), false, 'serverInfo is required');
+		assert.strictEqual(compileAndValidate(schema, 'InitializeResult', { ...resultOf(responses), serverInfo: { name: 'x' } }), false, 'serverInfo.version is required');
 	});
 
 	test('negotiates each supported legacy version and falls back to the latest otherwise', async () => {
@@ -336,6 +388,151 @@ suite('MCP - GatewaySession', () => {
 		conformance.touchResource('test://watched-resource');
 		assert.strictEqual(stream.notifications.length, 1);
 		assert.strictEqual(errorOf(await session.handleIncoming({ jsonrpc: '2.0', id: 3, method: 'resources/subscribe', params: {} })).code, MCP.INVALID_PARAMS);
+	});
+
+	/** An invoker that records the upstream resource subscriptions it holds open. */
+	function subscribingInvoker() {
+		const open = new Set<string>();
+		const invoker: IMcpGatewaySingleServerInvoker = {
+			onDidChangeTools: Event.None,
+			onDidChangeResources: Event.None,
+			capabilities: { resources: { subscribe: true } },
+			listTools: async () => [],
+			callTool: async () => ({ content: [] }),
+			listResources: async () => [],
+			readResource: async () => ({ contents: [] }),
+			listResourceTemplates: async () => [],
+			subscribeResource: async uri => {
+				open.add(uri);
+				return { dispose: () => open.delete(uri) };
+			},
+		};
+		return { invoker, open };
+	}
+
+	test(`resources/subscribe: a session keeps at most ${MAX_LEGACY_RESOURCE_SUBSCRIPTIONS} subscriptions, also when they are opened concurrently (-32603); a repeated URI is no new one, an unsubscribe makes room`, async () => {
+		const { invoker, open } = subscribingInvoker();
+		const { session } = setup(invoker);
+		await initialize(session);
+		const subscribe = (id: number, uri: string) => session.handleIncoming({ jsonrpc: '2.0', id, method: 'resources/subscribe', params: { uri } });
+
+		// All at once: the subscriptions still being opened count too.
+		const answers = await Promise.all(Array.from({ length: MAX_LEGACY_RESOURCE_SUBSCRIPTIONS + 1 }, (_, i) => subscribe(i, `test://r/${i}`)));
+		const refused = answers.filter(responses => (responses[0] as IJsonRpcErrorResponse).error !== undefined);
+		assert.deepStrictEqual(refused.map(errorOf).map(error => error.code), [MCP.INTERNAL_ERROR]);
+		assert.strictEqual(open.size, MAX_LEGACY_RESOURCE_SUBSCRIPTIONS);
+		assert.ok(!open.has(`test://r/${MAX_LEGACY_RESOURCE_SUBSCRIPTIONS}`), 'the refused subscription never reached the server');
+
+		assert.deepStrictEqual(resultOf(await subscribe(2000, 'test://r/0')), {}, 'a URI the session already watches');
+		assert.strictEqual(errorOf(await subscribe(2001, 'test://another')).code, MCP.INTERNAL_ERROR);
+		resultOf(await session.handleIncoming({ jsonrpc: '2.0', id: 2002, method: 'resources/unsubscribe', params: { uri: 'test://r/0' } }));
+		assert.deepStrictEqual(resultOf(await subscribe(2003, 'test://another')), {});
+		assert.deepStrictEqual([open.size, open.has('test://r/0'), open.has('test://another')], [MAX_LEGACY_RESOURCE_SUBSCRIPTIONS, false, true]);
+	});
+
+	test(`resources/subscribe: the subscribed URIs of a session add up to at most ${MAX_LEGACY_SUBSCRIPTION_URI_LENGTH} characters (-32603)`, async () => {
+		const { invoker, open } = subscribingInvoker();
+		const { session } = setup(invoker);
+		await initialize(session);
+		const subscribe = (id: number, uri: string) => session.handleIncoming({ jsonrpc: '2.0', id, method: 'resources/subscribe', params: { uri } });
+		const prefix = 'test://long/';
+		const first = prefix + 'a'.repeat(MAX_LEGACY_SUBSCRIPTION_URI_LENGTH - 20 - prefix.length);
+		assert.deepStrictEqual(resultOf(await subscribe(1, first)), {});
+		const tooLong = prefix + 'b'.repeat(21 - prefix.length);
+		assert.strictEqual(errorOf(await subscribe(2, tooLong)).code, MCP.INTERNAL_ERROR);
+		const fits = prefix + 'c'.repeat(20 - prefix.length);
+		assert.deepStrictEqual(resultOf(await subscribe(3, fits)), {});
+		assert.deepStrictEqual([...open], [first, fits]);
+	});
+
+	/** An invoker whose upstream subscriptions open only when the test settles them, one call at a time. */
+	function slowSubscribingInvoker() {
+		const open = new Set<string>();
+		const calls: { readonly uri: string; readonly settle: DeferredPromise<void> }[] = [];
+		const onDidCall = store.add(new Emitter<void>());
+		const invoker: IMcpGatewaySingleServerInvoker = {
+			...subscribingInvoker().invoker,
+			subscribeResource: async uri => {
+				const settle = new DeferredPromise<void>();
+				calls.push({ uri, settle });
+				onDidCall.fire();
+				await settle.p;
+				open.add(uri);
+				return { dispose: () => open.delete(uri) };
+			},
+		};
+		const whenCalled = async (count: number) => {
+			while (calls.length < count) {
+				await Event.toPromise(onDidCall.event);
+			}
+		};
+		return { invoker, open, calls, whenCalled };
+	}
+
+	test('resources/subscribe again after an unsubscribe while the first is being opened shares its one upstream call: a failure fails both, a success keeps the subscription', async () => {
+		const upstream = slowSubscribingInvoker();
+		const { session } = setup(upstream.invoker);
+		await initialize(session);
+		const send = (id: number, method: string, uri: string) => session.handleIncoming({ jsonrpc: '2.0', id, method, params: { uri } });
+
+		// subscribe, unsubscribe, subscribe again, then the server refuses the first subscription.
+		const first = send(1, 'resources/subscribe', 'test://a');
+		await upstream.whenCalled(1);
+		assert.deepStrictEqual(resultOf(await send(2, 'resources/unsubscribe', 'test://a')), {});
+		const again = send(3, 'resources/subscribe', 'test://a');
+		await timeout(0);
+		assert.strictEqual(upstream.calls.length, 1, 'no second upstream call for the same URI');
+		upstream.calls[0].settle.error(new Error('upstream refused the first subscription'));
+		assert.strictEqual(errorOf(await first).code, MCP.INTERNAL_ERROR);
+		assert.strictEqual(errorOf(await again).code, MCP.INTERNAL_ERROR, 'the client learns that its last subscribe failed: it is not told {} for a subscription nobody holds');
+		assert.strictEqual(upstream.open.size, 0);
+
+		// The same, but the server accepts it: the client's last word was subscribe, so the subscription stays.
+		const third = send(4, 'resources/subscribe', 'test://b');
+		await upstream.whenCalled(2);
+		resultOf(await send(5, 'resources/unsubscribe', 'test://b'));
+		const fourth = send(6, 'resources/subscribe', 'test://b');
+		upstream.calls[1].settle.complete();
+		assert.deepStrictEqual([resultOf(await third), resultOf(await fourth)], [{}, {}]);
+		assert.deepStrictEqual([upstream.calls.length, [...upstream.open]], [2, ['test://b']]);
+		resultOf(await send(7, 'resources/unsubscribe', 'test://b'));
+		assert.strictEqual(upstream.open.size, 0, 'and it is the session\'s subscription: unsubscribe closes it');
+
+		// Unsubscribed while it opens, and not subscribed again: closed as soon as it opens.
+		const fifth = send(8, 'resources/subscribe', 'test://c');
+		await upstream.whenCalled(3);
+		resultOf(await send(9, 'resources/unsubscribe', 'test://c'));
+		upstream.calls[2].settle.complete();
+		assert.deepStrictEqual([resultOf(await fifth), upstream.open.size], [{}, 0]);
+	});
+
+	test(`resources/subscribe: a subscription being opened keeps its slot after resources/unsubscribe until the server answers, so subscribe/unsubscribe churn keeps at most ${MAX_LEGACY_RESOURCE_SUBSCRIPTIONS} upstream calls in flight`, async () => {
+		const upstream = slowSubscribingInvoker();
+		const { session } = setup(upstream.invoker);
+		await initialize(session);
+		const send = (id: number, method: string, uri: string) => session.handleIncoming({ jsonrpc: '2.0', id, method, params: { uri } });
+
+		const subscribes: Promise<unknown[]>[] = [];
+		for (let i = 0; i < MAX_LEGACY_RESOURCE_SUBSCRIPTIONS; i++) {
+			subscribes.push(send(2 * i, 'resources/subscribe', `test://churn/${i}`));
+			await upstream.whenCalled(i + 1);
+			resultOf(await send(2 * i + 1, 'resources/unsubscribe', `test://churn/${i}`));
+		}
+		assert.strictEqual(errorOf(await send(5000, 'resources/subscribe', 'test://churn/one-more')).code, MCP.INTERNAL_ERROR);
+		assert.strictEqual(upstream.calls.length, MAX_LEGACY_RESOURCE_SUBSCRIPTIONS, 'the refused subscription never reached the server');
+
+		for (const call of upstream.calls) {
+			call.settle.complete();
+		}
+		for (const answer of await Promise.all(subscribes)) {
+			assert.deepStrictEqual(resultOf(answer), {});
+		}
+		assert.strictEqual(upstream.open.size, 0, 'each was closed as soon as it opened');
+
+		const late = send(5001, 'resources/subscribe', 'test://churn/one-more');
+		await upstream.whenCalled(MAX_LEGACY_RESOURCE_SUBSCRIPTIONS + 1);
+		upstream.calls[MAX_LEGACY_RESOURCE_SUBSCRIPTIONS].settle.complete();
+		assert.deepStrictEqual([resultOf(await late), [...upstream.open]], [{}, ['test://churn/one-more']], 'the slots are free once the server answered');
 	});
 
 	test('server→client requests go to the sink and resolve with the client\'s answer', async () => {

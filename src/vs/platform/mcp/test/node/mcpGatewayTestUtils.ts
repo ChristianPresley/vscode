@@ -119,6 +119,16 @@ export class HttpConnection {
 		this._res.destroy();
 	}
 
+	/** Stops reading the response (a client that does not keep up): the server's writes queue up behind TCP flow control. */
+	pause(): void {
+		this._res.pause();
+	}
+
+	/** Reads the response again after {@link pause}. */
+	resume(): void {
+		this._res.resume();
+	}
+
 	private async _waitFor(condition: () => boolean, timeoutMs: number, what: string): Promise<void> {
 		const deadline = Date.now() + timeoutMs;
 		while (!condition()) {

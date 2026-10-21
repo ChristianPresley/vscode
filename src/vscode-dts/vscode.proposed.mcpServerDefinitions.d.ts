@@ -23,15 +23,37 @@ declare module 'vscode' {
 		readonly address: Uri;
 
 		/**
-		 * The gRPC endpoint of the same MCP server, when the gateway serves gRPC:
-		 * `grpc://127.0.0.1:<port>/<routeId>`. A gRPC client connects to the
-		 * authority with cleartext HTTP/2 and calls either the JSON-RPC tunnel
-		 * `mcp.zig.transport.v1.Mcp/Call` or the typed service
-		 * `model_context_protocol.Mcp`, sending the path without its leading
-		 * slash as the `mcp-gateway-route` metadata (it may be left out when the
-		 * gateway exposes a single server).
+		 * The gRPC endpoint of the same MCP server:
+		 * `grpc://127.0.0.1:<port>/<routeId>`. It is set only for gateways
+		 * started with `{ grpc: true }` (see {@link McpGatewayStartOptions.grpc});
+		 * the servers of other gateways have none.
+		 *
+		 * A gRPC client connects to the authority with cleartext HTTP/2 and
+		 * calls either the JSON-RPC tunnel `mcp.zig.transport.v1.Mcp/Call` or
+		 * the typed service `model_context_protocol.Mcp`. Every call must send
+		 * the path without its leading slash as the `mcp-gateway-route`
+		 * metadata; a call without it, or with an unknown route, fails with
+		 * `NOT_FOUND`. The port is shared by all gateways started with
+		 * `{ grpc: true }`, so, as with the route in {@link address}, the route
+		 * id is what keeps other local processes away from this server.
 		 */
 		readonly grpcAddress?: Uri;
+	}
+
+	/**
+	 * Options for {@link lm.startMcpGateway}.
+	 */
+	export interface McpGatewayStartOptions {
+		/**
+		 * Also serve this gateway over gRPC (loopback, cleartext h2c; the tunnel
+		 * and the typed service). Its servers then carry
+		 * {@link McpGatewayServer.grpcAddress `grpcAddress`}.
+		 *
+		 * Without it, the gateway is served over HTTP only and opens no gRPC
+		 * port. If the gRPC listener cannot be opened, the gateway still starts,
+		 * served over HTTP only: its servers have no `grpcAddress`.
+		 */
+		readonly grpc?: boolean;
 	}
 
 	/**
@@ -83,15 +105,24 @@ declare module 'vscode' {
 		 * MCP servers.
 		 *
 		 * The HTTP server is shared among all gateways and is automatically torn down
-		 * when the last gateway is disposed. The gateway dynamically tracks server
-		 * additions and removals via {@link McpGateway.onDidChangeServers}.
+		 * when the last gateway is disposed. Likewise, the gRPC listener opens only for
+		 * gateways started with `{ grpc: true }` and is shared among them; it is open
+		 * only while one of them has a server, so it closes when the last such server
+		 * goes away (its gateway disposed, or the server removed) and opens again,
+		 * possibly on another port, for the next one. Read
+		 * {@link McpGatewayServer.grpcAddress `grpcAddress`} from the current
+		 * {@link McpGateway.servers servers} rather than keeping it. The gateway
+		 * dynamically tracks server additions and removals via
+		 * {@link McpGateway.onDidChangeServers}.
 		 *
 		 * @param chatSessionResource Optional chat session resource URI to associate with this
 		 * gateway. When provided, MCP tool calls made through this gateway will be associated
 		 * with the chat session, enabling inline elicitation UI in the chat response.
+		 * @param options Optional {@link McpGatewayStartOptions}, for instance `{ grpc: true }`
+		 * to also serve the gateway over gRPC.
 		 * @returns A promise that resolves to an {@link McpGateway} if successful,
 		 * or `undefined` if no Node process is available (e.g., in serverless web environments).
 		 */
-		export function startMcpGateway(chatSessionResource?: Uri): Thenable<McpGateway | undefined>;
+		export function startMcpGateway(chatSessionResource?: Uri, options?: McpGatewayStartOptions): Thenable<McpGateway | undefined>;
 	}
 }

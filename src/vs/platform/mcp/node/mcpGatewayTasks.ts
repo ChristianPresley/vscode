@@ -123,6 +123,32 @@ export function taskRunOf(context: IMcpGatewayInvokeContext | undefined): IMcpGa
 	return (context as IMcpGatewayTaskInvokeContext | undefined)?.task;
 }
 
+/**
+ * What the body of a task keeps of the request that created it: plain
+ * values only. A task outlives its request (until its TTL), so it must not
+ * hold the request's invoke context, whose `onProgress`, `onLog` and
+ * `closeSseStream` reach the request's response stream, its headers and its
+ * token.
+ */
+export interface IMcpGatewayTaskOrigin {
+	readonly protocolVersion: string;
+	readonly clientCapabilities: MCP.ClientCapabilities;
+	readonly clientInfo?: MCP.Implementation;
+	readonly logLevel?: MCP.LoggingLevel;
+	readonly chatSessionResource?: string;
+}
+
+/** Copies the fields a task body needs out of the creating request's invoke context. */
+export function taskOriginOf(context: IMcpGatewayInvokeContext): IMcpGatewayTaskOrigin {
+	return {
+		protocolVersion: context.protocolVersion,
+		clientCapabilities: context.clientCapabilities,
+		clientInfo: context.clientInfo,
+		logLevel: context.logLevel,
+		chatSessionResource: context.chatSessionResource,
+	};
+}
+
 const startTaskMarkers = new WeakSet<object>();
 
 /**

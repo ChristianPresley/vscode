@@ -11,7 +11,7 @@ import { IJsonRpcErrorResponse, IJsonRpcNotification, IJsonRpcRequest, IJsonRpcS
 import { Disposable, DisposableMap, IDisposable } from '../../../base/common/lifecycle.js';
 import { ILogger } from '../../log/common/log.js';
 import { IMcpGatewaySingleServerInvoker } from '../common/mcpGateway.js';
-import { legacyVersionSupportsPriming, McpGatewayRpcError } from '../common/mcpGatewayProtocol.js';
+import { legacyVersionSupportsPriming, MAX_LISTEN_FILTER_LENGTH, MAX_LISTEN_RESOURCE_SUBSCRIPTIONS, McpGatewayRpcError } from '../common/mcpGatewayProtocol.js';
 import { LEGACY_MCP_PROTOCOL_VERSIONS, META_PROGRESS_TOKEN } from '../common/mcpProtocolVersions.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
@@ -20,6 +20,17 @@ import { McpGatewayEventLog, McpGatewayStreamKind } from './mcpGatewayEventLog.j
 
 /** A legacy session with no message in flight and no open stream for this long is disposed. */
 export const LEGACY_SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * The most resources one 2025-11-25 session subscribes to with
+ * `resources/subscribe`: the limit of one 2026-07-28 `subscriptions/listen`
+ * filter. With the route's session limit (`MAX_LEGACY_SESSIONS`) it bounds
+ * what the legacy clients of a route keep subscribed upstream.
+ */
+export const MAX_LEGACY_RESOURCE_SUBSCRIPTIONS = MAX_LISTEN_RESOURCE_SUBSCRIPTIONS;
+
+/** The most characters the subscribed URIs of one 2025-11-25 session add up to: the size limit of one `subscriptions/listen` filter. */
+export const MAX_LEGACY_SUBSCRIPTION_URI_LENGTH = MAX_LISTEN_FILTER_LENGTH;
 
 /** Where the messages produced while serving a request go: the client's response stream. */
 export interface IMcpGatewayMessageSink {
@@ -93,6 +104,14 @@ function isResponse(message: unknown): message is IJsonRpcSuccessResponse | IJso
 	return isObject(message) && message.method === undefined && (message.result !== undefined || isObject(message.error));
 }
 
+/** A `resources/subscribe` whose upstream subscription is being opened. */
+interface IOpeningSubscription {
+	/** False once `resources/unsubscribe` came for its URI (and no `resources/subscribe` after it). */
+	wanted: boolean;
+	/** Settles when the upstream call does: rejects with its error. */
+	opened: Promise<void>;
+}
+
 function errorResponseFor(id: JsonRpcId, error: McpGatewayRpcError): IJsonRpcErrorResponse {
 	return { jsonrpc: '2.0', id, error: error.data === undefined ? { code: error.code, message: error.message } : { code: error.code, message: error.message, data: error.data } };
 }
@@ -114,10 +133,20 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 	private readonly _pending = new Map<JsonRpcId, { readonly deferred: DeferredPromise<unknown>; readonly listener: IDisposable }>();
 	private readonly _inflight = new Map<JsonRpcId, CancellationTokenSource>();
 	private readonly _resourceSubscriptions = this._register(new DisposableMap<string>());
+	/**
+	 * The upstream subscriptions being opened, at most one per URI. Each
+	 * counts toward the session's limits until its upstream call settles,
+	 * also once the client unsubscribed (then `wanted` is false and the
+	 * subscription is closed as soon as it opens), so subscribing and
+	 * unsubscribing in a loop cannot pile up upstream calls.
+	 */
+	private readonly _openingSubscriptions = new Map<string, IOpeningSubscription>();
 	private readonly _idleTimer: RunOnceScheduler;
 	/** Open responses that keep the session from expiring, each with the listener that releases it. */
 	private readonly _holds = this._register(new DisposableMap<object>());
 	private _activeMessages = 0;
+	/** When a message of the session or one of its open responses last started or ended (or the session was created). */
+	private _lastActiveAt = Date.now();
 	private _nextServerRequestId = 1;
 	private _initialized = false;
 	private _protocolVersion: string | undefined;
@@ -198,6 +227,16 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 		return this._pending.size;
 	}
 
+	/** Whether nothing of the session runs: no message in flight and no open response (the idle timer runs). */
+	get isIdle(): boolean {
+		return !this._store.isDisposed && this._activeMessages === 0 && this._holds.size === 0;
+	}
+
+	/** When a message of the session or one of its open responses last started or ended (`Date.now()` time). */
+	get lastActiveAt(): number {
+		return this._lastActiveAt;
+	}
+
 	/** What a response of this session needs to carry one of its SSE streams. */
 	streamOptions(kind: McpGatewayStreamKind, token?: CancellationToken): IMcpGatewayLegacyStreamOptions {
 		return { broker: this, log: this.eventLog, kind, priming: () => this.supportsPriming, token };
@@ -224,6 +263,7 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 			return;
 		}
 		const hold = {};
+		this._lastActiveAt = Date.now();
 		this._idleTimer.cancel();
 		this._holds.set(hold, Event.once(onDidClose)(() => {
 			this._holds.deleteAndDispose(hold);
@@ -242,6 +282,7 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 		const messages: unknown[] = Array.isArray(message) ? message : [message];
 		const responses: JsonRpcResponse[] = [];
 		this._activeMessages++;
+		this._lastActiveAt = Date.now();
 		this._idleTimer.cancel();
 		try {
 			for (const single of messages) {
@@ -306,6 +347,7 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 		if (this._store.isDisposed) {
 			return;
 		}
+		this._lastActiveAt = Date.now();
 		if (this._activeMessages > 0 || this._holds.size > 0) {
 			this._idleTimer.cancel();
 		} else {
@@ -472,6 +514,11 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 					throw new McpGatewayRpcError(MCP.INVALID_PARAMS, 'Missing resource URI');
 				}
 				this._resourceSubscriptions.deleteAndDispose(params.uri);
+				// A subscription still being opened is closed as soon as it is (it keeps its slot until then).
+				const opening = this._openingSubscriptions.get(params.uri);
+				if (opening) {
+					opening.wanted = false;
+				}
 				return {};
 			}
 		}
@@ -488,6 +535,8 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 			progressToken: typeof progressTokenRaw === 'string' || typeof progressTokenRaw === 'number' ? progressTokenRaw : undefined,
 			headers,
 			token,
+			// A 2025-11-25 client is its session, for the rate limits as for everything else.
+			clientKey: `session:${this.id}`,
 			notify: notification => sink.notify(notification),
 			sendServerRequest: serverRequest => sink.sendRequest(serverRequest, token),
 			closeSseStream: closeForPolling && this.supportsPriming ? () => {
@@ -533,19 +582,75 @@ export class McpGatewaySession extends Disposable implements IMcpGatewayRequestB
 		if (this._resourceSubscriptions.has(uri)) {
 			return {};
 		}
+		const opening = this._openingSubscriptions.get(uri);
+		if (opening) {
+			// Already being opened (maybe unsubscribed since): this request wants it again and gets the outcome of that one upstream call.
+			opening.wanted = true;
+			await opening.opened;
+			return {};
+		}
+		this._checkSubscriptionLimits(uri);
 		const subscribe = this._invoker.subscribeResource;
 		if (!subscribe) {
 			this._logger.debug(`[McpGateway][session ${this.id}] The server cannot watch ${uri}; subscription recorded without updates`);
 			this._resourceSubscriptions.set(uri, Disposable.None);
 			return {};
 		}
-		const subscription = await subscribe.call(this._invoker, uri);
-		if (this._store.isDisposed) {
-			subscription.dispose();
-		} else {
-			this._resourceSubscriptions.set(uri, subscription);
-		}
+		await this._openSubscription(uri, subscribe).opened;
 		return {};
+	}
+
+	/**
+	 * Opens the upstream subscription of `uri`: it is kept when the client
+	 * still wants it once it opens (no `resources/unsubscribe` came last),
+	 * and closed at once otherwise.
+	 */
+	private _openSubscription(uri: string, subscribe: NonNullable<IMcpGatewaySingleServerInvoker['subscribeResource']>): IOpeningSubscription {
+		const opening: IOpeningSubscription = { wanted: true, opened: Promise.resolve() };
+		this._openingSubscriptions.set(uri, opening);
+		opening.opened = (async () => {
+			let subscription: IDisposable;
+			try {
+				subscription = await subscribe.call(this._invoker, uri);
+			} finally {
+				if (this._openingSubscriptions.get(uri) === opening) {
+					this._openingSubscriptions.delete(uri);
+				}
+			}
+			if (this._store.isDisposed || !opening.wanted) {
+				subscription.dispose();
+			} else {
+				this._resourceSubscriptions.set(uri, subscription);
+			}
+		})();
+		return opening;
+	}
+
+	/**
+	 * Refuses (`-32603`, as a `subscriptions/listen` filter over the limits) a
+	 * subscription that would take the session past
+	 * {@link MAX_LEGACY_RESOURCE_SUBSCRIPTIONS} URIs or
+	 * {@link MAX_LEGACY_SUBSCRIPTION_URI_LENGTH} characters of URIs. The
+	 * subscriptions still being opened count, also those the client has
+	 * unsubscribed from (their upstream call is still in flight).
+	 */
+	private _checkSubscriptionLimits(uri: string): void {
+		const count = this._resourceSubscriptions.size + this._openingSubscriptions.size;
+		if (count >= MAX_LEGACY_RESOURCE_SUBSCRIPTIONS) {
+			this._logger.warn(`[McpGateway][session ${this.id}] Refused resources/subscribe: the session already has ${count} subscriptions (limit ${MAX_LEGACY_RESOURCE_SUBSCRIPTIONS})`);
+			throw new McpGatewayRpcError(MCP.INTERNAL_ERROR, `Too many resource subscriptions in this session (limit ${MAX_LEGACY_RESOURCE_SUBSCRIPTIONS}); unsubscribe from some first`);
+		}
+		let length = uri.length;
+		for (const subscribed of this._resourceSubscriptions.keys()) {
+			length += subscribed.length;
+		}
+		for (const pending of this._openingSubscriptions.keys()) {
+			length += pending.length;
+		}
+		if (length > MAX_LEGACY_SUBSCRIPTION_URI_LENGTH) {
+			this._logger.warn(`[McpGateway][session ${this.id}] Refused resources/subscribe: the subscribed URIs would have ${length} characters (limit ${MAX_LEGACY_SUBSCRIPTION_URI_LENGTH})`);
+			throw new McpGatewayRpcError(MCP.INTERNAL_ERROR, `The resource subscriptions of this session are too large: ${length} characters of URIs (limit ${MAX_LEGACY_SUBSCRIPTION_URI_LENGTH}); unsubscribe from some first`);
+		}
 	}
 }
 

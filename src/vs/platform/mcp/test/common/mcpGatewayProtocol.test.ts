@@ -6,7 +6,7 @@
 import assert from 'assert';
 import { IJsonRpcRequest } from '../../../../base/common/jsonRpcProtocol.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { applyModernEnvelope, classifyEra, clientInfoFromMeta, errorResponse, GATEWAY_SERVER_INFO, hasClientCapability, honorSubscriptionFilter, httpStatusForRpcError, isAllowedOrigin, isCacheableMethod, isInputRequiredResult, isLoopbackHost, LEGACY_TRANSPORT_ERROR, legacyVersionSupportsPriming, McpGatewayRpcError, requiredCapabilityForInputRequest, validateInputResponses, validateLegacyProtocolVersionHeader, validateModernRequestMeta, validateStandardHeaders, validateSubscriptionFilter } from '../../common/mcpGatewayProtocol.js';
+import { applyModernEnvelope, cancellationTargets, classifyEra, clientCapabilitiesOf, clientInfoFromMeta, errorResponse, GATEWAY_SERVER_INFO, hasClientCapability, honorSubscriptionFilter, httpStatusForRpcError, isAllowedOrigin, isCacheableMethod, isInputRequiredResult, isLoopbackHost, LEGACY_TRANSPORT_ERROR, legacyVersionSupportsPriming, MAX_LISTEN_FILTER_LENGTH, MAX_LISTEN_RESOURCE_SUBSCRIPTIONS, McpGatewayRpcError, requiredCapabilitiesForInputRequest, validateInputResponses, validateLegacyProtocolVersionHeader, validateModernRequestMeta, validateStandardHeaders, validateSubscriptionFilter } from '../../common/mcpGatewayProtocol.js';
 import { META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_LOG_LEVEL, META_PROTOCOL_VERSION, META_SERVER_INFO } from '../../common/mcpProtocolVersions.js';
 import { MCP } from '../../common/modelContextProtocol.js';
 
@@ -121,12 +121,12 @@ suite('MCP - GatewayProtocol', () => {
 	});
 
 	test('input request capability mapping', () => {
-		assert.strictEqual(requiredCapabilityForInputRequest('elicitation/create', { mode: 'form' }), 'elicitation');
-		assert.strictEqual(requiredCapabilityForInputRequest('elicitation/create', {}), 'elicitation');
-		assert.strictEqual(requiredCapabilityForInputRequest('elicitation/create', { mode: 'url' }), 'elicitation.url');
-		assert.strictEqual(requiredCapabilityForInputRequest('sampling/createMessage', {}), 'sampling');
-		assert.strictEqual(requiredCapabilityForInputRequest('roots/list', {}), 'roots');
-		assert.strictEqual(requiredCapabilityForInputRequest('tools/call', {}), undefined);
+		assert.deepStrictEqual(requiredCapabilitiesForInputRequest('elicitation/create', { mode: 'form' }), ['elicitation']);
+		assert.deepStrictEqual(requiredCapabilitiesForInputRequest('elicitation/create', {}), ['elicitation']);
+		assert.deepStrictEqual(requiredCapabilitiesForInputRequest('elicitation/create', { mode: 'url' }), ['elicitation.url']);
+		assert.deepStrictEqual(requiredCapabilitiesForInputRequest('sampling/createMessage', {}), ['sampling']);
+		assert.deepStrictEqual(requiredCapabilitiesForInputRequest('roots/list', {}), ['roots']);
+		assert.strictEqual(requiredCapabilitiesForInputRequest('tools/call', {}), undefined);
 
 		assert.strictEqual(hasClientCapability({ elicitation: { form: {} } }, 'elicitation'), true);
 		assert.strictEqual(hasClientCapability({ elicitation: { form: {} } }, 'elicitation.url'), false);
@@ -134,6 +134,34 @@ suite('MCP - GatewayProtocol', () => {
 		assert.strictEqual(hasClientCapability({ sampling: {} }, 'sampling'), true);
 		assert.strictEqual(hasClientCapability({}, 'roots'), false);
 		assert.strictEqual(hasClientCapability(undefined, 'roots'), false);
+	});
+
+	test('a tool-enabled sampling request needs sampling.tools, one with includeContext other than none needs sampling.context', () => {
+		const messages = [{ role: 'user', content: { type: 'text', text: 'Weather?' } }];
+		const tools = [{ name: 'get_weather', inputSchema: { type: 'object' } }];
+		// client/sampling#007: tools or toolChoice make the request tool-enabled.
+		assert.deepStrictEqual(requiredCapabilitiesForInputRequest('sampling/createMessage', { messages, maxTokens: 10, tools }), ['sampling', 'sampling.tools']);
+		assert.deepStrictEqual(requiredCapabilitiesForInputRequest('sampling/createMessage', { messages, maxTokens: 10, toolChoice: { mode: 'none' } }), ['sampling', 'sampling.tools']);
+		assert.deepStrictEqual(requiredCapabilitiesForInputRequest('sampling/createMessage', { messages, maxTokens: 10, tools: [] }), ['sampling', 'sampling.tools'], 'an empty tools array is still a tool-enabled request');
+		assert.deepStrictEqual(requiredCapabilitiesForInputRequest('sampling/createMessage', { messages, maxTokens: 10, tools: null, toolChoice: null }), ['sampling'], 'null is absent');
+		// client/sampling#009: the deprecated thisServer and allServers need sampling.context; none is the default.
+		assert.deepStrictEqual(requiredCapabilitiesForInputRequest('sampling/createMessage', { messages, maxTokens: 10, includeContext: 'none' }), ['sampling']);
+		assert.deepStrictEqual(requiredCapabilitiesForInputRequest('sampling/createMessage', { messages, maxTokens: 10, includeContext: 'thisServer' }), ['sampling', 'sampling.context']);
+		assert.deepStrictEqual(requiredCapabilitiesForInputRequest('sampling/createMessage', { messages, maxTokens: 10, includeContext: 'allServers', tools }), ['sampling', 'sampling.context', 'sampling.tools']);
+
+		assert.strictEqual(hasClientCapability({ sampling: {} }, 'sampling.tools'), false);
+		assert.strictEqual(hasClientCapability({ sampling: { context: {} } }, 'sampling.tools'), false);
+		assert.strictEqual(hasClientCapability({ sampling: { tools: {} } }, 'sampling.tools'), true);
+		assert.strictEqual(hasClientCapability({ sampling: { tools: {} } }, 'sampling.context'), false);
+		assert.strictEqual(hasClientCapability({ sampling: { context: {} } }, 'sampling.context'), true);
+		assert.strictEqual(hasClientCapability({}, 'sampling.tools'), false);
+		assert.strictEqual(hasClientCapability({ sampling: true } as unknown as MCP.ClientCapabilities, 'sampling.tools'), false, 'a malformed declaration declares no sub-capability');
+
+		// -32021 data.requiredCapabilities: the sub-capabilities merge into one sampling object.
+		assert.deepStrictEqual(clientCapabilitiesOf(['sampling.tools']), { sampling: { tools: {} } });
+		assert.deepStrictEqual(clientCapabilitiesOf(['sampling', 'sampling.context', 'sampling.tools']), { sampling: { context: {}, tools: {} } });
+		assert.deepStrictEqual(clientCapabilitiesOf(['elicitation', 'elicitation.url', 'roots']), { elicitation: { url: {} }, roots: {} });
+		assert.deepStrictEqual(clientCapabilitiesOf([]), {});
 	});
 
 	test('validateSubscriptionFilter: booleans for the list flags, an array of strings for resourceSubscriptions', () => {
@@ -145,6 +173,24 @@ suite('MCP - GatewayProtocol', () => {
 			assert.ok(error instanceof McpGatewayRpcError, JSON.stringify(bad));
 			assert.strictEqual(error.code, MCP.INVALID_PARAMS);
 		}
+	});
+
+	test('validateSubscriptionFilter: at most MAX_LISTEN_RESOURCE_SUBSCRIPTIONS distinct URIs and MAX_LISTEN_FILTER_LENGTH characters (-32603); honorSubscriptionFilter keeps each URI once', () => {
+		const uris = (count: number) => Array.from({ length: count }, (_, i) => `test://r/${i}`);
+		assert.strictEqual(validateSubscriptionFilter({ resourceSubscriptions: uris(MAX_LISTEN_RESOURCE_SUBSCRIPTIONS) }), undefined);
+		assert.strictEqual(validateSubscriptionFilter({ resourceSubscriptions: [...uris(MAX_LISTEN_RESOURCE_SUBSCRIPTIONS), ...uris(10)] }), undefined, 'repeated URIs count once');
+		const tooMany = validateSubscriptionFilter({ resourceSubscriptions: uris(MAX_LISTEN_RESOURCE_SUBSCRIPTIONS + 1) });
+		assert.ok(tooMany instanceof McpGatewayRpcError);
+		assert.strictEqual(tooMany.code, MCP.INTERNAL_ERROR);
+		assert.match(tooMany.message, new RegExp(`limit ${MAX_LISTEN_RESOURCE_SUBSCRIPTIONS}`));
+		const tooLarge = validateSubscriptionFilter({ resourceSubscriptions: [`test://${'x'.repeat(MAX_LISTEN_FILTER_LENGTH)}`] });
+		assert.strictEqual(tooLarge?.code, MCP.INTERNAL_ERROR);
+		assert.strictEqual(validateSubscriptionFilter({ toolsListChanged: true, padding: 'x'.repeat(MAX_LISTEN_FILTER_LENGTH) })?.code, MCP.INTERNAL_ERROR, 'unknown keys count towards the size');
+		// A malformed filter is still -32602, whatever its size.
+		assert.strictEqual(validateSubscriptionFilter({ resourceSubscriptions: [...uris(MAX_LISTEN_RESOURCE_SUBSCRIPTIONS + 1), 1] })?.code, MCP.INVALID_PARAMS);
+
+		const caps: MCP.ServerCapabilities = { resources: { subscribe: true } };
+		assert.deepStrictEqual(honorSubscriptionFilter({ resourceSubscriptions: ['a://b', 'c://d', 'a://b', 'a://b'] }, caps), { resourceSubscriptions: ['a://b', 'c://d'] });
 	});
 
 	test('honorSubscriptionFilter is defensive about malformed filters', () => {
@@ -200,6 +246,33 @@ suite('MCP - GatewayProtocol', () => {
 		assert.strictEqual(isAllowedOrigin('https://example.com'), false);
 		assert.strictEqual(isAllowedOrigin('null'), false);
 		assert.strictEqual(isAllowedOrigin('not a url'), false);
+	});
+
+	test('cancellationTargets: a named cancellation reaches its own client only; a nameless one the only client of its address with the id, never one of several', () => {
+		const entry = (name: string, owner: string, peer: string) => ({ name, owner, peer });
+		const named = { key: 'A', peer: 'here', named: true };
+		const nameless = { key: 'nameless@here', peer: 'here', named: false };
+		const names = (entries: readonly { name: string }[]) => entries.map(e => e.name);
+
+		// A cancellation that names its client reaches exactly that client's entries, never by address.
+		assert.deepStrictEqual(names(cancellationTargets([entry('a1', 'A', 'here'), entry('b1', 'B', 'here')], named)), ['a1']);
+		assert.deepStrictEqual(names(cancellationTargets([entry('b1', 'B', 'here')], named)), []);
+
+		// Without client info: a request that named its client is still reached when it is the only client of the address with the id.
+		assert.deepStrictEqual(names(cancellationTargets([entry('a1', 'A', 'here'), entry('a2', 'A', 'here')], nameless)), ['a1', 'a2']);
+		assert.deepStrictEqual(names(cancellationTargets([entry('x1', 'X', 'elsewhere')], nameless)), [], 'another address is never reached');
+		assert.deepStrictEqual(names(cancellationTargets([entry('a1', 'A', 'here'), entry('x1', 'X', 'elsewhere')], nameless)), ['a1']);
+		// Ambiguous: two clients of the address have the id.
+		assert.deepStrictEqual(names(cancellationTargets([entry('a1', 'A', 'here'), entry('b1', 'B', 'here')], nameless)), []);
+		// A client without client info is reached when it is the only client of the address with the id...
+		assert.deepStrictEqual(names(cancellationTargets([entry('n1', 'nameless@here', 'here'), entry('n2', 'nameless@here', 'here')], nameless)), ['n1', 'n2']);
+		// ...but its key matching the cancellation's is no proof that it sent it: A's notifications need not carry _meta either, so this is ambiguous too.
+		assert.deepStrictEqual(names(cancellationTargets([entry('n1', 'nameless@here', 'here'), entry('a1', 'A', 'here')], nameless)), []);
+		assert.deepStrictEqual(names(cancellationTargets([entry('a1', 'A', 'here'), entry('n1', 'nameless@here', 'here')], nameless)), []);
+		// A named cancellation never reaches the nameless client's entries.
+		assert.deepStrictEqual(names(cancellationTargets([entry('n1', 'nameless@here', 'here')], named)), []);
+		// Entries without a sender (a transport that keeps none) are reached by no cancellation.
+		assert.deepStrictEqual(names(cancellationTargets([{ name: 'anon', owner: undefined, peer: undefined }], nameless)), []);
 	});
 
 	test('errorResponse shapes', () => {

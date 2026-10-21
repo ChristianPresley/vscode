@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import sinon from 'sinon';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Event } from '../../../../base/common/event.js';
 import { IJsonRpcRequest } from '../../../../base/common/jsonRpcProtocol.js';
@@ -17,6 +18,7 @@ import { MCP } from '../../common/modelContextProtocol.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { CONFORMANCE_CACHE_HINTS, CONFORMANCE_INSTRUCTIONS, CONFORMANCE_SERVER_INFO, McpGatewayConformanceInvoker } from '../../node/mcpGatewayConformanceInvoker.js';
 import { IMcpGatewayDispatchContext, IMcpGatewayDispatcherOptions, IMcpGatewayNotification, MAX_GATEWAY_INPUT_ROUNDS, McpGatewayDispatcher, McpGatewayResourceNotFoundError } from '../../node/mcpGatewayDispatcher.js';
+import { DEFAULT_MCP_GATEWAY_RATE_LIMITS, isRateLimitedError, McpGatewayRateLimitedError, RATE_LIMITED_REASON, ROUTE_RATE_MULTIPLIER } from '../../node/mcpGatewayRateLimit.js';
 import { McpGatewaySealedState } from '../../node/mcpGatewaySealedState.js';
 import { modernMeta } from './mcpGatewayTestUtils.js';
 
@@ -268,6 +270,69 @@ suite('MCP - GatewayDispatcher', () => {
 		assert.deepStrictEqual(Object.keys(partial.inputRequests ?? {}), ['greeting']);
 	});
 
+	/** An upstream whose tool asks for one sampling request with `extra` params until it gets an answer. */
+	function samplingInvoker(extra: Record<string, unknown>) {
+		const calls: number[] = [];
+		const invoker = minimalInvoker({
+			callTool: async (_name, _args, invokeCtx) => {
+				calls.push(calls.length);
+				if (!invokeCtx?.inputResponses?.weather) {
+					const result: IMcpGatewayInputRequired = { resultType: 'input_required', inputRequests: { weather: { method: 'sampling/createMessage', params: { messages: [{ role: 'user', content: { type: 'text', text: 'Weather in Paris?' } }], maxTokens: 100, ...extra } } } };
+					return result;
+				}
+				return { content: [{ type: 'text', text: 'sampled' }] };
+			},
+		});
+		return { invoker, calls };
+	}
+
+	test('a tool-enabled sampling request reaches only a client with sampling.tools: -32021 on 2026-07-28, never bridged to a 2025-11-25 client without it', async () => {
+		const withTools = { tools: [{ name: 'get_weather', inputSchema: { type: 'object' } }], toolChoice: { mode: 'auto' } };
+		const { invoker } = samplingInvoker(withTools);
+		const dispatcher = createDispatcher(invoker, {});
+
+		// 2026-07-28: data.requiredCapabilities lists the missing capability only.
+		await assertRpcError(dispatcher.dispatch(context('modern', { clientCapabilities: { sampling: {} } }).ctx, 'tools/call', { name: 'echo', arguments: {} }), MCP.MISSING_REQUIRED_CLIENT_CAPABILITY, error => {
+			assert.deepStrictEqual((error.data as { requiredCapabilities: unknown }).requiredCapabilities, { sampling: { tools: {} } });
+			assert.match(error.message, /sampling\.tools/);
+		});
+		// A client without sampling at all misses both.
+		await assertRpcError(dispatcher.dispatch(context('modern', { clientCapabilities: {} }).ctx, 'tools/call', { name: 'echo', arguments: {} }), MCP.MISSING_REQUIRED_CLIENT_CAPABILITY, error => {
+			assert.deepStrictEqual((error.data as { requiredCapabilities: unknown }).requiredCapabilities, { sampling: { tools: {} } });
+		});
+		const declared = await dispatcher.dispatch(context('modern', { clientCapabilities: { sampling: { tools: {} } } }).ctx, 'tools/call', { name: 'echo', arguments: {} }) as MCP.InputRequiredResult;
+		assert.strictEqual(declared.resultType, 'input_required');
+		assert.deepStrictEqual(declared.inputRequests?.weather.params, { messages: [{ role: 'user', content: { type: 'text', text: 'Weather in Paris?' } }], maxTokens: 100, ...withTools });
+
+		// toolChoice alone makes the request tool-enabled too.
+		const choiceOnly = createDispatcher(samplingInvoker({ toolChoice: { mode: 'none' } }).invoker, {});
+		await assertRpcError(choiceOnly.dispatch(context('modern', { clientCapabilities: { sampling: {} } }).ctx, 'tools/call', { name: 'echo', arguments: {} }), MCP.MISSING_REQUIRED_CLIENT_CAPABILITY);
+
+		// 2025-11-25: the bridge sends nothing to the client and the tool call fails with the error.
+		const legacy = context('legacy', { clientCapabilities: { sampling: {} } }, () => ({ role: 'assistant', content: { type: 'text', text: 'Sunny' }, model: 'm' }));
+		await assertRpcError(dispatcher.dispatch(legacy.ctx, 'tools/call', { name: 'echo', arguments: {} }), MCP.MISSING_REQUIRED_CLIENT_CAPABILITY, error => assert.match(error.message, /sampling\.tools/));
+		assert.deepStrictEqual(legacy.serverRequests, [], 'no sampling/createMessage was sent');
+		// A legacy client that declared sampling.tools gets the request on its stream.
+		const legacyTools = context('legacy', { clientCapabilities: { sampling: { tools: {} } } }, () => ({ role: 'assistant', content: { type: 'text', text: 'Sunny' }, model: 'm' }));
+		assert.strictEqual(textOf(await dispatcher.dispatch(legacyTools.ctx, 'tools/call', { name: 'echo', arguments: {} })), 'sampled');
+		assert.deepStrictEqual(legacyTools.serverRequests.map(r => r.method), ['sampling/createMessage']);
+	});
+
+	test('a sampling request with includeContext other than none needs sampling.context', async () => {
+		const dispatcher = createDispatcher(samplingInvoker({ includeContext: 'thisServer' }).invoker, {});
+		await assertRpcError(dispatcher.dispatch(context('modern', { clientCapabilities: { sampling: { tools: {} } } }).ctx, 'tools/call', { name: 'echo', arguments: {} }), MCP.MISSING_REQUIRED_CLIENT_CAPABILITY, error => {
+			assert.deepStrictEqual((error.data as { requiredCapabilities: unknown }).requiredCapabilities, { sampling: { context: {} } });
+		});
+		const legacy = context('legacy', { clientCapabilities: { sampling: {} } }, () => ({ role: 'assistant', content: { type: 'text', text: 'x' }, model: 'm' }));
+		await assertRpcError(dispatcher.dispatch(legacy.ctx, 'tools/call', { name: 'echo', arguments: {} }), MCP.MISSING_REQUIRED_CLIENT_CAPABILITY);
+		assert.deepStrictEqual(legacy.serverRequests, []);
+		const declared = await dispatcher.dispatch(context('modern', { clientCapabilities: { sampling: { context: {} } } }).ctx, 'tools/call', { name: 'echo', arguments: {} }) as MCP.InputRequiredResult;
+		assert.strictEqual(declared.resultType, 'input_required');
+		// The default, none, needs nothing beyond sampling.
+		const none = createDispatcher(samplingInvoker({ includeContext: 'none' }).invoker, {});
+		assert.strictEqual((await none.dispatch(context('modern', { clientCapabilities: { sampling: {} } }).ctx, 'tools/call', { name: 'echo', arguments: {} }) as MCP.InputRequiredResult).resultType, 'input_required');
+	});
+
 	test('inputResponses must be an object of objects', async () => {
 		const dispatcher = createDispatcher();
 		await assertRpcError(dispatcher.dispatch(context('modern').ctx, 'tools/call', { name: 'test_input_required_result_elicitation', arguments: {}, inputResponses: { user_name: 12345 } }), MCP.INVALID_PARAMS);
@@ -412,5 +477,121 @@ suite('MCP - GatewayDispatcher', () => {
 		await expectError(headers('tools/call', { [MCP_NAME_HEADER.toLowerCase()]: 'test_x_mcp_header' }), annotated, MCP.HEADER_MISMATCH);
 		assert.ok((await dispatcher.prepareModernRequest(headers('tools/call', { [MCP_NAME_HEADER.toLowerCase()]: 'test_x_mcp_header', 'mcp-param-region': 'eu' }), annotated)).ok);
 		await expectError(headers('tools/call', { [MCP_NAME_HEADER.toLowerCase()]: 'test_x_mcp_header', 'mcp-param-region': 'us' }), annotated, MCP.HEADER_MISMATCH);
+	});
+
+	test('rate limits: tools/call and completion/complete per client, -32603 rate_limited with retryAfterMs, never reaching the upstream; both eras', async () => {
+		const clock = sinon.useFakeTimers();
+		try {
+			let toolCalls = 0;
+			let completions = 0;
+			const dispatcher = createDispatcher(minimalInvoker({
+				callTool: async () => { toolCalls++; return { content: [{ type: 'text', text: 'ok' }] }; },
+				complete: async () => { completions++; return { completion: { values: ['a'] } }; },
+			}), { rateLimits: { toolCalls: { perSecond: 2, burst: 3 }, completions: { perSecond: 1, burst: 1 } } });
+			const call = (clientKey: string, era: 'modern' | 'legacy' = 'modern') => dispatcher.dispatch(context(era, { clientKey }).ctx, 'tools/call', { name: 'echo', arguments: {} });
+			const complete = (clientKey: string) => dispatcher.dispatch(context('modern', { clientKey }).ctx, 'completion/complete', { ref: { type: 'ref/prompt', name: 'p' }, argument: { name: 'x', value: '' } });
+			const rateLimited = (retryAfterMs: number, method: string) => (error: McpGatewayRpcError) => {
+				assert.ok(error instanceof McpGatewayRateLimitedError);
+				assert.ok(isRateLimitedError(error));
+				assert.deepStrictEqual(error.data, { reason: RATE_LIMITED_REASON, retryAfterMs, method, scope: 'client' });
+			};
+
+			// A burst of 3, then the 4th is refused until a token comes back (500 ms at 2 a second).
+			for (let i = 0; i < 3; i++) {
+				assert.strictEqual(textOf(await call('a')), 'ok');
+			}
+			await assertRpcError(call('a'), MCP.INTERNAL_ERROR, rateLimited(500, 'tools/call'));
+			assert.strictEqual(toolCalls, 3, 'the refused call never reached the upstream');
+			// Another client has its own bucket; legacy sessions are limited the same way.
+			assert.strictEqual(textOf(await call('b', 'legacy')), 'ok');
+			clock.tick(200);
+			await assertRpcError(call('a'), MCP.INTERNAL_ERROR, rateLimited(300, 'tools/call'));
+			clock.tick(300);
+			assert.strictEqual(textOf(await call('a')), 'ok');
+			await assertRpcError(call('a'), MCP.INTERNAL_ERROR);
+			// Refills up to the burst only.
+			clock.tick(60_000);
+			for (let i = 0; i < 3; i++) {
+				await call('a');
+			}
+			await assertRpcError(call('a'), MCP.INTERNAL_ERROR);
+
+			// completion/complete has its own limit; other methods have none.
+			await complete('a');
+			await assertRpcError(complete('a'), MCP.INTERNAL_ERROR, rateLimited(1000, 'completion/complete'));
+			assert.strictEqual(completions, 1);
+			for (let i = 0; i < 10; i++) {
+				await dispatcher.dispatch(context('modern', { clientKey: 'a' }).ctx, 'tools/list', {});
+			}
+			// Requests without a client key share the route's one bucket.
+			for (let i = 0; i < 3; i++) {
+				await dispatcher.dispatch(context('modern').ctx, 'tools/call', { name: 'echo', arguments: {} });
+			}
+			await assertRpcError(dispatcher.dispatch(context('modern').ctx, 'tools/call', { name: 'echo', arguments: {} }), MCP.INTERNAL_ERROR);
+		} finally {
+			clock.restore();
+		}
+	});
+
+	test('rate limits: a refusal by the route-wide bucket says that the server is busy, in the error and in the log, not that the client sent too many', async () => {
+		const clock = sinon.useFakeTimers();
+		try {
+			const warnings: string[] = [];
+			const recording = new class extends NullLogService {
+				override warn(message: string): void {
+					warnings.push(message);
+				}
+			};
+			// A token every ~17 minutes; the route-wide bucket holds ROUTE_RATE_MULTIPLIER calls of distinct clients.
+			const dispatcher = store.add(new McpGatewayDispatcher('route-1', recording, minimalInvoker(), new McpGatewaySealedState(), { rateLimits: { toolCalls: { perSecond: 0.001, burst: 1 } } }));
+			const call = (clientKey: string) => dispatcher.dispatch(context('modern', { clientKey }).ctx, 'tools/call', { name: 'echo', arguments: {} });
+
+			assert.strictEqual(textOf(await call('own')), '{}');
+			await assertRpcError(call('own'), MCP.INTERNAL_ERROR, error => {
+				assert.strictEqual((error.data as { scope?: unknown }).scope, 'client');
+				assert.match(error.message, /too many tools\/call requests from this client/);
+			});
+			assert.strictEqual(warnings.length, 1);
+			assert.match(warnings[0], /refusing tools\/call requests of a client for now/);
+
+			for (let i = 1; i < ROUTE_RATE_MULTIPLIER; i++) {
+				assert.strictEqual(textOf(await call(`client-${i}`)), '{}');
+			}
+			await assertRpcError(call('newcomer'), MCP.INTERNAL_ERROR, error => {
+				assert.ok(isRateLimitedError(error));
+				assert.strictEqual((error.data as { scope?: unknown }).scope, 'route');
+				assert.match(error.message, /the server is busy/);
+				assert.doesNotMatch(error.message, /from this client/, 'the newcomer sent one request');
+			});
+			assert.strictEqual(warnings.length, 2);
+			assert.match(warnings[1], /over its route-wide limit, refusing tools\/call requests of every client/);
+			assert.doesNotMatch(warnings[1], /requests of a client/);
+			// Logged once per run of refusals, as for a client.
+			await assertRpcError(call('another-newcomer'), MCP.INTERNAL_ERROR);
+			assert.strictEqual(warnings.length, 2);
+		} finally {
+			clock.restore();
+		}
+	});
+
+	test('rate limits: generous defaults, false turns a limit off', async () => {
+		const clock = sinon.useFakeTimers();
+		try {
+			const defaults = createDispatcher(minimalInvoker(), {});
+			for (let i = 0; i < DEFAULT_MCP_GATEWAY_RATE_LIMITS.toolCalls.burst; i++) {
+				await defaults.dispatch(context('modern', { clientKey: 'agent' }).ctx, 'tools/call', { name: 'echo', arguments: {} });
+			}
+			await assertRpcError(defaults.dispatch(context('modern', { clientKey: 'agent' }).ctx, 'tools/call', { name: 'echo', arguments: {} }), MCP.INTERNAL_ERROR, error => {
+				assert.strictEqual((error.data as { retryAfterMs: number }).retryAfterMs, 1000 / DEFAULT_MCP_GATEWAY_RATE_LIMITS.toolCalls.perSecond);
+			});
+
+			const unlimited = createDispatcher(minimalInvoker(), { rateLimits: { toolCalls: false } });
+			for (let i = 0; i < 1000; i++) {
+				await unlimited.dispatch(context('modern', { clientKey: 'agent' }).ctx, 'tools/call', { name: 'echo', arguments: {} });
+			}
+			assert.strictEqual(unlimited.rateLimiter.clientCount('tools/call'), 0);
+		} finally {
+			clock.restore();
+		}
 	});
 });

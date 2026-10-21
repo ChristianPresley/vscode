@@ -8,7 +8,10 @@
 // Start with: node out/vs/platform/mcp/node/mcpGatewayConformanceMain.js [--url-file <path>] [--log <path>] [--quiet] [--grpc]
 // Prints `READY:<url>` on stdout (and nothing else) once it listens. With
 // `--grpc` the route is also served on the gateway's gRPC listener (both
-// bindings) and a second line `GRPC:<port>` follows `READY:<url>`.
+// bindings) and a second line `GRPC:<port>` follows `READY:<url>`. Unlike the
+// product's listener, this one lets calls without the `mcp-gateway-route`
+// metadata reach the only route (`allowDefaultRoute`), so that unmodified
+// clients (the zig-sdk example client, curl) can call it.
 
 import { fileURLToPath } from 'url';
 
@@ -78,9 +81,11 @@ async function main(): Promise<void> {
 	const logStream = fs.createWriteStream(logFile, { flags: 'a' });
 	logStream.on('error', error => diagnostic(`Cannot write the log file ${logFile}: ${error.message}`));
 	const loggerService = new ConformanceLoggerService(logStream, LogLevel.Trace);
-	const service = new McpGatewayService(loggerService, { grpc });
+	// A test fixture: one route, and gRPC calls may leave the route out. As in
+	// the product, the gRPC listener opens only because the route asks for it.
+	const service = new McpGatewayService(loggerService, { grpc: grpc ? { allowDefaultRoute: true } : false });
 	const invoker = new McpGatewayConformanceInvoker();
-	const route = await service.createRoute('conformance', invoker, { serverInfo: CONFORMANCE_SERVER_INFO });
+	const route = await service.createRoute('conformance', invoker, { serverInfo: CONFORMANCE_SERVER_INFO }, { grpc });
 	const url = route.address.toString(true);
 
 	if (options.urlFile) {
