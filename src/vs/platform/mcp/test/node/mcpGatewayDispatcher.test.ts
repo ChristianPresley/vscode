@@ -469,6 +469,12 @@ suite('MCP - GatewayDispatcher', () => {
 		assert.deepStrictEqual(unsupported.data, { supported: [LATEST_MCP_PROTOCOL_VERSION], requested: 'v9' });
 		// The header disagrees with the body: a mismatch, before the version is judged.
 		await expectError(headers('tools/list'), request('tools/list', { _meta: { ...modernMeta(), [META_PROTOCOL_VERSION]: 'v9' } }), MCP.HEADER_MISMATCH);
+		// The header and the body name the same unsupported revision: -32022 before the other headers
+		// (here Mcp-Method is missing), so a client of another revision can renegotiate.
+		const noMethod = await expectError({ [MCP_PROTOCOL_VERSION_HEADER.toLowerCase()]: 'v9' }, request('tools/list', { _meta: { ...modernMeta(), [META_PROTOCOL_VERSION]: 'v9' } }), MCP.UNSUPPORTED_PROTOCOL_VERSION);
+		assert.deepStrictEqual(noMethod.data, { supported: [LATEST_MCP_PROTOCOL_VERSION], requested: 'v9' });
+		// The version header is missing: a mismatch first.
+		await expectError({ [MCP_METHOD_HEADER.toLowerCase()]: 'tools/list' }, request('tools/list', { _meta: { ...modernMeta(), [META_PROTOCOL_VERSION]: 'v9' } }), MCP.HEADER_MISMATCH);
 		await expectError(headers('prompts/list'), request('tools/list', { _meta: modernMeta() }), MCP.HEADER_MISMATCH);
 		await expectError(headers('tools/call'), request('tools/call', { name: 'test_simple_text', _meta: modernMeta() }), MCP.HEADER_MISMATCH);
 		assert.ok((await dispatcher.prepareModernRequest(headers('tools/call', { [MCP_NAME_HEADER.toLowerCase()]: 'test_simple_text' }), request('tools/call', { name: 'test_simple_text', _meta: modernMeta() }))).ok);

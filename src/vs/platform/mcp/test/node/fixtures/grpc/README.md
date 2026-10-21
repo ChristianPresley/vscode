@@ -30,7 +30,7 @@ interop checks.
 | `LICENSE-zig-sdk` | `LICENSE` |
 
 - Source: https://github.com/ChristianPresley/zig-sdk
-- Release `v0.5.2`, commit `03b8049d59d2abdb6fa6c08beaac33c370de8eb0`.
+- Release `v0.6.0`, commit `77146c46df2c2289185ec8151dcf173809f4b0c4` (the proto is unchanged since `v0.5.2`).
 - License: Apache-2.0 (see `LICENSE-zig-sdk` and the `ChristianPresley/zig-sdk`
   entry in `cgmanifest.json`).
 - The normative description of the tunnel and of the typed mapping is the

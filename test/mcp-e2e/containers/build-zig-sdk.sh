@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# build-zig-sdk.sh [branch] - runs INSIDE the vscode-mcp-build:2 container (see build-zig-sdk.ps1).
+# build-zig-sdk.sh [branch or tag] - runs INSIDE the vscode-mcp-build:2 container (see build-zig-sdk.ps1).
 # Clones zig-sdk from the read-only mount /src/zig-sdk into the volume (/work/zig-sdk), builds the
 # conformance server and the examples (ReleaseSafe), then starts
 #   mcp-conformance-server --port 3000 --grpc-port 50051 --grpc-typed
 # and checks a 2026-07-28 `server/discover` over HTTP POST /mcp (and over gRPC with curl).
 set -euo pipefail
-BRANCH="${1:-main}"
+BRANCH="${1:-v0.6.0}"
 SRC=/src/zig-sdk
 REPO=/work/zig-sdk
 LOGS=/out/logs
@@ -23,8 +23,13 @@ if [ ! -d "$REPO/.git" ]; then
 	git clone --branch "$BRANCH" "$SRC" "$REPO"
 else
 	git -C "$REPO" remote set-url origin "$SRC"
-	git -C "$REPO" fetch --prune origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
-	git -C "$REPO" checkout -f -B "$BRANCH" "origin/$BRANCH"
+	git -C "$REPO" fetch --prune --tags --force origin "+refs/heads/*:refs/remotes/origin/*"
+	# A release tag (the default) is checked out detached; a branch at its tip.
+	if git -C "$REPO" rev-parse -q --verify "refs/tags/$BRANCH^{commit}" > /dev/null; then
+		git -C "$REPO" checkout -f --detach "refs/tags/$BRANCH"
+	else
+		git -C "$REPO" checkout -f -B "$BRANCH" "origin/$BRANCH"
+	fi
 	git -C "$REPO" clean -fd
 fi
 cd "$REPO"

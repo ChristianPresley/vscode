@@ -48,7 +48,7 @@ test/mcp-e2e/run-e2e.sh --skip-build --repeat 3              # Git Bash: the sam
 | `-Only <substrings>` | Run only the tests whose name contains one of the comma-separated substrings (UI scenarios also match by their id; `screenshots` selects the screenshot pass of the UI suite). |
 | `-RunId <id>` | The name of the results folder (default: a UTC timestamp). |
 | `-Cpu` | Start llama.cpp on the CPU. |
-| `-RebuildZig`, `-ZigSdk <path>`, `-ZigBranch <b>` | Rebuild the zig-sdk servers (by default only when they are missing from the volume). |
+| `-RebuildZig`, `-ZigSdk <path>`, `-ZigBranch <b>` | Rebuild the zig-sdk servers (by default only when they are missing from the volume). `-ZigBranch` takes a branch or a tag; the default is the release `v0.6.0`. |
 | `-KeepLlamaDuringBuild` | Do not stop `llama-e2e` while the product builds. |
 
 The driver exits non-zero when any test fails or any screenshot fails its DOM checks (1: a check that does not hold, a screenshot section that threw, or a screenshot whose UI never showed), or when a suite produced no results (2). A test that skips although this build is expected to support what it tests fails (see "Expectation flags").

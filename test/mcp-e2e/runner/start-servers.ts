@@ -62,9 +62,10 @@ async function startProcess(logDir: string, name: string, command: string, args:
 		return false;
 	}
 	// A server of the previous start can leave its port unbindable for a while although nothing
-	// listens any more (TIME_WAIT connections; the zig server binds without SO_REUSEADDR and exits
-	// with AddressInUse, seen in run dbg-2 between the API and the UI suite). A process that exits
-	// before it listens is started again until the port can be bound, for up to 90 s.
+	// listens any more (TIME_WAIT connections: a zig server before 0.6.0 binds without SO_REUSEADDR
+	// and exits with AddressInUse, seen in run dbg-2 between the API and the UI suite; 0.6.0 gets
+	// `--reuse-address`, see `zigArgs`). A process that exits before it listens is started again
+	// until the port can be bound, for up to 90 s.
 	const deadline = Date.now() + 90_000;
 	for (let attempt = 1; ; attempt++) {
 		const out = fs.openSync(path.join(logDir, `${name}.log`), 'a');
@@ -82,6 +83,22 @@ async function startProcess(logDir: string, name: string, command: string, args:
 		console.log(`[start-servers] ${name}: exited with ${exitCode} before listening on ${port} (attempt ${attempt}); starting it again in 3 s`);
 		await new Promise(r => setTimeout(r, 3000));
 	}
+}
+
+/**
+ * The arguments of a zig-sdk conformance server: with `--reuse-address` when the binary knows the
+ * option (zig-sdk 0.6.0 and later), so a restart on the same port does not wait for TIME_WAIT.
+ * The old process is still stopped and waited for first (`stop`), since with the option a second
+ * live server of the same user could share the port on Linux.
+ */
+function zigArgs(binary: string, args: readonly string[]): readonly string[] {
+	let supported = false;
+	try {
+		supported = fs.readFileSync(binary).includes('--reuse-address');
+	} catch {
+		// no binary: the start fails and reports it
+	}
+	return supported && !args.includes('--reuse-address') && !args.includes('--stdio') ? [...args, '--reuse-address'] : args;
 }
 
 async function start(logDir: string, args: readonly string[]): Promise<number> {
@@ -102,7 +119,8 @@ async function start(logDir: string, args: readonly string[]): Promise<number> {
 		const p = resolvePlaceholders(server.process, placeholders);
 		// The server itself, or (for an entry without a command) another entry's server as the upstream.
 		const upstream = p.command ? p.port : p.upstreamPort;
-		if (p.command && (p.port === undefined || !await startProcess(logDir, server.label, p.command, p.args ?? [], p.port, p.env, pids))) {
+		const processArgs = p.command === placeholders.zig ? zigArgs(placeholders.zig, p.args ?? []) : p.args ?? [];
+		if (p.command && (p.port === undefined || !await startProcess(logDir, server.label, p.command, processArgs, p.port, p.env, pids))) {
 			failures++;
 			continue;
 		}

@@ -2035,7 +2035,7 @@ export const FEATURE_ROWS: readonly { readonly feature: string; readonly status:
  * The validation order of a call to the gateway gRPC listener
  * (`GrpcServer` in `src/vs/base/node/grpcServer.ts`, routes in
  * `src/vs/platform/mcp/node/mcpGatewayGrpc.ts`) next to zig-sdk
- * `src/grpc/transport/grpc_server.zig` (v0.5.2, `handleStreamInner`).
+ * `src/grpc/transport/grpc_server.zig` (v0.6.0, `handleStreamInner`).
  */
 export interface IGrpcServerParityStep {
 	readonly step: string;
@@ -2106,8 +2106,8 @@ export const GRPC_SERVER_PARITY: readonly IGrpcServerParityStep[] = [
 	},
 	{
 		step: '7. Mirrored request metadata',
-		zig: '`mcp-protocol-version`, `mcp-method`, `mcp-name` and `mcp-param-*` checked against the message: -32020',
-		gateway: 'the same checks as the HTTP route (`prepareModernRequest`): -32020 or -32022 in `mcp-error-bin`, before the request runs',
+		zig: '`mcp-protocol-version` first: another revision is -32022 with `data.supported`, a value that is missing, malformed or differs from `_meta` is -32020; then `mcp-method`, `mcp-name` and `mcp-param-*` against the message: -32020',
+		gateway: 'the same order as the HTTP route (`prepareModernRequest`): -32022 for another revision before the other metadata, otherwise -32020, in `mcp-error-bin`, before the request runs',
 		tests: [
 			{ file: 'src/vs/platform/mcp/test/node/mcpGatewayGrpc.test.ts', test: 'a header mismatch ends the call before the request runs: -32020 in mcp-error-bin' },
 			{ file: 'src/vs/platform/mcp/test/node/mcpGatewayGrpc.test.ts', test: 'typed metadata that disagrees with the message is -32020, an unsupported version -32022' },

@@ -812,10 +812,10 @@
 				"git": {
 					"name": "ChristianPresley/zig-sdk",
 					"repositoryUrl": "https://github.com/ChristianPresley/zig-sdk",
-					"commitHash": "03b8049d59d2abdb6fa6c08beaac33c370de8eb0"
+					"commitHash": "77146c46df2c2289185ec8151dcf173809f4b0c4"
 				}
 			},
-			"version": "v0.5.2",
+			"version": "v0.6.0",
 			"description": "Test data only: the vendored proto of its gRPC transport (mcp_zig_transport_v1.proto) and test/mcp-conformance/requirements-2026-07-28.json, converted from its docs/spec/requirements.zon (the normative sentences of the MCP 2026-07-28 specification).",
 			"developmentDependency": true,
 			"license": "Apache-2.0"

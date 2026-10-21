@@ -41,7 +41,7 @@ param(
 	[string]$RunId,
 	[string]$Repo,
 	[string]$ZigSdk = 'C:\repos\zig-sdk',
-	[string]$ZigBranch = 'main',
+	[string]$ZigBranch = 'v0.6.0',
 	[switch]$RebuildZig,
 	[switch]$Cpu,
 	[switch]$KeepLlamaDuringBuild,

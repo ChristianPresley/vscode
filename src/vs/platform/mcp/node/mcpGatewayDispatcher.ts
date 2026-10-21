@@ -12,6 +12,7 @@ import { ILogger } from '../../log/common/log.js';
 import { IMcpGatewayCacheHints, IMcpGatewayInputRequired, IMcpGatewayInvokeContext, IMcpGatewayServerCapabilities, IMcpGatewaySingleServerInvoker } from '../common/mcpGateway.js';
 import { applyModernEnvelope, clientCapabilitiesOf, GATEWAY_SERVER_INFO, hasClientCapability, honorSubscriptionFilter, IModernRequestMeta, McpGatewayRpcError, McpInputRequestCapability, requiredCapabilitiesForInputRequest, validateInputResponses, validateModernRequestMeta, validateStandardHeaders } from '../common/mcpGatewayProtocol.js';
 import { LATEST_MCP_PROTOCOL_VERSION, McpProtocolEra } from '../common/mcpProtocolVersions.js';
+import { MCP_PROTOCOL_VERSION_HEADER, trimOws } from '../common/mcpHttpHeaders.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
 import { McpTasks } from '../common/modelContextProtocolTasks.js';
@@ -294,11 +295,17 @@ export class McpGatewayDispatcher extends Disposable {
 		const meta = validateModernRequestMeta(request);
 		if (!meta.ok) {
 			if (meta.error.code === MCP.UNSUPPORTED_PROTOCOL_VERSION) {
-				// A header that disagrees with the body is a mismatch before the version is judged.
+				// An unsupported revision is judged before the other mirrored headers, so a
+				// client of another revision learns the supported ones and can renegotiate
+				// (the order of zig-sdk 0.6.0). A version header that is missing, malformed
+				// or disagrees with the body is still a mismatch first.
 				const requested = (meta.error.data as { requested: string }).requested;
-				const headerError = validateStandardHeaders(headers, request, requested);
-				if (headerError) {
-					return { ok: false, error: headerError };
+				const rawVersion = headers[MCP_PROTOCOL_VERSION_HEADER.toLowerCase()];
+				if (rawVersion === undefined || trimOws(rawVersion) !== requested) {
+					const headerError = validateStandardHeaders(headers, request, requested);
+					if (headerError) {
+						return { ok: false, error: headerError };
+					}
 				}
 			}
 			return meta;
