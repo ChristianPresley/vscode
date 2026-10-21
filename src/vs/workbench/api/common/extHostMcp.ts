@@ -6,11 +6,11 @@
 import * as vscode from 'vscode';
 import { DeferredPromise, raceCancellationError, Sequencer, timeout } from '../../../base/common/async.js';
 import { CancellationToken, CancellationTokenSource } from '../../../base/common/cancellation.js';
-import { CancellationError } from '../../../base/common/errors.js';
+import { CancellationError, isCancellationError } from '../../../base/common/errors.js';
 import { Emitter, Event } from '../../../base/common/event.js';
 import { JsonRpcId } from '../../../base/common/jsonRpcProtocol.js';
 import { Disposable, DisposableMap, DisposableStore, IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
-import { AUTH_SCOPE_SEPARATOR, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, OAuthClientError, parseWWWAuthenticateHeader, scopesMatch } from '../../../base/common/oauth.js';
+import { AUTH_SCOPE_SEPARATOR, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, isAuthorizationProtectedResourceMetadata, OAuthClientError, parseWWWAuthenticateHeader, scopesMatch } from '../../../base/common/oauth.js';
 import { IOAuthClientRecord, IOAuthClientStorage, OAuthLogLevel, parseBearerChallenge, redact } from '../../../base/common/oauthClient.js';
 import { SSEParser } from '../../../base/common/sseParser.js';
 import { URI, UriComponents } from '../../../base/common/uri.js';
@@ -27,14 +27,14 @@ import { StorageScope } from '../../../platform/storage/common/storage.js';
 import { extensionPrefixedIdentifier, IMcpMessageEnvelope, IMcpRequestAbort, McpCollectionDefinition, McpConnectionState, McpServerDefinition, McpServerEnvironmentVariableExpansion, McpServerLaunch, McpServerStaticMetadata, McpServerStaticToolAvailability, McpServerTransportHTTP, McpServerTransportType, UserInteractionRequiredError } from '../../contrib/mcp/common/mcpTypes.js';
 import { MCPLegacy } from '../../contrib/mcp/common/modelContextProtocolLegacy.js';
 import { checkProposedApiEnabled, isProposedApiEnabled } from '../../services/extensions/common/extensions.js';
-import { ExtHostMcpShape, IMcpAuthenticationDetails, IAuthMetadataSource, IStartMcpOptions, MainContext, MainThreadMcpShape, IAuthResourceMetadataSource, IAuthServerMetadataSource, IMcpGatewayServerDto } from './extHost.protocol.js';
+import { ExtHostMcpShape, IMcpAuthenticationDetails, IAuthMetadataSource, IStartMcpOptions, MainContext, MainThreadMcpShape, IAuthResourceMetadataSource, IAuthServerMetadataSource, IMcpGatewayServerDto, IMcpRegisteredAuthorizationServer } from './extHost.protocol.js';
 import { IExtHostInitDataService } from './extHostInitDataService.js';
 import { IExtHostRpcService } from './extHostRpcService.js';
 import * as Convert from './extHostTypeConverters.js';
 import { McpGrpcServerDefinition, McpHttpServerDefinition, McpStdioServerDefinition, McpToolAvailability } from './extHostTypes.js';
 import { IExtHostVariableResolverProvider } from './extHostVariableResolverService.js';
 import { IExtHostWorkspace } from './extHostWorkspace.js';
-import { createMcpOAuthClient, IMcpOAuthServerPolicy, MCP_OAUTH_MAX_AUTHORIZATION_REQUESTS, MCP_OAUTH_MAX_CHALLENGE_CYCLES, MCP_OAUTH_REJECTIONS_BEFORE_REREGISTRATION, resolveMcpOAuthPolicy } from './mcpOAuthClientFactory.js';
+import { createMcpOAuthClient, IMcpOAuthServerPolicy, MCP_OAUTH_MAX_AUTHORIZATION_REQUESTS, MCP_OAUTH_MAX_CHALLENGE_CYCLES, MCP_OAUTH_METADATA_TIMEOUT_MS, MCP_OAUTH_REJECTIONS_BEFORE_REREGISTRATION, resolveMcpOAuthPolicy } from './mcpOAuthClientFactory.js';
 import { IMcpRemoteServerOAuthConfiguration } from '../../../platform/mcp/common/mcpPlatformTypes.js';
 
 export const IExtHostMpcService = createDecorator<IExtHostMpcService>('IExtHostMpcService');
@@ -48,8 +48,13 @@ export interface IExtHostMpcService extends ExtHostMcpShape {
 	/** Returns all MCP server definitions known to the editor. */
 	readonly mcpServerDefinitions: readonly vscode.McpServerDefinition[];
 
-	/** Starts an MCP gateway that exposes MCP servers via HTTP endpoints. */
-	startMcpGateway(chatSessionResource?: URI): Promise<vscode.McpGateway | undefined>;
+	/**
+	 * Starts an MCP gateway that exposes MCP servers via HTTP endpoints
+	 * ({@link vscode.lm.startMcpGateway}). Both parameters are required, also
+	 * when `undefined`, so that a caller (the API factory) cannot drop the
+	 * extension's options without failing to compile.
+	 */
+	startMcpGateway(chatSessionResource: URI | undefined, options: vscode.McpGatewayStartOptions | undefined): Promise<vscode.McpGateway | undefined>;
 }
 
 const serverDataValidation = vObj({
@@ -94,6 +99,8 @@ export class ExtHostMcpService extends Disposable implements IExtHostMpcService 
 	private readonly _unresolvedMcpServers = new Map</* collectionId */ string, {
 		provider: vscode.McpServerDefinitionProvider;
 		servers: vscode.McpServerDefinition[];
+		/** The extension of the provider; resolved definitions are subject to its API proposals too. */
+		extension: IExtensionDescription;
 	}>();
 
 	// MCP server definitions synced from main thread
@@ -129,17 +136,37 @@ export class ExtHostMcpService extends Disposable implements IExtHostMpcService 
 		this._onDidChangeMcpServerDefinitions.fire();
 	}
 
+	/**
+	 * Starts a launch. The main thread does not wait for this call, so a launch
+	 * that cannot start (a transport this extension host does not have, an
+	 * invalid launch, a transport handle that throws) reports the Error state
+	 * here, rather than leaving the server in Starting forever.
+	 */
 	$startMcp(id: number, opts: IStartMcpOptions): void {
-		this._startMcp(id, McpServerLaunch.fromSerialized(opts.launch), opts.defaultCwd && URI.revive(opts.defaultCwd), opts.errorOnUserInteraction);
+		let started: void | Promise<void>;
+		try {
+			started = this._startMcp(id, McpServerLaunch.fromSerialized(opts.launch), opts.defaultCwd && URI.revive(opts.defaultCwd), opts.errorOnUserInteraction);
+		} catch (err) {
+			this._didFailToStart(id, err);
+			return;
+		}
+		started?.catch(err => this._didFailToStart(id, err));
 	}
 
-	protected _startMcp(id: number, launch: McpServerLaunch, _defaultCwd?: URI, errorOnUserInteraction?: boolean): void {
+	private _didFailToStart(id: number, err: unknown): void {
+		this._logService.error(`[MCP] Could not start server ${id}: ${stringifyError(err)}`);
+		this._sseEventSources.deleteAndDispose(id);
+		this._proxy.$onDidChangeState(id, { state: McpConnectionState.Kind.Error, message: err instanceof Error ? err.message : String(err) });
+	}
+
+	/** Starts a launch; throws, or returns a promise that rejects, when it cannot. */
+	protected _startMcp(id: number, launch: McpServerLaunch, _defaultCwd?: URI, errorOnUserInteraction?: boolean): void | Promise<void> {
 		if (launch.type === McpServerTransportType.HTTP) {
 			this._sseEventSources.set(id, new McpHTTPHandle(id, launch, this._proxy, this._logService, errorOnUserInteraction));
 			return;
 		}
 
-		throw new Error('not implemented');
+		throw new Error(localize('mcp.transportUnsupported', "This extension host cannot start {0} MCP servers.", transportDisplayName(launch.type)));
 	}
 
 	async $substituteVariables<T>(_workspaceFolder: UriComponents | undefined, value: T): Promise<T> {
@@ -198,6 +225,12 @@ export class ExtHostMcpService extends Disposable implements IExtHostMpcService 
 		}
 
 		const resolved = await rec.provider.resolveMcpServerDefinition(server, CancellationToken.None);
+		if (resolved instanceof McpGrpcServerDefinition) {
+			// As in provideMcpServerDefinitions: a resolved definition may be the first gRPC one.
+			checkProposedApiEnabled(rec.extension, 'mcpGrpcServerDefinition');
+			// The launch of this server alone fails, with the reason.
+			McpServerLaunch.validateGrpcUri(resolved.uri);
+		}
 		return resolved ? Convert.McpServerDefinition.from(resolved) : undefined;
 	}
 
@@ -222,23 +255,30 @@ export class ExtHostMcpService extends Disposable implements IExtHostMpcService 
 
 		const update = async () => {
 			const list = await provider.provideMcpServerDefinitions(CancellationToken.None);
-			this._unresolvedMcpServers.set(mcp.id, { servers: list ?? [], provider });
+			this._unresolvedMcpServers.set(mcp.id, { servers: list ?? [], provider, extension });
 
 			const servers: McpServerDefinition.Serialized[] = [];
+			const accepted: vscode.McpServerDefinition[] = [];
 			for (const item of list ?? []) {
-				let id = ExtensionIdentifier.toKey(extension.identifier) + '/' + item.label;
-				if (servers.some(s => s.id === id)) {
-					let i = 2;
-					while (servers.some(s => s.id === id + i)) { i++; }
-					id = id + i;
-				}
-
 				serverDataValidation.validateOrThrow(item);
 				if ((item as vscode.McpHttpServerDefinition2).authentication) {
 					checkProposedApiEnabled(extension, 'mcpToolDefinitions');
 				}
 				if (item instanceof McpGrpcServerDefinition) {
 					checkProposedApiEnabled(extension, 'mcpGrpcServerDefinition');
+					if (!McpServerLaunch.isGrpcScheme(item.uri.scheme)) {
+						// Left out alone: the main thread would reject the launch, and with it every server of the collection.
+						this._logService.error(`[MCP] The server '${item.label}' of ${extension.identifier.value} is a McpGrpcServerDefinition whose URI ${item.uri.toString(true)} does not start with grpc:// or grpcs://; it is left out.`);
+						continue;
+					}
+				}
+				accepted.push(item);
+
+				let id = ExtensionIdentifier.toKey(extension.identifier) + '/' + item.label;
+				if (servers.some(s => s.id === id)) {
+					let i = 2;
+					while (servers.some(s => s.id === id + i)) { i++; }
+					id = id + i;
 				}
 
 				let staticMetadata: McpServerStaticMetadata | undefined;
@@ -264,6 +304,7 @@ export class ExtHostMcpService extends Disposable implements IExtHostMpcService 
 				});
 			}
 
+			this._unresolvedMcpServers.set(mcp.id, { servers: accepted, provider, extension });
 			this._proxy.$upsertMcpCollection(mcp, servers);
 		};
 
@@ -299,9 +340,10 @@ export class ExtHostMcpService extends Disposable implements IExtHostMpcService 
 		return store;
 	}
 
-	/** {@link vscode.lm.startMcpGateway} */
-	public async startMcpGateway(chatSessionResource?: URI): Promise<vscode.McpGateway | undefined> {
-		const result = await this._proxy.$startMcpGateway(chatSessionResource?.toJSON());
+	/** {@link vscode.lm.startMcpGateway} (see {@link IExtHostMpcService.startMcpGateway} for why both parameters are required) */
+	public async startMcpGateway(chatSessionResource: URI | undefined, options: vscode.McpGatewayStartOptions | undefined): Promise<vscode.McpGateway | undefined> {
+		// Only `grpc: true` opens the gateway's gRPC listener (a truthy non-boolean does not).
+		const result = await this._proxy.$startMcpGateway(chatSessionResource?.toJSON(), options?.grpc === true ? { grpc: true } : undefined);
 		if (!result) {
 			return undefined;
 		}
@@ -344,6 +386,15 @@ function reviveGatewayServer(server: IMcpGatewayServerDto): vscode.McpGatewaySer
 		: { label: server.label, address: URI.revive(server.address) };
 }
 
+function transportDisplayName(type: McpServerTransportType): string {
+	switch (type) {
+		case McpServerTransportType.Stdio: return 'stdio';
+		case McpServerTransportType.HTTP: return 'HTTP';
+		case McpServerTransportType.Grpc: return 'gRPC';
+		default: return String(type);
+	}
+}
+
 function stringifyError(err: unknown): string {
 	if (!(err instanceof Error)) {
 		return String(err);
@@ -383,6 +434,15 @@ function requestKey(id: JsonRpcId): string {
 	return `${typeof id}:${id}`;
 }
 
+/**
+ * Whether an SSE `message` event carries no JSON-RPC message: the priming
+ * event of a 2025-11-25 stream (an id, maybe a retry, and empty data) or a
+ * keep-alive. Its `id` and `retry` still count for resumption.
+ */
+function isEmptySSEData(data: string): boolean {
+	return data.trim() === '';
+}
+
 function tryParseJson(text: string): unknown {
 	try {
 		return JSON.parse(text);
@@ -401,6 +461,34 @@ function isResponseFor(data: string, requestId: JsonRpcId): boolean {
 		&& (Object.prototype.hasOwnProperty.call(message, 'result') || Object.prototype.hasOwnProperty.call(message, 'error')));
 }
 
+/**
+ * An HTTP error body (`text`, parsed as `body`) for the POST of request
+ * `requestId`, as the message delivered to the engine. Each POST carries one
+ * message, so a JSON-RPC error in the body answers that request even when its
+ * `id` is null or missing (a server or intermediary that rejected the request
+ * before reading it): the request's id is put in, because the JSON-RPC layer
+ * drops a response that matches no pending request, which would leave the
+ * request (a handshake, for instance) pending forever.
+ */
+function asResponseToRequest(text: string, body: unknown, requestId: JsonRpcId | undefined): string {
+	if (requestId === undefined) {
+		return text;
+	}
+	const lacksId = (message: unknown): message is Record<string, unknown> =>
+		typeof message === 'object' && message !== null && !Array.isArray(message)
+		&& Object.prototype.hasOwnProperty.call(message, 'error')
+		&& ((message as { id?: unknown }).id === null || (message as { id?: unknown }).id === undefined);
+	if (Array.isArray(body)) {
+		return body.some(lacksId) ? JSON.stringify(body.map(message => lacksId(message) ? { ...message, id: requestId } : message)) : text;
+	}
+	return lacksId(body) ? JSON.stringify({ ...body, id: requestId }) : text;
+}
+
+/** The outcome of a legacy HTTP+SSE attachment: the message endpoint the server named, or why there is none. */
+type SseAttachment =
+	| { readonly kind: 'attached'; readonly endpoint: string }
+	| { readonly kind: 'failed'; readonly message: string };
+
 const MAX_FOLLOW_REDIRECTS = 5;
 const REDIRECT_STATUS_CODES = [301, 302, 303, 307, 308];
 const HTTP_PROTOCOLS = new Set(['http:', 'https:']);
@@ -415,6 +503,23 @@ function setHostHeader(headers: Record<string, string>, name: string, value: str
 		}
 	}
 	headers[name] = value;
+}
+
+/**
+ * The headers of a request (or a redirect) to another origin than the MCP
+ * server's: without the credential-bearing headers and the configured ones
+ * (`configured`, compared case-insensitively), with the generated
+ * `transportHeaders`, which survive. Shared by the Streamable HTTP and gRPC
+ * transports.
+ */
+export function stripCrossOriginHeaders(headers: Readonly<Record<string, string>>, configured: readonly (readonly [string, string])[], transportHeaders: Readonly<Record<string, string>>): Record<string, string> {
+	const configuredNames = new Set(configured.map(([name]) => name.toLowerCase()));
+	const filtered = Object.fromEntries(Object.entries(headers).filter(([name]) =>
+		!CROSS_ORIGIN_STRIPPED_HEADERS.has(name.toLowerCase()) && !configuredNames.has(name.toLowerCase())));
+	for (const [name, value] of Object.entries(transportHeaders)) {
+		setHostHeader(filtered, name, value);
+	}
+	return filtered;
 }
 
 function isSameSocketEndpoint(url: string, configuredUrl: string): boolean {
@@ -433,10 +538,18 @@ function isSameSocketEndpoint(url: string, configuredUrl: string): boolean {
  * The protocol engine tells the handle which revision a message belongs to
  * through its {@link IMcpMessageEnvelope}. A modern request probes the server
  * first: a 2xx or a recognized modern error means the server speaks the new
- * revision; any other 4xx means it is a legacy server, the request is aborted
- * with `legacy-probe` and the engine retries with the legacy handshake.
+ * revision; any other 4xx, or a 2xx whose event stream names a message
+ * endpoint (a legacy HTTP+SSE server answering any POST with its stream),
+ * means it is a legacy server, the request is aborted with `legacy-probe` and
+ * the engine retries with the legacy handshake.
  * Messages without an envelope are legacy traffic and go on the wire exactly
  * as they always did (first POST decides between Streamable HTTP and SSE).
+ * A first legacy request with an envelope (a pinned or cached legacy revision)
+ * that the server rejects with a recognized modern error is answered with that
+ * error instead of the HTTP+SSE fallback, so the engine renegotiates. Any other
+ * rejection still tries the HTTP+SSE fallback; when that fails too, the
+ * enveloped request is aborted rather than the server failed, and the engine
+ * renegotiates (a hinted handshake) or fails the start.
  */
 export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 	private readonly _requestSequencer = new Sequencer();
@@ -467,7 +580,7 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 			proxy: _proxy,
 			errorOnUserInteraction: this._errorOnUserInteraction,
 			protocolVersion: () => this._protocolVersion,
-			fetchMetadata: (url, init, transportHeaders) => this._fetch(url, init, { isAuthMetadata: true, transportHeaders }),
+			fetchMetadata: (url, init, transportHeaders, signal) => this._fetch(url, init, { isAuthMetadata: true, transportHeaders, signal }),
 			log: (level, message) => this._log(level, message),
 		}));
 
@@ -496,7 +609,10 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 				await this._send(message, envelope);
 			}
 		} catch (err) {
-			if (envelope?.requestId !== undefined && this._wasCancelledLocally(envelope.requestId)) {
+			// Only 2026-07-28 requests are tracked, so only they can have been
+			// cancelled locally; a failed legacy request (a terminal authorization
+			// error such as step_up_limit, a network error) must not be dropped.
+			if (era === 'modern' && envelope?.requestId !== undefined && this._wasCancelledLocally(envelope.requestId)) {
 				return;
 			}
 			if (envelope?.requestId !== undefined) {
@@ -605,7 +721,9 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 	 */
 	private async _sendModern(message: string, envelope: IMcpMessageEnvelope): Promise<void> {
 		if (this._mode.value === HttpMode.SSE) {
-			this._abortRequest(envelope, { reason: 'unexpressible', message: 'The server uses the legacy HTTP+SSE transport' });
+			// A legacy server, recognized when its 4xx led to the HTTP+SSE fallback: a probe (the engine
+			// renegotiating a pinned revision this server rejected) falls back to the legacy handshake.
+			this._abortRequest(envelope, { reason: 'legacy-probe', message: 'The server uses the legacy HTTP+SSE transport' });
 			return;
 		}
 
@@ -636,10 +754,11 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 		);
 
 		if (res.status >= 200 && res.status < 300) {
-			if (this._mode.value === HttpMode.Unknown) {
+			const probing = this._mode.value === HttpMode.Unknown;
+			if (probing) {
 				this._mode = { value: HttpMode.Modern };
 			}
-			await this._handleSuccessfulStreamableHttp(res, message, envelope, controller?.signal);
+			await this._handleSuccessfulStreamableHttp(res, message, envelope, controller?.signal, probing);
 			this._untrackRequest(envelope);
 			return;
 		}
@@ -654,7 +773,7 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 					this._mode = { value: HttpMode.Modern };
 				}
 				this._untrackRequest(envelope);
-				this._proxy.$onDidReceiveMessage(this._id, errText);
+				this._proxy.$onDidReceiveMessage(this._id, asResponseToRequest(errText, body, envelope.requestId));
 				return;
 			}
 			if (this._mode.value === HttpMode.Unknown) {
@@ -716,8 +835,20 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 			// ...except for auth errors
 			&& !isAuthStatusCode(res.status)
 		) {
+			// An enveloped legacy request (a pinned or cached revision) rejected with a recognized
+			// 2026-07-28 error comes from a modern server, not from a legacy HTTP+SSE one: the
+			// engine gets the JSON-RPC error and renegotiates. Any other 4xx keeps the fallback.
+			if (envelope && (res.status === 400 || res.status === 404 || res.status === 405)) {
+				const errText = await this._getErrText(res);
+				const body = tryParseJson(errText);
+				if (body !== undefined && isRecognizedModernError(res.status, body)) {
+					this._log(LogLevel.Info, `${res.status} status with a 2026-07-28 error for a ${envelope.protocolVersion} request to ${this._launch.uri}; the server does not speak this revision`);
+					this._proxy.$onDidReceiveMessage(this._id, asResponseToRequest(errText, body, envelope.requestId));
+					return;
+				}
+			}
 			this._log(LogLevel.Info, `${res.status} status sending message to ${this._launch.uri}, will attempt to fall back to legacy SSE`);
-			this._sseFallbackWithMessage(message, envelope);
+			this._sseFallbackWithMessage(message, envelope, res.status);
 			return;
 		}
 
@@ -745,13 +876,28 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 		await this._handleSuccessfulStreamableHttp(res, message, envelope);
 	}
 
-	private async _sseFallbackWithMessage(message: string, envelope?: IMcpMessageEnvelope) {
+	/**
+	 * Falls back to the legacy HTTP+SSE transport and sends `message` there.
+	 * When the fallback follows a rejected POST (`rejectedStatus`) and fails
+	 * before the server names its message endpoint, an enveloped request is
+	 * aborted with both reasons instead of failing the server, and the engine
+	 * decides: it renegotiates a pinned or cached revision the server rejected
+	 * (`server/discover`), and otherwise fails the start with that message.
+	 */
+	private async _sseFallbackWithMessage(message: string, envelope?: IMcpMessageEnvelope, rejectedStatus?: number) {
 		try {
-			const endpoint = await this._attachSSE();
-			if (endpoint) {
-				this._mode = { value: HttpMode.SSE, endpoint };
-				await this._sendLegacySSE(endpoint, message, envelope);
+			const attached = await this._attachSSE();
+			if (attached.kind === 'failed') {
+				if (rejectedStatus !== undefined && envelope?.kind === 'request' && envelope.requestId !== undefined) {
+					this._log(LogLevel.Info, `The fallback to legacy SSE failed (${attached.message}); the ${envelope.method} request fails with the ${rejectedStatus} status`);
+					this._abortRequest(envelope, { reason: 'http-status', httpStatus: rejectedStatus, message: `${rejectedStatus} status sending message to ${this._launch.uri}, and the fallback to legacy SSE failed: ${attached.message}` });
+				} else {
+					this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: attached.message });
+				}
+				return;
 			}
+			this._mode = { value: HttpMode.SSE, endpoint: attached.endpoint };
+			await this._sendLegacySSE(attached.endpoint, message, envelope);
 		} catch (err) {
 			this._handleSendError(err);
 		}
@@ -762,9 +908,16 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 	 * stream whose events are forwarded until it ends. With an envelope the
 	 * stream is watched for the response to the request: a modern stream that
 	 * ends without it aborts the request; a legacy stream that ends without it
-	 * is resumed with `Last-Event-ID` when the server supports resumption.
+	 * is resumed with `Last-Event-ID` when the server supports resumption. A
+	 * stream that names a message endpoint (a legacy HTTP+SSE server) is ended
+	 * and the message goes to the HTTP+SSE fallback instead, without an abort.
+	 * When it answers the first 2026-07-28 request (`probing`: this response
+	 * took the mode for modern), the server is a legacy one all the same: the
+	 * mode is unknown again and the request is aborted with `legacy-probe`, as
+	 * for a 4xx, so the engine falls back to the legacy handshake, whose POST
+	 * then gets the HTTP+SSE fallback.
 	 */
-	private async _handleSuccessfulStreamableHttp(res: CommonResponse, message: string, envelope?: IMcpMessageEnvelope, signal?: AbortSignal) {
+	private async _handleSuccessfulStreamableHttp(res: CommonResponse, message: string, envelope?: IMcpMessageEnvelope, signal?: AbortSignal, probing = false) {
 		if (res.status === 202) {
 			return; // no body
 		}
@@ -773,6 +926,13 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 		if (contentType.startsWith('text/event-stream')) {
 			const watched = envelope?.requestId !== undefined && envelope.kind !== 'notification' ? envelope : undefined;
 			let sawResponse = false;
+			/** Whether the stream delivered a message: a stream that did is not a legacy server's. */
+			let sawMessage = false;
+			/**
+			 * The stream named an endpoint: the message went to the legacy HTTP+SSE fallback, which answers it or
+			 * fails the server, or the probe was aborted with `legacy-probe`. Either way the stream ends here.
+			 */
+			let fellBack = false;
 			let lastEventId: string | undefined;
 			let retryMs: number | undefined;
 			const parser = new SSEParser(event => {
@@ -782,7 +942,12 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 				if (event.retry) {
 					retryMs = event.retry;
 				}
+				if (event.type === 'message' && isEmptySSEData(event.data)) {
+					// A priming event (an id and empty data, 2025-11-25): it only sets the resumption point.
+					return;
+				}
 				if (event.type === 'message') {
+					sawMessage = true;
 					if (watched && !sawResponse && isResponseFor(event.data, watched.requestId!)) {
 						sawResponse = true;
 					}
@@ -790,7 +955,15 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 				} else if (event.type === 'endpoint' && this._mode.value !== HttpMode.Modern) {
 					// An SSE server that didn't correctly return a 4xx status when we POSTed
 					this._log(LogLevel.Warning, `Received SSE endpoint from a POST to ${this._launch.uri}, will fall back to legacy SSE`);
+					fellBack = true;
 					this._sseFallbackWithMessage(message, envelope);
+					throw new CancellationError(); // just to end the SSE stream
+				} else if (event.type === 'endpoint' && probing && watched && !sawMessage) {
+					// The same server answering the 2026-07-28 probe: it does not speak that revision.
+					this._log(LogLevel.Warning, `Received SSE endpoint from a ${watched.protocolVersion} POST to ${this._launch.uri}; the server uses the legacy HTTP+SSE transport`);
+					fellBack = true;
+					this._mode = { value: HttpMode.Unknown };
+					this._abortRequest(watched, { reason: 'legacy-probe', message: 'The server uses the legacy HTTP+SSE transport' });
 					throw new CancellationError(); // just to end the SSE stream
 				}
 			});
@@ -799,11 +972,13 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 			try {
 				await this._doSSE(parser, res, signal);
 			} catch (err) {
-				streamFailed = true;
-				this._log(LogLevel.Warning, `Error reading SSE stream: ${stringifyError(err)}`);
+				if (!fellBack) {
+					streamFailed = true;
+					this._log(LogLevel.Warning, `Error reading SSE stream: ${stringifyError(err)}`);
+				}
 			}
 
-			if (!watched || sawResponse || this._store.isDisposed || signal?.aborted) {
+			if (!watched || sawResponse || fellBack || this._store.isDisposed || signal?.aborted) {
 				return;
 			}
 			if (this._mode.value === HttpMode.Modern) {
@@ -865,7 +1040,7 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 				if (event.retry) {
 					retryMs = event.retry;
 				}
-				if (event.type === 'message' && event.data) {
+				if (event.type === 'message' && !isEmptySSEData(event.data)) {
 					this._proxy.$onDidReceiveMessage(this._id, event.data);
 					if (isResponseFor(event.data, envelope.requestId!)) {
 						sawResponse = true;
@@ -897,11 +1072,17 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 		let lastEventId: string | undefined;
 		let canReconnectAt: number | undefined;
 		for (let retry = 0; !this._store.isDisposed; retry++) {
-			if (canReconnectAt !== undefined) {
-				await timeout(Math.max(0, canReconnectAt - Date.now()), this._cts.token);
-				canReconnectAt = undefined;
-			} else {
-				await timeout(Math.min(retry * 1000, 30_000), this._cts.token);
+			try {
+				if (canReconnectAt !== undefined) {
+					await timeout(Math.max(0, canReconnectAt - Date.now()), this._cts.token);
+					canReconnectAt = undefined;
+				} else {
+					await timeout(Math.min(retry * 1000, 30_000), this._cts.token);
+				}
+			} catch {
+				// Cancelled: the handle was disposed while waiting to (re)connect. Nobody awaits this
+				// loop, so it must end quietly rather than with an unhandled CancellationError.
+				return;
 			}
 
 			let res: CommonResponse;
@@ -949,7 +1130,7 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 				if (event.retry) {
 					canReconnectAt = Date.now() + event.retry;
 				}
-				if (event.type === 'message' && event.data) {
+				if (event.type === 'message' && !isEmptySSEData(event.data)) {
 					this._proxy.$onDidReceiveMessage(this._id, event.data);
 				}
 				if (event.id) {
@@ -968,9 +1149,12 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 	/**
 	 * Starts a legacy SSE attachment, where the SSE response is the session lifetime.
 	 * Unlike `_attachStreamableBackchannel`, this fails the server if it disconnects.
+	 * Resolves with the message endpoint the server names, or with the reason the
+	 * attachment failed before it named one (the GET failed, or the stream errored
+	 * or ended first); the caller reports that failure.
 	 */
-	private async _attachSSE(): Promise<string | undefined> {
-		const postEndpoint = new DeferredPromise<string>();
+	private async _attachSSE(): Promise<SseAttachment> {
+		const outcome = new DeferredPromise<SseAttachment>();
 		const transportHeaders: Record<string, string> = { 'Accept': 'text/event-stream', ...this._versionHeader() };
 		const headers: Record<string, string> = {
 			...Object.fromEntries(this._launch.headers),
@@ -990,28 +1174,37 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 				transportHeaders,
 			);
 			if (res.status >= 300) {
-				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `${res.status} status connecting to ${this._launch.uri} as SSE: ${await this._getErrText(res)}` });
-				return;
+				return { kind: 'failed', message: `${res.status} status connecting to ${this._launch.uri} as SSE: ${await this._getErrText(res)}` };
 			}
 		} catch (e) {
-			this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error connecting to ${this._launch.uri} as SSE: ${e}` });
-			return;
+			return { kind: 'failed', message: `Error connecting to ${this._launch.uri} as SSE: ${e}` };
 		}
 
 		const parser = new SSEParser(event => {
 			if (event.type === 'message') {
-				this._proxy.$onDidReceiveMessage(this._id, event.data);
-			} else if (event.type === 'endpoint') {
-				postEndpoint.complete(new URL(event.data, this._launch.uri.toString(true)).toString());
+				if (!isEmptySSEData(event.data)) {
+					this._proxy.$onDidReceiveMessage(this._id, event.data);
+				}
+			} else if (event.type === 'endpoint' && !outcome.isSettled) {
+				outcome.complete({ kind: 'attached', endpoint: new URL(event.data, this._launch.uri.toString(true)).toString() });
 			}
 		});
 
-		this._register(toDisposable(() => postEndpoint.cancel()));
-		this._doSSE(parser, res).catch(err => {
-			this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error reading SSE stream: ${stringifyError(err)}` });
+		this._register(toDisposable(() => outcome.cancel()));
+		this._doSSE(parser, res).then(() => {
+			if (!outcome.isSettled) {
+				outcome.complete({ kind: 'failed', message: `The SSE stream from ${this._launch.uri} ended before it named the message endpoint` });
+			}
+		}, err => {
+			const message = `Error reading SSE stream: ${stringifyError(err)}`;
+			if (!outcome.isSettled) {
+				outcome.complete({ kind: 'failed', message });
+			} else {
+				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message });
+			}
 		});
 
-		return postEndpoint.p;
+		return outcome.p;
 	}
 
 	/**
@@ -1097,25 +1290,40 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 	 * again, at most {@link MCP_OAUTH_MAX_CHALLENGE_CYCLES} times. A terminal
 	 * authorization failure ({@link OAuthClientError}) is thrown, which puts
 	 * the connection in the error state; any other challenged response is
-	 * returned as is.
+	 * returned as is. Cancelling the request (`signal`) or disposing the
+	 * handle ends the challenge handling, discovery included.
 	 */
 	private async _fetchWithAuthRetry(mcpUrl: string, init: MinimalRequestInit, headers: Record<string, string>, transportHeaders?: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<CommonResponse> {
 		const doFetch = () => this._fetch(mcpUrl, init, { transportHeaders, signal });
 
 		let res = await doFetch();
-		for (let cycle = 0; isAuthStatusCode(res.status); cycle++) {
-			if (cycle >= MCP_OAUTH_MAX_CHALLENGE_CYCLES) {
-				this._log(LogLevel.Warning, `${res.status} status from ${mcpUrl} after ${cycle} authorization attempts; giving up on this request`);
-				break;
+		if (isAuthStatusCode(res.status)) {
+			// Challenge handling ends with the request or the handle.
+			const cts = new CancellationTokenSource(this._cts.token);
+			const onAbort = () => cts.cancel();
+			signal?.addEventListener('abort', onAbort, { once: true });
+			if (signal?.aborted) {
+				cts.cancel();
 			}
-			const retry = await this._auth.handleChallenge(res.status, res.headers.get('WWW-Authenticate') ?? undefined, headers);
-			if (!retry) {
-				break;
+			try {
+				for (let cycle = 0; isAuthStatusCode(res.status); cycle++) {
+					if (cycle >= MCP_OAUTH_MAX_CHALLENGE_CYCLES) {
+						this._log(LogLevel.Warning, `${res.status} status from ${mcpUrl} after ${cycle} authorization attempts; giving up on this request`);
+						break;
+					}
+					const retry = await this._auth.handleChallenge(res.status, res.headers.get('WWW-Authenticate') ?? undefined, headers, cts.token);
+					if (!retry) {
+						break;
+					}
+					const errorText = await this._getErrText(res);
+					this._log(LogLevel.Debug, `Retrying after a ${res.status} status with a new token. Error details: ${redact(errorText) || 'no additional details'}`);
+					init.headers = headers;
+					res = await doFetch();
+				}
+			} finally {
+				signal?.removeEventListener('abort', onAbort);
+				cts.dispose();
 			}
-			const errorText = await this._getErrText(res);
-			this._log(LogLevel.Debug, `Retrying after a ${res.status} status with a new token. Error details: ${redact(errorText) || 'no additional details'}`);
-			init.headers = headers;
-			res = await doFetch();
 		}
 		if (res.status < 400) {
 			this._auth.onDidAccept(headers);
@@ -1149,7 +1357,9 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 			if (traceObj.body) {
 				traceObj.body = new TextDecoder().decode(traceObj.body);
 			}
-			traceObj.headers = redactCredentialHeaders(traceObj.headers); // don't log credentials
+			// Never log credentials: neither the ones the transport adds nor the configured
+			// headers, whose values are typically API keys (as on gRPC).
+			traceObj.headers = redactCredentialHeaders(traceObj.headers, this._launch.headers.map(([name]) => name));
 			this._log(LogLevel.Trace, `Fetching ${url} with options: ${JSON.stringify(traceObj)}`);
 		}
 
@@ -1224,13 +1434,7 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 	}
 
 	private _stripCrossOriginHeaders(headers: Record<string, string>, transportHeaders: Readonly<Record<string, string>>): Record<string, string> {
-		const configuredNames = new Set(this._launch.headers.map(([name]) => name.toLowerCase()));
-		const filtered = Object.fromEntries(Object.entries(headers).filter(([name]) =>
-			!CROSS_ORIGIN_STRIPPED_HEADERS.has(name.toLowerCase()) && !configuredNames.has(name.toLowerCase())));
-		for (const [name, value] of Object.entries(transportHeaders)) {
-			setHostHeader(filtered, name, value);
-		}
-		return filtered;
+		return stripCrossOriginHeaders(headers, this._launch.headers, transportHeaders);
 	}
 
 	protected _fetchInternal(url: string, init?: CommonRequestInit): Promise<CommonResponse> {
@@ -1367,8 +1571,12 @@ class AuthMetadata implements IAuthMetadata {
 export interface ICreateAuthMetadataOptions {
 	/** Headers to include when fetching metadata from the same origin as the resource server */
 	sameOriginHeaders?: Record<string, string>;
-	/** Fetch function to use for HTTP requests */
-	fetch: (url: string, init: MinimalRequestInit) => Promise<CommonResponse>;
+	/**
+	 * Fetch function to use for HTTP requests. `signal` aborts the request when
+	 * discovery is cancelled or the request exceeds {@link metadataTimeoutMs};
+	 * discovery does not wait for a fetch that ignores it.
+	 */
+	fetch: (url: string, init: MinimalRequestInit & { signal?: AbortSignal }) => Promise<CommonResponse>;
 	/** Logger function for diagnostic output */
 	log: AuthMetadataLogger;
 	/**
@@ -1380,25 +1588,104 @@ export interface ICreateAuthMetadataOptions {
 	/** The server's authorization policy (`oauth` escape hatches); defaults to PKCE required, HTTPS or loopback only. */
 	policy?: IMcpOAuthServerPolicy;
 	/**
-	 * An authorization server this client already obtained tokens from for the
-	 * resource; it is selected when the resource still lists it, otherwise the
-	 * first listed authorization server is.
+	 * The authorization servers this client already holds a registration (or
+	 * obtained tokens) with for the resource: the first `authorization_servers`
+	 * entry among them is selected, otherwise the first listed one.
 	 */
-	registeredAuthorizationServer?: string;
+	registeredAuthorizationServers?: readonly IMcpRegisteredAuthorizationServer[];
+	/** How long one metadata request may take; defaults to {@link MCP_OAUTH_METADATA_TIMEOUT_MS}. */
+	metadataTimeoutMs?: number;
 	token?: CancellationToken;
 }
 
-/** A storage that only answers which authorization server already has a registration, for the authorization server selection rule. */
-class RegisteredAuthorizationServerStorage implements IOAuthClientStorage {
-	constructor(private readonly _issuer: string) { }
+/**
+ * A storage that only answers which authorization server already has a
+ * registration, for the selection rule: the first `authorization_servers`
+ * entry of the protected resource metadata that is registered. The fetch
+ * adapter shows it each protected resource metadata document it reads; the
+ * client asks after accepting one, so the last document is the accepted one.
+ */
+class RegisteredAuthorizationServerSelection implements IOAuthClientStorage {
+	private _resourceMetadata: IAuthorizationProtectedResourceMetadata | undefined;
+
+	constructor(private readonly _registered: readonly IMcpRegisteredAuthorizationServer[]) { }
+
+	observe(body: unknown): void {
+		if (isAuthorizationProtectedResourceMetadata(body)) {
+			this._resourceMetadata = body;
+		}
+	}
 
 	async get(_key: string): Promise<IOAuthClientRecord | undefined> {
-		return { issuer: this._issuer, registrationKind: 'dcr', clientId: '', tokenEndpointAuthMethod: 'none', authorizationRequests: 0 };
+		const metadata = this._resourceMetadata;
+		const issuer = metadata?.authorization_servers?.find(server => this._registered.some(registered => isRegistration(registered, server, metadata.resource)));
+		return issuer ? { issuer, registrationKind: 'dcr', clientId: '', tokenEndpointAuthMethod: 'none', authorizationRequests: 0 } : undefined;
 	}
 
 	async set(): Promise<void> { /* discovery stores nothing */ }
 
 	async delete(): Promise<void> { /* discovery stores nothing */ }
+}
+
+function isRegistration(registered: IMcpRegisteredAuthorizationServer, server: string, resource: string): boolean {
+	if (registered.resource !== undefined && registered.resource !== resource) {
+		return false;
+	}
+	if (registered.authorizationServer === server) {
+		return true;
+	}
+	try {
+		return URI.parse(server).toString(true) === registered.authorizationServer;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * A metadata fetch that ends when `signal` aborts (a {@link CancellationError})
+ * or after `timeoutMs` (an error the client treats as an unavailable
+ * document), also when the underlying fetch ignores its signal. The response
+ * and the reading of its body each get `timeoutMs`; the timer and the listener
+ * on `signal` end with each, so a response whose body is never read (a `404`
+ * probe, for example) keeps neither alive. Exported for testing.
+ */
+export async function fetchMetadataWithin(fetchImpl: ICreateAuthMetadataOptions['fetch'], url: string, init: MinimalRequestInit, signal: AbortSignal | undefined, timeoutMs: number): Promise<CommonResponse> {
+	const controller = new AbortController();
+	const within = <T>(start: () => Promise<T>): Promise<T> => new Promise<T>((resolve, reject) => {
+		const end = () => {
+			clearTimeout(timer);
+			signal?.removeEventListener('abort', onAbort);
+		};
+		const fail = (error: Error) => {
+			end();
+			controller.abort();
+			reject(error);
+		};
+		const onAbort = () => fail(new CancellationError());
+		const timer = setTimeout(() => fail(new Error(`The metadata request to ${url} timed out after ${timeoutMs} ms`)), timeoutMs);
+		if (signal?.aborted) {
+			onAbort();
+			return;
+		}
+		signal?.addEventListener('abort', onAbort, { once: true });
+		new Promise<T>(started => started(start())).then(value => {
+			end();
+			resolve(value);
+		}, error => {
+			end();
+			reject(error);
+		});
+	});
+	const response = await within(() => fetchImpl(url, { ...init, signal: controller.signal }));
+	return {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers,
+		body: response.body,
+		url: response.url,
+		json: () => within(() => response.json()),
+		text: () => within(() => response.text()),
+	};
 }
 
 function toLogLevel(level: OAuthLogLevel): LogLevel {
@@ -1416,13 +1703,17 @@ function toLogLevel(level: OAuthLogLevel): LogLevel {
  * 1. the protected resource metadata (RFC 9728) from the challenge's
  *    `resource_metadata`, then the path-based, then the root well-known URI;
  *    its `resource` must name the server;
- * 2. the authorization server: the listed one that already has a registration,
+ * 2. the authorization server: the first listed one that already has a
+ *    registration ({@link ICreateAuthMetadataOptions.registeredAuthorizationServers}),
  *    otherwise the first listed one;
  * 3. its metadata in the specification's discovery order, whose `issuer` must
  *    equal the authorization server identifier exactly; its endpoints must be
  *    HTTPS (or loopback) unless the server's policy allows HTTP;
  * 4. only a server without protected resource metadata falls back to the
  *    2025-03-26 default endpoints at its origin.
+ *
+ * Each metadata request ends after {@link MCP_OAUTH_METADATA_TIMEOUT_MS}
+ * (it counts as unavailable), and cancelling `options.token` ends discovery.
  *
  * Any violation is a terminal {@link OAuthClientError}. PKCE support is
  * checked by whoever runs the authorization code grant (VS Code's dynamic
@@ -1452,6 +1743,8 @@ export async function createAuthMetadata(
 	const policy = options.policy ?? resolveMcpOAuthPolicy(undefined);
 	const protocolVersion = options.protocolVersion ?? MCPLegacy.LATEST_PROTOCOL_VERSION;
 	const sameOriginHeaders = { ...options.sameOriginHeaders, [MCP_PROTOCOL_VERSION_HEADER]: protocolVersion };
+	const timeoutMs = options.metadataTimeoutMs ?? MCP_OAUTH_METADATA_TIMEOUT_MS;
+	const selection = options.registeredAuthorizationServers?.length ? new RegisteredAuthorizationServerSelection(options.registeredAuthorizationServers) : undefined;
 	const client = createMcpOAuthClient({
 		clientName: product.nameLong,
 		redirectUris: ['http://127.0.0.1/'],
@@ -1459,8 +1752,11 @@ export async function createAuthMetadata(
 		registration: { dynamic: false },
 		authorize: () => Promise.reject(new Error('Authorization metadata discovery does not authorize')),
 		policy: { ...policy, pkce: 'assume-supported' },
-		storage: options.registeredAuthorizationServer ? new RegisteredAuthorizationServerStorage(options.registeredAuthorizationServer) : undefined,
-		fetch: (url, init) => fetch(url, { method: init.method ?? 'GET', headers: { ...init.headers } }),
+		storage: selection,
+		fetch: async (url, init) => {
+			const response = await fetchMetadataWithin(fetch, url, { method: init.method ?? 'GET', headers: { ...init.headers } }, init.signal, timeoutMs);
+			return selection ? { ...response, json: async () => { const body = await response.json(); selection.observe(body); return body; } } : response;
+		},
 		sameOriginHeaders,
 		legacyDefaultEndpoints: true,
 		log: (level, message) => log(toLogLevel(level), message),
@@ -1510,14 +1806,16 @@ export async function createAuthMetadata(
 /** The headers that carry credentials; trace logs show them blanked. */
 const CREDENTIAL_HEADERS = new Set(['authorization', 'proxy-authorization', 'cookie', 'set-cookie']);
 
-/** A copy of `headers` with the credential-bearing ones blanked, for trace logs. */
-function redactCredentialHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
+/** A copy of `headers` with the credential-bearing ones and those named in `alsoRedact` (in any letter case) blanked, for trace logs. */
+function redactCredentialHeaders(headers: Record<string, string> | undefined, alsoRedact: readonly string[] = []): Record<string, string> | undefined {
 	if (!headers) {
 		return headers;
 	}
+	const redacted = new Set(alsoRedact.map(name => name.toLowerCase()));
 	const copy: Record<string, string> = {};
 	for (const [name, value] of Object.entries(headers)) {
-		copy[name] = CREDENTIAL_HEADERS.has(name.toLowerCase()) ? '***' : value;
+		const lower = name.toLowerCase();
+		copy[name] = CREDENTIAL_HEADERS.has(lower) || redacted.has(lower) ? '***' : value;
 	}
 	return copy;
 }
@@ -1565,16 +1863,17 @@ export interface IMcpAuthHeaderProviderHost {
 		readonly oauth?: McpServerTransportHTTP['oauth'];
 		readonly authentication?: McpServerTransportHTTP['authentication'];
 	};
-	readonly proxy: Pick<MainThreadMcpShape, '$getTokenFromServerMetadata' | '$getTokenForProviderId' | '$onDidChangeState' | '$logMcpAuthSetup'>;
+	readonly proxy: Pick<MainThreadMcpShape, '$getTokenFromServerMetadata' | '$getTokenForProviderId' | '$onDidChangeState' | '$logMcpAuthSetup' | '$getRegisteredAuthorizationServers'>;
 	readonly errorOnUserInteraction?: boolean;
 	/** The protocol revision of the traffic; metadata requests to the resource origin carry it. */
 	protocolVersion(): string | undefined;
 	/**
 	 * Fetches authorization metadata. It is not subject to the server allow
 	 * list; `transportHeaders` are generated headers that survive cross-origin
-	 * redirects.
+	 * redirects; `signal` aborts the request (discovery was cancelled or the
+	 * request timed out).
 	 */
-	fetchMetadata(url: string, init: MinimalRequestInit, transportHeaders: Readonly<Record<string, string>> | undefined): Promise<CommonResponse>;
+	fetchMetadata(url: string, init: MinimalRequestInit, transportHeaders: Readonly<Record<string, string>> | undefined, signal?: AbortSignal): Promise<CommonResponse>;
 	log(level: LogLevel, message: string): void;
 	/** The URL protected resource metadata is discovered for, when it is not the launch URI (a `grpc(s)://` server's HTTPS identity). */
 	resourceUrl?(): string;
@@ -1657,7 +1956,8 @@ export class McpAuthHeaderProvider extends Disposable {
 			return false;
 		}
 		const sentToken = bearerTokenOf(headers);
-		return this._challenges.queue(async () => {
+		// A cancelled request stops waiting for the challenges ahead of it, and its own discovery ends.
+		return raceCancellationError(this._challenges.queue(async () => {
 			if (this._store.isDisposed || token.isCancellationRequested) {
 				throw new CancellationError();
 			}
@@ -1718,7 +2018,7 @@ export class McpAuthHeaderProvider extends Disposable {
 			this._issued = { token: newToken, scopes: metadata.scopes ?? [] };
 			this._setToken(headers, newToken);
 			return true;
-		});
+		}), token);
 	}
 
 	/** Records that a request carrying `headers` was answered without a challenge: the rejection streak ends. */
@@ -1728,18 +2028,40 @@ export class McpAuthHeaderProvider extends Disposable {
 		}
 	}
 
-	protected _discover(wwwAuthenticate: string | undefined, token: CancellationToken): Promise<AuthMetadata> {
+	protected async _discover(wwwAuthenticate: string | undefined, token: CancellationToken): Promise<AuthMetadata> {
 		const protocolVersion = this._host.protocolVersion() ?? MCPLegacy.LATEST_PROTOCOL_VERSION;
 		const policy = resolveMcpOAuthPolicy(this._host.launch.oauth as IMcpRemoteServerOAuthConfiguration | undefined);
+		const registeredAuthorizationServers = await this._registeredAuthorizationServers(token);
 		return createAuthMetadata(this._resourceUrl, new Headers(wwwAuthenticate !== undefined ? { 'WWW-Authenticate': wwwAuthenticate } : {}), {
 			sameOriginHeaders: Object.fromEntries(this._host.launch.headers),
 			protocolVersion,
 			policy,
-			registeredAuthorizationServer: this._registeredAuthorizationServer,
-			fetch: (url, init) => this._host.fetchMetadata(url, init, init.headers[MCP_PROTOCOL_VERSION_HEADER] === protocolVersion ? { [MCP_PROTOCOL_VERSION_HEADER]: protocolVersion } : undefined),
+			registeredAuthorizationServers,
+			fetch: (url, init) => this._host.fetchMetadata(url, { method: init.method, headers: init.headers, body: init.body }, init.headers[MCP_PROTOCOL_VERSION_HEADER] === protocolVersion ? { [MCP_PROTOCOL_VERSION_HEADER]: protocolVersion } : undefined, init.signal),
 			log: (level, message) => this._host.log(level, message),
 			token,
 		});
+	}
+
+	/**
+	 * The authorization servers with a registration for the resource: the one
+	 * this connection obtained tokens from, and those the main thread keeps
+	 * dynamic providers for, which outlive the connection and the window.
+	 */
+	private async _registeredAuthorizationServers(token: CancellationToken): Promise<IMcpRegisteredAuthorizationServer[]> {
+		const registered: IMcpRegisteredAuthorizationServer[] = this._registeredAuthorizationServer ? [{ authorizationServer: this._registeredAuthorizationServer }] : [];
+		const persisted = this._host.proxy.$getRegisteredAuthorizationServers?.(this._host.id, this._resourceUrl);
+		if (persisted) {
+			try {
+				registered.push(...await raceCancellationError(persisted, token));
+			} catch (e) {
+				if (isCancellationError(e)) {
+					throw e;
+				}
+				this._host.log(LogLevel.Warning, `Could not look up the registered authorization servers of ${this._resourceUrl}: ${redact(String(e))}`);
+			}
+		}
+		return registered;
 	}
 
 	private _setToken(headers: Record<string, string>, token: string): void {

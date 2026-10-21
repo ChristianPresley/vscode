@@ -22,7 +22,7 @@ import { ChatElicitationRequestPart } from '../../chat/common/model/chatProgress
 import { ChatQuestionCarouselData } from '../../chat/common/model/chatProgressTypes/chatQuestionCarouselData.js';
 import { ChatModel } from '../../chat/common/model/chatModel.js';
 import { ElicitationState, IChatQuestion, IChatQuestionAnswers, IChatQuestionValidation, IChatService } from '../../chat/common/chatService/chatService.js';
-import { isAcceptableElicitationUrl } from '../common/mcpProtocolMeta.js';
+import { checkElicitationSchema, isAcceptableElicitationUrl } from '../common/mcpProtocolMeta.js';
 import { ElicitationKind, ElicitResult, IFormModeElicitResult, IMcpElicitationService, IMcpElicitOptions, IMcpServer, IMcpToolCallContext, IUrlModeElicitResult, McpConnectionState, MpcResponseError } from '../common/mcpTypes.js';
 import { mcpServerToSourceData } from '../common/mcpTypesUtils.js';
 import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
@@ -109,13 +109,37 @@ export function isEmptyFormSchema(params: { readonly requestedSchema?: { readonl
 	return !properties || Object.keys(properties).length === 0;
 }
 
+/** Every ASCII punctuation character: CommonMark lets each be backslash-escaped, and an escaped character is never syntax. */
+const MARKDOWN_PUNCTUATION = /[\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]/g;
+
+/**
+ * Server-provided text as Markdown that renders literally, so no link can
+ * form in it: not `[text](url)` nor `<url>`, and not the bare `https://…`,
+ * `www.…` and e-mail autolinks that {@link MarkdownString.appendText} lets
+ * through. elicitation.mdx "Safe URL Handling": clients SHOULD NOT render
+ * URLs as clickable in any field of an elicitation request, except the `url`
+ * of a URL elicitation (which the consent prompt shows as code, not a link).
+ */
+export function literalMarkdown(text: string): MarkdownString {
+	const paragraphs = text.split(/\r\n|\r|\n/).map(line => line
+		.replace(MARKDOWN_PUNCTUATION, '\\$&')
+		// leading whitespace would otherwise start an indented code block
+		.replace(/^[ \t]+/, indent => '&nbsp;'.repeat(indent.length)));
+	return new MarkdownString(paragraphs.join('\n\n'));
+}
+
+/** Whether `text` could render as a link when shown as Markdown: link or autolink syntax, a URL, a `www.` host or an e-mail address. */
+export function mayRenderAsLink(text: string): boolean {
+	return /[[<@]|:\/\/|www\./i.test(text);
+}
+
 /**
  * The consent prompt for a URL elicitation: the server's message, the full
  * URL, the host it resolves to and, for an internationalized host, both its
  * Unicode and punycode spellings with a warning.
  */
 export function buildUrlElicitationMessage(message: string, plan: Extract<UrlElicitationPlan, { kind: 'open' | 'resume' }>): MarkdownString {
-	const md = new MarkdownString().appendText(message);
+	const md = literalMarkdown(message);
 	md.appendMarkdown('\n\n' + (plan.kind === 'resume'
 		? localize('mcp.elicit.url.resume', 'You already opened this URL. Continue once you have finished there.')
 		: localize('mcp.elicit.url.instruction', 'Open this URL?')));
@@ -233,6 +257,11 @@ function getServerEra(server: IMcpServer): McpProtocolEra | undefined {
 	}
 }
 
+/** The revision the server negotiated, if it has a live protocol handler; it decides how its form schemas are read. */
+function getServerProtocolVersion(server: IMcpServer): string | undefined {
+	return server.connection.get()?.handler.get()?.currentProtocolVersion;
+}
+
 //#endregion
 
 export class McpElicitationService implements IMcpElicitationService {
@@ -258,6 +287,17 @@ export class McpElicitationService implements IMcpElicitationService {
 	}
 
 	private async _elicitForm(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCPLegacy.ElicitRequestFormParams | Pre20251125ElicitationParams, token: CancellationToken): Promise<IFormModeElicitResult> {
+		// basic/index.mdx (2026-07-28): a schema that does not compile is rejected, not treated as
+		// permissive. Nothing is shown: the answer could not be validated. Servers speaking
+		// 2025-11-25 or older get their form as before, with a warning in the log.
+		const schemaProblem = checkElicitationSchema(elicitation.requestedSchema, getServerProtocolVersion(server), warning => {
+			this._logService.warn(`[MCP] The form elicitation from "${server.definition.label}": ${warning}`);
+		});
+		if (schemaProblem !== undefined) {
+			this._logService.warn(`[MCP] Declined the form elicitation from "${server.definition.label}" because its requested schema does not compile: ${schemaProblem}`);
+			return { kind: ElicitationKind.Form, value: { action: 'decline' }, dispose: () => { } };
+		}
+
 		if (isEmptyFormSchema(elicitation)) {
 			return this._elicitConsent(server, context, elicitation, token);
 		}
@@ -275,7 +315,7 @@ export class McpElicitationService implements IMcpElicitationService {
 						/* resolveId */ undefined,
 						/* data */ undefined,
 						/* isUsed */ undefined,
-						/* message */ new MarkdownString(elicitation.message),
+						/* message */ literalMarkdown(elicitation.message),
 						/* source */ mcpServerToSourceData(server),
 					);
 
@@ -338,7 +378,7 @@ export class McpElicitationService implements IMcpElicitationService {
 				const cancelAction = store.add(new Action('mcp.elicit.consent.cancel', localize('mcp.elicit.cancel', 'Cancel'), undefined, true));
 				part = new ChatElicitationRequestPart(
 					localize('mcp.elicit.consent.title', 'Confirmation Required'),
-					new MarkdownString().appendText(elicitation.message),
+					literalMarkdown(elicitation.message),
 					localize('msg.subtitle', "{0} (MCP Server)", server.definition.label),
 					localize('mcp.elicit.consent.accept', 'Accept'),
 					localize('mcp.elicit.consent.decline', 'Decline'),
@@ -929,6 +969,16 @@ export class McpElicitationService implements IMcpElicitationService {
 					defaultValue: schema.default !== undefined ? String(schema.default) : undefined,
 					validation: Object.keys(validation).length > 0 ? validation : undefined,
 				});
+			}
+		}
+
+		// The carousel renders a question's title as Markdown (descriptions and
+		// option labels as text). A title that could form a link is shown
+		// literally instead; other titles keep their plain-text form, which the
+		// answer summary shows as it is.
+		for (const question of questions) {
+			if (mayRenderAsLink(question.title)) {
+				question.message = literalMarkdown(question.title);
 			}
 		}
 

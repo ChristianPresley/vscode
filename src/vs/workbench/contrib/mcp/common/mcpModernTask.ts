@@ -5,9 +5,10 @@
 
 import { DeferredPromise, disposableTimeout } from '../../../../base/common/async.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
-import { CancellationError } from '../../../../base/common/errors.js';
+import { CancellationError, isCancellationError } from '../../../../base/common/errors.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { Disposable, IDisposable } from '../../../../base/common/lifecycle.js';
+import { stableStringify } from '../../../../base/common/objects.js';
 import { ILogger } from '../../../../platform/log/common/log.js';
 import { MCP } from '../../../../platform/mcp/common/modelContextProtocol.js';
 import { McpTasks } from '../../../../platform/mcp/common/modelContextProtocolTasks.js';
@@ -47,15 +48,77 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 const TASK_STATUSES: ReadonlySet<string> = new Set<McpTasks.TaskStatus>(['working', 'input_required', 'completed', 'failed', 'cancelled']);
 
+/** The `requestState` a server may put on a task waiting for input (the extension does not require one). */
+function requestStateOf(task: McpTasks.Task): string | undefined {
+	const value: unknown = task.requestState;
+	return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * The input requests of a task that the client answered in the current
+ * input round. A server may keep showing requests it was answered for (it
+ * did not take the `tasks/update` in yet, or it shows each round for a
+ * while), so the client remembers every request it answered, by its key and
+ * a canonical form of the request, and never answers the same pair twice in
+ * one round. A request under a known key with different content is a new
+ * request.
+ *
+ * A new round starts, and the remembered answers are forgotten, when the
+ * server shows that it moved on: a `tasks/get` with a status other than
+ * `input_required` (the task ran again with the answers), or a
+ * `requestState` other than the one the answers were given under (for a
+ * server that sends one).
+ */
+class AnsweredInputRequests {
+	private readonly _answered = new Map<string, string>();
+	private _requestState: string | undefined;
+
+	/** The task left `input_required`: the next input requests belong to a new round. */
+	reset(): void {
+		this._answered.clear();
+		this._requestState = undefined;
+	}
+
+	/** The requests of this poll that were not answered in the current round, with their canonical forms. */
+	unanswered(inputRequests: MCP.InputRequests, requestState: string | undefined): Map<string, { readonly request: MCP.InputRequest; readonly fingerprint: string }> {
+		if (requestState !== this._requestState) {
+			this.reset();
+		}
+		const fresh = new Map<string, { readonly request: MCP.InputRequest; readonly fingerprint: string }>();
+		for (const [key, request] of Object.entries(inputRequests)) {
+			const fingerprint = stableStringify(request);
+			if (this._answered.get(key) !== fingerprint) {
+				fresh.set(key, { request, fingerprint });
+			}
+		}
+		return fresh;
+	}
+
+	/** Records the requests that were answered (and delivered) under the given state. */
+	add(answered: ReadonlyMap<string, { readonly fingerprint: string }>, requestState: string | undefined): void {
+		this._requestState = requestState;
+		for (const [key, { fingerprint }] of answered) {
+			this._answered.set(key, fingerprint);
+		}
+	}
+}
+
 /**
  * A tool call that a 2026-07-28 server turned into a task of the Tasks
  * extension (`io.modelcontextprotocol/tasks`, SEP-2663): the client polls
  * `tasks/get` every `pollIntervalMs`, answers `input_required` rounds with
  * the same elicitation, sampling and roots handlers as a multi round-trip
- * request and delivers the answers with `tasks/update`, and sends
- * `tasks/cancel` when the caller cancels. A completed task resolves with the
- * inlined tool result, a failed one rejects with its inlined error, a task
- * the server cancelled rejects with a cancellation.
+ * request and delivers the answers with `tasks/update`. A completed task
+ * resolves with the inlined tool result, a failed one rejects with its
+ * inlined error, a task the server cancelled rejects with a cancellation.
+ * The same input request is never answered twice in one round (see
+ * {@link AnsweredInputRequests}).
+ *
+ * Whenever the client stops following a task the server may still run (the
+ * caller cancelled, answering input or `tasks/update` failed, polling gave
+ * up, the task manager dropped the task), it sends `tasks/cancel` once, on a
+ * best-effort basis; not after a terminal status or when the server no
+ * longer knows the task.
  *
  * `notifications/tasks/status` (optional on the server side) only triggers
  * an early poll: `tasks/get` is authoritative. Like the 2025-11-25 task it
@@ -73,6 +136,8 @@ export class McpModernTask extends Disposable implements IMcpTaskInternal {
 	private _lastStatusMessage: string | undefined;
 	private _cancelRequested = false;
 	private _cancelSent = false;
+	/** Set once the server's task is over (a terminal status) or unknown to the server: no `tasks/cancel` is due then. */
+	private _serverTaskEnded = false;
 
 	public get id(): string {
 		return this._created.taskId;
@@ -119,6 +184,8 @@ export class McpModernTask extends Disposable implements IMcpTaskInternal {
 
 	override dispose(): void {
 		if (!this._promise.isSettled) {
+			// The task manager drops a task that may still run on the server (the server is going away).
+			this._stopServerTask();
 			this._promise.cancel();
 		}
 		this._cts.cancel();
@@ -136,13 +203,26 @@ export class McpModernTask extends Disposable implements IMcpTaskInternal {
 		this._promise.cancel();
 	}
 
+	/** The client stops following the task: cancel it on the server unless it is over there already. */
+	private _stopServerTask(): void {
+		if (!this._serverTaskEnded) {
+			this._sendCancel();
+		}
+	}
+
+	/** Sends `tasks/cancel` at most once (best effort: a failure is only logged). */
 	private _sendCancel(): void {
 		const host = this._host;
 		if (this._cancelSent || !host) {
 			return;
 		}
 		this._cancelSent = true;
-		host.cancelModernTask({ taskId: this.id }).catch(e => host.logger.warn(`Could not cancel task ${this.id}: ${e}`));
+		host.cancelModernTask({ taskId: this.id }).catch(e => {
+			// A cancellation only means that the connection went away with the request.
+			if (!isCancellationError(e)) {
+				host.logger.warn(`Could not cancel task ${this.id}: ${e}`);
+			}
+		});
 	}
 
 	private _reportStatusMessage(message: string | undefined): void {
@@ -157,6 +237,9 @@ export class McpModernTask extends Disposable implements IMcpTaskInternal {
 			const result = await this._poll();
 			this._promise.complete(result);
 		} catch (e) {
+			// Answering input or `tasks/update` failed, polling gave up, the result was invalid, or the
+			// caller cancelled (then the cancel is already out): the server may still run the task.
+			this._stopServerTask();
 			if (this._promise.isSettled) {
 				return;
 			}
@@ -173,9 +256,7 @@ export class McpModernTask extends Disposable implements IMcpTaskInternal {
 		let rounds = 0;
 		let failures = 0;
 		let immediate = false;
-		/** The input requests of the last round answered, and whether a poll that still showed them was skipped. */
-		let answered: string | undefined;
-		let skipped = false;
+		const answered = new AnsweredInputRequests();
 		for (; ;) {
 			if (!immediate) {
 				await this._sleep(this._pollIntervalMs);
@@ -197,6 +278,7 @@ export class McpModernTask extends Disposable implements IMcpTaskInternal {
 				}
 				// An unknown task (expired, or the server forgot it) cannot recover.
 				if (e instanceof MpcResponseError && e.code === MCP.INVALID_PARAMS) {
+					this._serverTaskEnded = true;
 					throw e;
 				}
 				if (++failures >= MAX_MODERN_TASK_POLL_FAILURES) {
@@ -211,6 +293,12 @@ export class McpModernTask extends Disposable implements IMcpTaskInternal {
 			}
 			this._pollIntervalMs = clampPollInterval(task.pollIntervalMs) ?? this._pollIntervalMs;
 			this._reportStatusMessage(task.statusMessage);
+			if (McpTasks.isTerminalStatus(task.status)) {
+				this._serverTaskEnded = true;
+			}
+			if (task.status !== 'input_required') {
+				answered.reset(); // the task moved on: the next input requests are a new round
+			}
 			switch (task.status) {
 				case 'working':
 					break;
@@ -233,23 +321,25 @@ export class McpModernTask extends Disposable implements IMcpTaskInternal {
 					if (!isObject(task.inputRequests) || Object.keys(task.inputRequests).length === 0) {
 						break; // nothing to answer (yet): poll again
 					}
-					const signature = JSON.stringify(task.inputRequests);
-					if (signature === answered && !skipped) {
-						// The server may not have taken the last answers in yet: give it one interval before asking again.
-						skipped = true;
+					const requestState = requestStateOf(task);
+					const unanswered = answered.unanswered(task.inputRequests as MCP.InputRequests, requestState);
+					if (unanswered.size === 0) {
+						// Every request was answered in this round: the server did not take the answers in yet.
 						break;
 					}
 					if (++rounds > MAX_MRTR_ROUNDS) {
-						this._sendCancel();
 						throw new McpClientError('too-many-rounds', `Task ${this.id} asked for input more than ${MAX_MRTR_ROUNDS} times`);
 					}
-					const inputResponses = await host.answerInputRequests(task.inputRequests as MCP.InputRequests, token, this._context, this._seenUrls);
+					const inputRequests: MCP.InputRequests = {};
+					for (const [key, { request }] of unanswered) {
+						inputRequests[key] = request;
+					}
+					const inputResponses = await host.answerInputRequests(inputRequests, token, this._context, this._seenUrls);
 					if (token.isCancellationRequested) {
 						throw new CancellationError();
 					}
 					await host.updateTask({ taskId: this.id, inputResponses }, token);
-					answered = signature;
-					skipped = false;
+					answered.add(unanswered, requestState);
 					immediate = true; // the answers usually move the task on at once
 					break;
 				}

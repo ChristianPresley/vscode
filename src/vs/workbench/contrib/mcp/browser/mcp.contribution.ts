@@ -35,6 +35,7 @@ import { IMcpRegistry } from '../common/mcpRegistryTypes.js';
 import { IMcpSandboxService, McpSandboxService } from '../common/mcpSandboxService.js';
 import { McpResourceFilesystem } from '../common/mcpResourceFilesystem.js';
 import { McpSamplingService } from '../common/mcpSamplingService.js';
+import { McpUserConfigurationSchemaAssociations } from '../common/mcpSchemaAssociations.js';
 import { McpService } from '../common/mcpService.js';
 import { IMcpElicitationService, IMcpSamplingService, IMcpService, IMcpWorkbenchService } from '../common/mcpTypes.js';
 import { IWorkbenchMcpGatewayService } from '../common/mcpGatewayService.js';
@@ -113,6 +114,8 @@ registerWorkbenchContribution2(McpConfigMigrationContribution.ID, McpConfigMigra
 
 const jsonRegistry = <jsonContributionRegistry.IJSONContributionRegistry>Registry.as(jsonContributionRegistry.Extensions.JSONContribution);
 jsonRegistry.registerSchema(mcpSchemaId, mcpServerSchema);
+// The user and remote user `mcp.json` (the workspace one is associated by the configuration-editing extension).
+registerWorkbenchContribution2(McpUserConfigurationSchemaAssociations.ID, McpUserConfigurationSchemaAssociations, WorkbenchPhase.Eventually);
 
 Registry.as<IEditorPaneRegistry>(EditorExtensions.EditorPane).registerEditorPane(
 	EditorPaneDescriptor.create(

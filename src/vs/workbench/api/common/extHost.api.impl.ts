@@ -1972,9 +1972,9 @@ export function createApiFactoryAndRegisterActors(accessor: ServicesAccessor): I
 				checkProposedApiEnabled(extension, 'mcpServerDefinitions');
 				return extHostMcp.mcpServerDefinitions;
 			},
-			startMcpGateway(chatSessionResource?: URI) {
+			startMcpGateway(chatSessionResource?: URI, options?: vscode.McpGatewayStartOptions) {
 				checkProposedApiEnabled(extension, 'mcpServerDefinitions');
-				return extHostMcp.startMcpGateway(chatSessionResource);
+				return extHostMcp.startMcpGateway(chatSessionResource, options);
 			},
 			onDidChangeChatRequestTools(...args) {
 				checkProposedApiEnabled(extension, 'chatParticipantAdditions');

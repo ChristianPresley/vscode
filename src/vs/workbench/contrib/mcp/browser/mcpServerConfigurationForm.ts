@@ -406,13 +406,13 @@ export class McpServerConfigurationForm extends Disposable {
 			ariaLabel: localize('mcpForm.grpc.binding.aria', "gRPC service binding"),
 			// Labels are the `binding` values written to the file, so they are not localized.
 			items: [
-				{ text: 'auto', tooltip: localize('mcpForm.grpc.binding.auto.tooltip', "Try the JSON-RPC tunnel first and fall back to the typed service") },
+				{ text: 'auto', tooltip: localize('mcpForm.grpc.binding.auto.tooltip', "The default: the JSON-RPC tunnel, as tunnel. VS Code never switches to the typed service on its own") },
 				{ text: 'tunnel', tooltip: localize('mcpForm.grpc.binding.tunnel.tooltip', "Send JSON-RPC messages through the mcp.zig.transport.v1.Mcp/Call tunnel") },
-				{ text: 'typed', tooltip: localize('mcpForm.grpc.binding.typed.tooltip', "Call the typed model_context_protocol.Mcp service methods") },
+				{ text: 'typed', tooltip: localize('mcpForm.grpc.binding.typed.tooltip', "Call the typed model_context_protocol.Mcp service methods, for a server that does not offer the tunnel") },
 			],
 		}));
 		bindingField.appendChild(this.bindingRadio.domNode);
-		this.appendHint(bindingField, localize('mcpForm.grpc.binding.hint', "Which gRPC service the server implements. Leave on auto unless the server only implements one of them."));
+		this.appendHint(bindingField, localize('mcpForm.grpc.binding.hint', "Which gRPC service the server implements. auto and tunnel use the JSON-RPC tunnel; choose typed only for a server that offers just the typed service."));
 		this._register(this.bindingRadio.onDidSelect(index => {
 			if (this.state) {
 				const binding = mcpServerFormGrpcBindings[index];

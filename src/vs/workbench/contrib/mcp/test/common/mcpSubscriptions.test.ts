@@ -194,10 +194,11 @@ suite('Workbench - MCP - Subscriptions', () => {
 			assert.deepStrictEqual(reconnects[2], { stream: 'lists', reason: 'cancelled by the server', backoffMs: 1000 });
 		});
 
-		test('a graceful close reconnects immediately', async () => {
+		test('a graceful close of a stable stream reconnects immediately', async () => {
 			manager.start(allLists);
 			const first = host.last;
 			acknowledge(first.id, allLists);
+			await clock.tickAsync(LISTEN_STABLE_MS);
 			scheduledDelays.length = 0;
 
 			host.close(first);
@@ -207,6 +208,44 @@ suite('Workbench - MCP - Subscriptions', () => {
 			assert.strictEqual(host.listens.length, 2);
 			assert.deepStrictEqual(host.cancelled, [], 'a closed stream is not cancelled');
 			assert.deepStrictEqual(scheduledDelays, [LISTEN_ACK_TIMEOUT_MS], 'the new stream waits for its acknowledgement');
+		});
+
+		test('a stream closed before or soon after its acknowledgement reconnects with backoff, not in a tight loop', async () => {
+			manager.start(allLists);
+
+			// A server that answers subscriptions/listen at once, before acknowledging it.
+			host.close(host.last);
+			await clock.tickAsync(0);
+			assert.strictEqual(host.listens.length, 1, 'no immediate reconnect');
+			assert.deepStrictEqual(reconnects, [{ stream: 'lists', reason: 'closed by the server before the acknowledgement', backoffMs: LISTEN_BACKOFF_MS }]);
+			await clock.tickAsync(LISTEN_BACKOFF_MS);
+			assert.strictEqual(host.listens.length, 2);
+
+			// A server that acknowledges and closes right away: the backoff keeps growing.
+			acknowledge(host.last.id, allLists);
+			await clock.tickAsync(LISTEN_STABLE_MS - 1);
+			host.close(host.last);
+			await clock.tickAsync(0);
+			assert.deepStrictEqual(reconnects[1], { stream: 'lists', reason: 'closed by the server soon after the acknowledgement', backoffMs: 1000 });
+			assert.strictEqual(host.listens.length, 2);
+			await clock.tickAsync(1000);
+			assert.strictEqual(host.listens.length, 3);
+
+			// More quick closes follow the backoff schedule instead of opening a stream per tick.
+			let expected = 2000;
+			for (let i = 0; i < 6; i++) {
+				acknowledge(host.last.id, allLists);
+				host.close(host.last);
+				await clock.tickAsync(0);
+				const opened: number = host.listens.length;
+				assert.strictEqual(reconnects.at(-1)?.backoffMs, expected, `close ${i}`);
+				await clock.tickAsync(expected - 1);
+				assert.strictEqual(host.listens.length, opened, `close ${i}: still waiting`);
+				await clock.tickAsync(1);
+				assert.strictEqual(host.listens.length, opened + 1, `close ${i}: reconnected`);
+				expected = Math.min(expected * 2, LISTEN_MAX_BACKOFF_MS);
+			}
+			assert.strictEqual(expected, LISTEN_MAX_BACKOFF_MS);
 		});
 
 		test('a server cancellation of the listen id reconnects', async () => {
@@ -250,12 +289,14 @@ suite('Workbench - MCP - Subscriptions', () => {
 			acknowledge(host.last.id, { toolsListChanged: true, resourcesListChanged: true });
 			assert.deepStrictEqual(events, { tools: 0, prompts: 0, resources: 0, updates: [] });
 
+			await clock.tickAsync(LISTEN_STABLE_MS);
 			host.close(host.last);
 			await clock.tickAsync(0);
 			acknowledge(host.last.id, { toolsListChanged: true, resourcesListChanged: true });
 			assert.deepStrictEqual(events, { tools: 1, prompts: 0, resources: 1, updates: [] });
 
 			// the filter the server echoes decides what is compensated
+			await clock.tickAsync(LISTEN_STABLE_MS);
 			host.close(host.last);
 			await clock.tickAsync(0);
 			acknowledge(host.last.id, { toolsListChanged: true });
@@ -337,6 +378,35 @@ suite('Workbench - MCP - Subscriptions', () => {
 			streamEvent(lists.id, 'notifications/resources/updated', { uri: 'file:///b.txt' });
 			assert.deepStrictEqual(events.updates.map(u => u.uri), ['file:///a.txt', 'file:///b.txt']);
 			assert.deepStrictEqual(reconnects, []);
+		});
+
+		test('subscribed resources are signalled updated after the resources stream is re-acknowledged following an outage', async () => {
+			store.add(manager.subscribeResource('file:///b.txt'));
+			store.add(manager.subscribeResource('file:///a.txt'));
+			await clock.tickAsync(50);
+			acknowledge(host.last.id, { resourceSubscriptions: ['file:///a.txt', 'file:///b.txt'] });
+			assert.strictEqual(events.updates.length, 0, 'the first acknowledgement compensates nothing');
+
+			// a new subscription swaps the stream: nothing was lost, nothing is signalled
+			const c = manager.subscribeResource('file:///c.txt');
+			await clock.tickAsync(50);
+			acknowledge(host.last.id, { resourceSubscriptions: ['file:///a.txt', 'file:///b.txt', 'file:///c.txt'] });
+			assert.strictEqual(events.updates.length, 0);
+			c.dispose();
+			await clock.tickAsync(50);
+			acknowledge(host.last.id, { resourceSubscriptions: ['file:///a.txt', 'file:///b.txt'] });
+			assert.strictEqual(events.updates.length, 0);
+
+			// the server cancels the stream: updates may have been missed until the next acknowledgement
+			assert.strictEqual(manager.handleCancelled(host.last.id), true);
+			await clock.tickAsync(delayInTick(0));
+			acknowledge(host.last.id, { resourceSubscriptions: ['file:///a.txt', 'file:///b.txt'] });
+			assert.deepStrictEqual(events.updates.map(u => u.uri), ['file:///a.txt', 'file:///b.txt']);
+
+			// a transport restart is an outage too
+			manager.restart();
+			acknowledge(host.last.id, { resourceSubscriptions: ['file:///a.txt'] });
+			assert.deepStrictEqual(events.updates.map(u => u.uri), ['file:///a.txt', 'file:///b.txt', 'file:///a.txt']);
 		});
 
 		test('the resources stream reconnects with its own backoff and reports its kind', async () => {

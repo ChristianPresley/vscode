@@ -6,6 +6,7 @@
 import { Emitter } from '../../../base/common/event.js';
 import { JsonRpcId, JsonRpcMessage } from '../../../base/common/jsonRpcProtocol.js';
 import { Disposable } from '../../../base/common/lifecycle.js';
+import { redact } from '../../../base/common/oauthClient.js';
 import { IObservable, observableValue } from '../../../base/common/observable.js';
 import { UriComponents } from '../../../base/common/uri.js';
 import { AbstractLogger, LogLevel } from '../../../platform/log/common/log.js';
@@ -22,7 +23,11 @@ import { McpHTTPHandle } from '../common/extHostMcp.js';
  * a stderr logger and the scenario context the suite passes in.
  */
 
-/** Supplies bearer tokens to the transport; the authorization milestone implements it, until then the client has none. */
+/**
+ * Supplies bearer tokens to the transport. The conformance client installs
+ * one backed by the product's OAuth rule set (`createConformanceTokenSource`
+ * in mcpConformanceOAuth.ts); tests may pass their own.
+ */
 export interface IConformanceTokenSource {
 	getToken(details: IMcpAuthenticationDetails, options: IMcpAuthenticationOptions | undefined): Promise<string | undefined>;
 }
@@ -69,7 +74,7 @@ export class ConformanceMainThreadMcp extends Disposable implements MainThreadMc
 	/** How the transport discovered the authorization metadata, per `$logMcpAuthSetup` call. */
 	readonly authSetups: IAuthMetadataSource[] = [];
 
-	/** Set by the authorization milestone; without one every request goes out unauthenticated. */
+	/** Set by the conformance client before it connects; without one every request goes out unauthenticated. */
 	tokenSource: IConformanceTokenSource | undefined;
 
 	async $checkMcpServerAllowed(_id: number, _url: string): Promise<string | undefined> {
@@ -217,21 +222,26 @@ export class InProcessMcpTransport extends Disposable implements IMcpMessageTran
 	}
 }
 
-const SECRET_PATTERNS: readonly { readonly pattern: RegExp; readonly replacement: string }[] = [
-	// `Authorization: <scheme> <credentials>` in headers and header dumps
-	{ pattern: /(\bAuthorization["']?\s*[:=]\s*["']?)[^"',\r\n}]+/gi, replacement: '$1***' },
-	// bare credentials of the bearer-like schemes
-	{ pattern: /(\b(?:Bearer|DPoP|Basic)\s+)[A-Za-z0-9\-._~+/]+=*/g, replacement: '$1***' },
-	// JSON bodies of token and registration responses
-	{ pattern: /("(?:client_secret|access_token|refresh_token|id_token)"\s*:\s*")[^"]*(")/g, replacement: '$1***$2' },
-	// form-encoded and query-string parameters (`code=` is the authorization code)
-	{ pattern: /(\b(?:client_secret|access_token|refresh_token|id_token|code)=)[^&\s"']+/g, replacement: '$1***' },
+/**
+ * Header values that the shared {@link redact} of the OAuth client does not
+ * cover: the credentials of an `Authorization` or `Proxy-Authorization`
+ * header in any scheme, and cookies.
+ */
+const HEADER_PATTERNS: readonly { readonly pattern: RegExp; readonly replacement: string }[] = [
+	{ pattern: /(\b(?:Proxy-)?Authorization["']?\s*[:=]\s*["']?)[^"',\r\n}]+/gi, replacement: '$1[redacted]' },
+	{ pattern: /(\b(?:Set-)?Cookie["']?\s*[:=]\s*["']?)[^"\r\n}]+/gi, replacement: '$1[redacted]' },
 ];
 
-/** Blanks the credentials that may appear in transport logs. */
+/**
+ * Blanks the credentials that may appear in transport and OAuth logs: the
+ * shared {@link redact} (bearer-like credentials, `Location`, and token,
+ * secret, password, assertion, `code` and `code_verifier` values in JSON,
+ * forms and query strings), then every `Authorization`,
+ * `Proxy-Authorization`, `Cookie` and `Set-Cookie` value.
+ */
 export function redactSecrets(text: string): string {
-	let result = text;
-	for (const { pattern, replacement } of SECRET_PATTERNS) {
+	let result = redact(text);
+	for (const { pattern, replacement } of HEADER_PATTERNS) {
 		result = result.replace(pattern, replacement);
 	}
 	return result;

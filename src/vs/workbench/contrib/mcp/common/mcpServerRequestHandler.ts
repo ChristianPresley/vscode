@@ -73,6 +73,19 @@ export interface IMcpNegotiatedProtocol {
 	readonly protocolVersion: string;
 }
 
+/** A request of a 2026-07-28 server that failed with a protocol error the client could not recover from. */
+export type McpProtocolFailure =
+	/**
+	 * -32020. Only `tools/call` is retried, once, after re-listing the tools
+	 * (`refresh: 'refreshed'`, or `'failed'` when the re-list itself failed and
+	 * there was no retry); other methods fail at once (`refresh: 'none'`).
+	 */
+	| { readonly kind: 'header-mismatch'; readonly method: string; readonly refresh: 'refreshed' | 'failed' | 'none' }
+	/** -32021: the server needs client capabilities that were not declared (from `error.data.requiredCapabilities`). */
+	| { readonly kind: 'missing-capability'; readonly method: string; readonly capabilities: readonly string[] }
+	/** -32022 after one renegotiation, or with no revision to switch to (from `error.data.supported`). */
+	| { readonly kind: 'unsupported-version'; readonly method: string; readonly requested: string; readonly supported: readonly string[] };
+
 interface ISendOptions {
 	/** Speak this version instead of the negotiated one (used during the probe). */
 	readonly version?: string;
@@ -82,6 +95,17 @@ interface ISendOptions {
 	readonly acceptResultTypes?: readonly string[];
 	/** Declare the Tasks extension (`io.modelcontextprotocol/tasks`) in this request's client capabilities (modern only). */
 	readonly tasks?: boolean;
+}
+
+interface ISendWithInputsOptions {
+	/** Told about each answered round. */
+	readonly onStatusMessage?: (message: string) => void;
+	/** Result types the caller handles itself (besides `complete` and `input_required`). */
+	readonly acceptResultTypes?: readonly string[];
+	/** Declare the Tasks extension in the request (see {@link ISendOptions.tasks}). */
+	readonly tasks?: boolean;
+	/** Called when the server answers `input_required`, before its input requests are answered. */
+	readonly onInputRequired?: () => void;
 }
 
 type ProbeOutcome =
@@ -133,6 +157,7 @@ export class McpServerRequestHandler extends Disposable {
 	private _logLevel: MCP.LoggingLevel | undefined;
 	private _probeTimedOut = false;
 	private _lastNegotiation: (McpProtocolEvent & { kind: 'negotiation' }) | undefined;
+	private readonly _handshakeEvents: McpProtocolEvent[] = [];
 	private _pendingInitializeId: JsonRpcId | undefined;
 	private _sending: { readonly version: string; readonly kind?: IMcpMessageEnvelope['kind']; readonly deadlineMs?: number } | undefined;
 	private readonly _headerAnnotations = new Map<string, readonly McpHeaderAnnotation[]>();
@@ -153,6 +178,11 @@ export class McpServerRequestHandler extends Disposable {
 
 	public get protocolVersion(): string {
 		return this.negotiated.protocolVersion;
+	}
+
+	/** The negotiated revision, or undefined before {@link create} resolves and while the era is being renegotiated. */
+	public get currentProtocolVersion(): string | undefined {
+		return this._negotiated?.protocolVersion;
 	}
 
 	/** The server's capabilities in the 2026-07-28 shape (legacy capabilities are projected onto it). */
@@ -188,6 +218,15 @@ export class McpServerRequestHandler extends Disposable {
 	/** The negotiation event of this connection (fired before anyone could subscribe). */
 	public get lastNegotiation(): (McpProtocolEvent & { kind: 'negotiation' }) | undefined {
 		return this._lastNegotiation;
+	}
+
+	/**
+	 * Every protocol event of the handshake, in order: the probe's
+	 * renegotiations (-32022 on `server/discover`) and then the negotiation.
+	 * They fire inside {@link create}, before anyone could subscribe.
+	 */
+	public get handshakeEvents(): readonly McpProtocolEvent[] {
+		return this._handshakeEvents;
 	}
 
 	/** The modern subscription manager; undefined for legacy servers. */
@@ -228,6 +267,10 @@ export class McpServerRequestHandler extends Disposable {
 	private readonly _onDidReportProtocolEvent = this._register(new Emitter<McpProtocolEvent>());
 	readonly onDidReportProtocolEvent = this._onDidReportProtocolEvent.event;
 
+	private readonly _onDidReportProtocolFailure = this._register(new Emitter<McpProtocolFailure>());
+	/** A request failed with -32020, -32021 or -32022 after the automatic recovery (the server wrapper tells the user). */
+	readonly onDidReportProtocolFailure = this._onDidReportProtocolFailure.event;
+
 	/**
 	 * Connects to the MCP server and negotiates the protocol era.
 	 * @throws MpcResponseError if the server rejects the handshake, McpClientError
@@ -237,6 +280,8 @@ export class McpServerRequestHandler extends Disposable {
 		const mcp = new McpServerRequestHandler(opts);
 		const store = new DisposableStore();
 		try {
+			// Nobody can subscribe before create() resolves: keep the handshake's events for replay.
+			store.add(mcp.onDidReportProtocolEvent(e => mcp._handshakeEvents.push(e)));
 			const timer = store.add(new IntervalTimer());
 			timer.cancelAndSet(() => {
 				opts.logger.info('Waiting for server to respond to the protocol handshake...');
@@ -299,8 +344,8 @@ export class McpServerRequestHandler extends Disposable {
 		this._transportType = transportType;
 		this._negotiationHint = negotiationHint;
 		this._serverInfo = defaultServerInfo ?? { name: 'MCP Server', version: '' };
-		// HTTP relies on the transport's legacy-probe abort; stdio (and unknown transports) time out.
-		this._probeTimeoutMs = probeTimeoutMs ?? (transportType === McpServerTransportType.HTTP ? undefined : PROBE_TIMEOUT_MS);
+		// HTTP relies on the transport's legacy-probe abort and gRPC always answers or aborts the call; stdio (and unknown transports) time out.
+		this._probeTimeoutMs = probeTimeoutMs ?? (transportType === McpServerTransportType.HTTP || transportType === McpServerTransportType.Grpc ? undefined : PROBE_TIMEOUT_MS);
 		this._logLevel = mapLogLevelToMcp(logger.getLevel());
 
 		this._rpc = this._register(new JsonRpcProtocol(
@@ -353,20 +398,29 @@ export class McpServerRequestHandler extends Disposable {
 		const hint = this._negotiationHint;
 		const hintedEra = hint?.era ?? (hint?.protocolVersion ? eraForProtocolVersion(hint.protocolVersion) : undefined);
 
+		let modernVersion = hint?.protocolVersion && eraForProtocolVersion(hint.protocolVersion) === 'modern' ? hint.protocolVersion : LATEST_MCP_PROTOCOL_VERSION;
 		if (hintedEra === 'legacy') {
 			const version = hint?.protocolVersion && eraForProtocolVersion(hint.protocolVersion) === 'legacy' ? hint.protocolVersion : MCPLegacy.LATEST_PROTOCOL_VERSION;
 			try {
 				await this._legacyHandshake(version, token);
 				return;
 			} catch (e) {
-				if (hint?.strict || e instanceof CancellationError) {
+				if (hint?.strict || e instanceof CancellationError || this._cannotRenegotiateAfter(e)) {
 					throw e;
 				}
-				this.logger.info(`Legacy handshake with the cached revision ${version} failed; probing again`);
+				// The hinted (pinned or cached) revision was rejected: negotiate as without a hint.
+				this.logger.warn(`The server rejected MCP ${version} (${describeHandshakeError(e)}); negotiating the protocol revision instead`);
+				const offered = this._offerAfterRejectedHandshake(e, version);
+				if (offered?.era === 'legacy') {
+					await this._legacyHandshake(offered.version, token);
+					return;
+				}
+				if (offered?.era === 'modern') {
+					modernVersion = offered.version;
+				}
 			}
 		}
 
-		const modernVersion = hint?.protocolVersion && eraForProtocolVersion(hint.protocolVersion) === 'modern' ? hint.protocolVersion : LATEST_MCP_PROTOCOL_VERSION;
 		const strict = !!hint?.strict;
 
 		if (this._probeTimeoutMs === undefined || strict) {
@@ -457,6 +511,39 @@ export class McpServerRequestHandler extends Disposable {
 		}
 	}
 
+	/**
+	 * Whether a failed hinted handshake leaves nothing to renegotiate: the
+	 * transport could not deliver the `initialize` (a `transport-error` abort,
+	 * such as a server that cannot be reached, which rejected no revision), or
+	 * the launch has already failed or stopped, so no later request would be
+	 * answered (the cancellation of the pending requests on that state has run
+	 * already: a probe sent now would never settle).
+	 */
+	private _cannotRenegotiateAfter(error: unknown): boolean {
+		const state = this._launch.state.get().state;
+		if (state === McpConnectionState.Kind.Error || state === McpConnectionState.Kind.Stopped) {
+			return true;
+		}
+		return error instanceof McpClientError && error.reason === 'request-aborted' && (error.detail as IMcpRequestAbort | undefined)?.reason === 'transport-error';
+	}
+
+	/**
+	 * The revision to try after the server rejected the hinted `initialize`: a
+	 * -32022 names the revisions the server speaks (the rule for -32022 on any
+	 * request), so another legacy one gets the handshake and a modern one is
+	 * probed with `server/discover`. Undefined (any other error, or no other
+	 * shared revision) probes from the start.
+	 */
+	private _offerAfterRejectedHandshake(error: unknown, rejected: string): { readonly era: McpProtocolEra; readonly version: string } | undefined {
+		if (!(error instanceof MpcResponseError) || error.code !== MCP.UNSUPPORTED_PROTOCOL_VERSION) {
+			return undefined;
+		}
+		const negotiated = negotiateProtocolVersion(supportedVersionsFromError(error.data));
+		const offered = negotiated && negotiated.version !== rejected ? negotiated : undefined;
+		this._onDidReportProtocolEvent.fire({ kind: 'renegotiation', code: error.code, retried: !!offered });
+		return offered;
+	}
+
 	/** Sends `server/discover`, retrying once when the server names another modern revision (-32022). Never rejects. */
 	private async _probeDiscover(version: string, token: CancellationToken, retried = false): Promise<ProbeOutcome> {
 		let result: MCP.DiscoverResult;
@@ -469,9 +556,10 @@ export class McpServerRequestHandler extends Disposable {
 			if (e instanceof MpcResponseError) {
 				if (e.code === MCP.UNSUPPORTED_PROTOCOL_VERSION) {
 					const negotiated = negotiateProtocolVersion(supportedVersionsFromError(e.data));
+					// A modern offer is retried once even when it names the rejected revision (see below).
 					const willRetry = !!negotiated && (negotiated.era === 'legacy'
 						? !this._negotiationHint?.strict
-						: !retried && negotiated.version !== version);
+						: !retried);
 					this._onDidReportProtocolEvent.fire({ kind: 'renegotiation', code: e.code, retried: willRetry });
 					if (!negotiated) {
 						return { kind: 'error', error: new McpClientError('no-supported-version', 'The server supports no MCP revision this client speaks', e.data) };
@@ -639,8 +727,14 @@ export class McpServerRequestHandler extends Disposable {
 					this.logger.warn(`The server reported a header mismatch for ${method}; refreshing the tool list and retrying once`);
 					try {
 						await this.listToolsEx({}, token);
-					} catch {
-						throw e;
+					} catch (listError) {
+						if (listError instanceof CancellationError || token.isCancellationRequested || this._store.isDisposed) {
+							// The call was cancelled (or the connection went away) during the re-list: not a refresh failure,
+							// so nothing is reported, and the notification is left for a real one.
+							throw listError instanceof CancellationError ? listError : new CancellationError();
+						}
+						this.logger.warn(`Refreshing the tool list after the header mismatch failed: ${listError}`);
+						throw this._unrecoveredError(method, e, 'failed');
 					}
 					this._onDidChangeToolList.fire();
 					continue;
@@ -651,8 +745,44 @@ export class McpServerRequestHandler extends Disposable {
 						continue;
 					}
 				}
-				throw e;
+				throw this._unrecoveredError(method, e, retriedHeaders ? 'refreshed' : 'none');
 			}
+		}
+	}
+
+	/**
+	 * A -32020, -32021 or -32022 that the automatic recovery (one re-list, one
+	 * renegotiation) did not resolve is logged and reported through
+	 * {@link onDidReportProtocolFailure}; -32021 becomes a `missing-capability`
+	 * client error naming the capabilities from `error.data`. Other errors are
+	 * returned unchanged.
+	 *
+	 * @param headerRefresh For -32020: whether the tool list was re-listed before the last attempt.
+	 */
+	private _unrecoveredError(method: string, error: MpcResponseError, headerRefresh: 'refreshed' | 'failed' | 'none' = 'none'): Error {
+		switch (error.code) {
+			case MCP.HEADER_MISMATCH:
+				this.logger.error(`The server rejected ${method} with a header mismatch (-32020): ${error.message}`);
+				this._onDidReportProtocolFailure.fire({ kind: 'header-mismatch', method, refresh: headerRefresh });
+				return error;
+			case MCP.UNSUPPORTED_PROTOCOL_VERSION: {
+				const supported = boundedNames(supportedVersionsFromError(error.data));
+				const requested = this._negotiated?.protocolVersion ?? LATEST_MCP_PROTOCOL_VERSION;
+				this.logger.error(`The server rejected ${method} for the protocol revision ${requested} (-32022: ${error.message}); it supports ${supported.length ? supported.join(', ') : 'no revision it named'}`);
+				this._onDidReportProtocolFailure.fire({ kind: 'unsupported-version', method, requested, supported });
+				return error;
+			}
+			case MCP.MISSING_REQUIRED_CLIENT_CAPABILITY: {
+				const capabilities = requiredCapabilityNames(error.data);
+				const message = capabilities.length
+					? `The server requires client capabilities this client does not declare for ${method}: ${capabilities.join(', ')}`
+					: `The server requires a client capability this client does not declare for ${method}`;
+				this.logger.error(`${message} (-32021: ${error.message})`);
+				this._onDidReportProtocolFailure.fire({ kind: 'missing-capability', method, capabilities });
+				return new McpClientError('missing-capability', message, { code: error.code, message: error.message, data: error.data, capabilities });
+			}
+			default:
+				return error;
 		}
 	}
 
@@ -950,12 +1080,12 @@ export class McpServerRequestHandler extends Disposable {
 			this._rpc.failPendingRequest(requestId, new CancellationError());
 			return;
 		}
-		// The server cancels a request it sent us (legacy sampling/elicitation)…
-		if (this._rpc.cancelIncomingRequest(requestId)) {
-			return;
-		}
-		// …or, leniently, tells us it abandoned one of ours.
-		this._rpc.cancelPendingRequest(requestId);
+		// The server cancels a request it sent us (legacy sampling/elicitation). A
+		// `notifications/cancelled` names a request of its sender, so it never
+		// cancels one of ours: request ids of both sides may be equal (a late
+		// cancel of a server request that already completed would otherwise
+		// cancel an unrelated client request with the same id).
+		this._rpc.cancelIncomingRequest(requestId);
 	}
 
 	private handleLoggingNotification(request: MCPLegacy.LoggingMessageNotification): void {
@@ -1004,7 +1134,8 @@ export class McpServerRequestHandler extends Disposable {
 	 * Sends a request that may come back as `input_required`, answering the
 	 * server's input requests and re-sending until the result is complete.
 	 */
-	private async _sendWithInputs<R extends object>(method: 'tools/call' | 'prompts/get' | 'resources/read', params: object, token: CancellationToken, context?: IMcpToolCallContext, onStatusMessage?: (message: string) => void, acceptResultTypes?: readonly string[], tasks = false): Promise<R> {
+	private async _sendWithInputs<R extends object>(method: 'tools/call' | 'prompts/get' | 'resources/read', params: object, token: CancellationToken, context?: IMcpToolCallContext, options: ISendWithInputsOptions = {}): Promise<R> {
+		const { onStatusMessage, acceptResultTypes, tasks = false, onInputRequired } = options;
 		const { inputResponses: _ignoredResponses, requestState: _ignoredState, ...base } = params as Record<string, unknown>;
 		let current: Record<string, unknown> = { ...base };
 		let rounds = 0;
@@ -1019,6 +1150,7 @@ export class McpServerRequestHandler extends Disposable {
 				}
 				return result as R;
 			}
+			onInputRequired?.();
 			if (++rounds > MAX_MRTR_ROUNDS) {
 				throw new McpClientError('too-many-rounds', `The server asked for input more than ${MAX_MRTR_ROUNDS} times for ${method}`);
 			}
@@ -1067,7 +1199,7 @@ export class McpServerRequestHandler extends Disposable {
 				}
 				const result = await this._elicitationRequestHandler(params, token, context, options);
 				if (result.action === 'accept' && params.mode !== 'url') {
-					const validation = validateElicitFormContent(result.content, params.requestedSchema);
+					const validation = validateElicitFormContent(result.content, params.requestedSchema, this.currentProtocolVersion);
 					if (!validation.ok) {
 						throw new McpClientError('invalid-elicit-content', `The elicitation answer does not match the requested schema: ${validation.message}`);
 					}
@@ -1144,24 +1276,23 @@ export class McpServerRequestHandler extends Disposable {
 	}
 
 	/**
-	 * Read a specific resource. Retry results (after an `input_required` round) are never cached: their `ttlMs` is set to 0.
+	 * Read a specific resource. A result produced by retrying the read after an
+	 * `input_required` round depends on the answers, which are not part of any
+	 * cache key, so it MUST NOT be cached (caching.mdx, "Cache Key"): its
+	 * `ttlMs` is set to 0, and `onInputRequired` tells the caller as soon as the
+	 * first round starts.
 	 */
-	async readResource(params: MCPLegacy.ReadResourceRequest['params'], token: CancellationToken = CancellationToken.None, context?: IMcpToolCallContext): Promise<MCPLegacy.ReadResourceResult> {
-		let rounds = 0;
-		const listener = this.onDidReportProtocolEvent(e => {
-			if (e.kind === 'mrtr' && e.method === 'resources/read') {
-				rounds = e.rounds;
-			}
+	async readResource(params: MCPLegacy.ReadResourceRequest['params'], token: CancellationToken = CancellationToken.None, context?: IMcpToolCallContext, onInputRequired?: () => void): Promise<MCPLegacy.ReadResourceResult> {
+		let retried = false;
+		const result = await this._sendWithInputs<MCPLegacy.ReadResourceResult & { ttlMs?: number }>('resources/read', params, token, context, {
+			onInputRequired: () => {
+				if (!retried) {
+					retried = true;
+					onInputRequired?.();
+				}
+			},
 		});
-		try {
-			const result = await this._sendWithInputs<MCPLegacy.ReadResourceResult & { ttlMs?: number }>('resources/read', params, token, context);
-			if (rounds > 0 && typeof result.ttlMs === 'number') {
-				return { ...result, ttlMs: 0 };
-			}
-			return result;
-		} finally {
-			listener.dispose();
-		}
+		return retried ? { ...result, ttlMs: 0 } : result;
 	}
 
 	/**
@@ -1269,7 +1400,7 @@ export class McpServerRequestHandler extends Disposable {
 		if (this._negotiated?.era === 'modern') {
 			const { task, ...modernParams } = params;
 			const tasks = task !== undefined && this.supportsModernTasks;
-			const modernResponse = await this._sendWithInputs<MCPLegacy.CallToolResult | McpTasks.CreateTaskResult>('tools/call', modernParams, token, context, onStatusMessage, tasks ? [McpTasks.RESULT_TYPE_TASK] : undefined, tasks);
+			const modernResponse = await this._sendWithInputs<MCPLegacy.CallToolResult | McpTasks.CreateTaskResult>('tools/call', modernParams, token, context, { onStatusMessage, acceptResultTypes: tasks ? [McpTasks.RESULT_TYPE_TASK] : undefined, tasks });
 			if (!McpTasks.isCreateTaskResult(modernResponse as MCP.Result)) {
 				return modernResponse as MCPLegacy.CallToolResult;
 			}
@@ -1282,7 +1413,7 @@ export class McpServerRequestHandler extends Disposable {
 			});
 		}
 
-		const response = await this._sendWithInputs<MCPLegacy.CallToolResult | MCPLegacy.CreateTaskResult>('tools/call', params, token, context, onStatusMessage);
+		const response = await this._sendWithInputs<MCPLegacy.CallToolResult | MCPLegacy.CreateTaskResult>('tools/call', params, token, context, { onStatusMessage });
 
 		if (this._negotiated?.era === 'legacy' && isTaskResult(response)) {
 			const task = new McpTask<MCPLegacy.CallToolResult>(response.task, token, onStatusMessage);
@@ -1411,12 +1542,58 @@ function cacheHintOf(result: unknown): IMcpCacheHint {
 	};
 }
 
+/** A rejected handshake for the log: the JSON-RPC error (its message names the code), or the client error. */
+function describeHandshakeError(error: unknown): string {
+	if (error instanceof McpClientError) {
+		return `${error.reason}: ${error.message}`;
+	}
+	return error instanceof Error ? error.message : String(error);
+}
+
 function supportedVersionsFromError(data: unknown): readonly string[] {
 	if (typeof data !== 'object' || data === null) {
 		return [];
 	}
 	const supported = (data as { supported?: unknown }).supported;
 	return Array.isArray(supported) ? supported.filter((v): v is string => typeof v === 'string') : [];
+}
+
+const MAX_REPORTED_NAMES = 10;
+const MAX_REPORTED_NAME_LENGTH = 100;
+
+/**
+ * Server-provided names (capabilities, revisions) as they are shown to the
+ * user: at most ten, each at most 100 characters of `[A-Za-z0-9_.:/@+-]`, so
+ * no link syntax (`[label](target)`) can reach a notification.
+ */
+function boundedNames(names: readonly string[]): string[] {
+	return names.slice(0, MAX_REPORTED_NAMES)
+		.map(name => name.replace(/[^\w.:/@+-]/g, ''))
+		.filter(name => name.length > 0)
+		.map(name => name.length > MAX_REPORTED_NAME_LENGTH ? name.slice(0, MAX_REPORTED_NAME_LENGTH) + '…' : name);
+}
+
+/**
+ * The capabilities a -32021 error names (`data.requiredCapabilities`), as
+ * dotted paths of at most two levels: `{ elicitation: { url: {} } }` is
+ * `elicitation.url`, `{ sampling: {} }` is `sampling`, an extension is
+ * `extensions.<id>`.
+ */
+function requiredCapabilityNames(data: unknown): string[] {
+	const required = typeof data === 'object' && data !== null ? (data as { requiredCapabilities?: unknown }).requiredCapabilities : undefined;
+	if (typeof required !== 'object' || required === null || Array.isArray(required)) {
+		return [];
+	}
+	const names: string[] = [];
+	for (const [key, value] of Object.entries(required)) {
+		const children = typeof value === 'object' && value !== null && !Array.isArray(value) ? Object.keys(value) : [];
+		if (children.length) {
+			names.push(...children.map(child => `${key}.${child}`));
+		} else {
+			names.push(key);
+		}
+	}
+	return boundedNames(names);
 }
 
 function legacyToModernCapabilities(cap: MCPLegacy.ServerCapabilities): MCP.ServerCapabilities {

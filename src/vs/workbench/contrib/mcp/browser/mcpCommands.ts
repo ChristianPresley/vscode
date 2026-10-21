@@ -14,6 +14,7 @@ import { VSBuffer } from '../../../../base/common/buffer.js';
 import { Codicon } from '../../../../base/common/codicons.js';
 import { groupBy } from '../../../../base/common/collections.js';
 import { isCancellationError } from '../../../../base/common/errors.js';
+import Severity from '../../../../base/common/severity.js';
 import { Event } from '../../../../base/common/event.js';
 import { createMarkdownCommandLink, MarkdownString } from '../../../../base/common/htmlContent.js';
 import { Disposable, DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
@@ -33,6 +34,7 @@ import { CustomizationEnablementKind, McpServerStatus } from '../../../../platfo
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { ConfigurationTarget, IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ContextKeyExpr } from '../../../../platform/contextkey/common/contextkey.js';
+import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IInstantiationService, ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
 import { ILabelService } from '../../../../platform/label/common/label.js';
@@ -68,6 +70,7 @@ import { ILanguageModelToolsService } from '../../chat/common/tools/languageMode
 import { extensionsFilterSubMenu, IExtensionsWorkbenchService } from '../../extensions/common/extensions.js';
 import { TEXT_FILE_EDITOR_ID } from '../../files/common/files.js';
 import { McpCommandIds } from '../common/mcpCommandIds.js';
+import { parseStoredClientSecret, serializeStoredClientSecret } from '../common/mcpOAuthClientSecret.js';
 import { mcpWorkspaceRootConfig } from '../common/mcpConfiguration.js';
 import { McpContextKeys } from '../common/mcpContextKeys.js';
 import { IMcpCopilotGlobalConfigurationService } from '../common/mcpCopilotGlobalConfigurationService.js';
@@ -1244,9 +1247,14 @@ export class SetOAuthClientSecret extends Action2 {
 	async run(accessor: ServicesAccessor, clientId: string, mcpServerUrl: string, serverName: string): Promise<void> {
 		const quickInputService = accessor.get(IQuickInputService);
 		const secretStorageService = accessor.get(ISecretStorageService);
+		const dialogService = accessor.get(IDialogService);
+		const notificationService = accessor.get(INotificationService);
 
 		const key = mcpOAuthClientSecretStorageKey(mcpServerUrl, clientId);
-		const existing = await secretStorageService.get(key);
+		// The stored form is `{ clientSecret, issuer }`: only the secret is shown and edited.
+		const stored = parseStoredClientSecret(await secretStorageService.get(key));
+		const existing = stored?.clientSecret;
+		const hasStored = stored !== undefined;
 
 		const deleteButton = {
 			iconClass: ThemeIcon.asClassName(Codicon.trash),
@@ -1263,11 +1271,11 @@ export class SetOAuthClientSecret extends Action2 {
 
 		const result = await new Promise<{ kind: 'accept'; value: string } | { kind: 'delete' } | undefined>(resolve => {
 			const input = quickInputService.createInputBox();
-			input.title = existing
+			input.title = hasStored
 				? localize('mcp.setOAuthClientSecret.title.replace', "Replace Client Secret for {0}", serverName)
 				: localize('mcp.setOAuthClientSecret.title.set', "Set Client Secret for {0}", serverName);
 			input.prompt = localize('mcp.setOAuthClientSecret.prompt', "Enter the client secret for OAuth client '{0}'.", clientId);
-			input.placeholder = existing
+			input.placeholder = hasStored
 				? localize('mcp.setOAuthClientSecret.placeholder.replace', "Enter a new client secret to replace the stored value")
 				: localize('mcp.setOAuthClientSecret.placeholder.set', "Enter client secret");
 			input.password = true;
@@ -1278,7 +1286,7 @@ export class SetOAuthClientSecret extends Action2 {
 			}
 			const updateButtons = () => {
 				const toggleButton = input.password ? revealButton : hideButton;
-				input.buttons = existing ? [toggleButton, deleteButton] : [toggleButton];
+				input.buttons = hasStored ? [toggleButton, deleteButton] : [toggleButton];
 			};
 			updateButtons();
 			const disposables = new DisposableStore();
@@ -1316,9 +1324,27 @@ export class SetOAuthClientSecret extends Action2 {
 
 		if (result.kind === 'delete') {
 			await secretStorageService.delete(key);
-		} else {
-			await secretStorageService.set(key, result.value);
+			return;
 		}
+
+		// The stored secret is bound to the authorization server it was first used with. A new secret keeps
+		// that binding only when the user confirms it was issued by the same authorization server; otherwise
+		// it is bound again on its next successful sign-in.
+		let issuer = stored?.issuer;
+		if (issuer !== undefined && result.value !== existing) {
+			const { confirmed } = await dialogService.confirm({
+				type: Severity.Info,
+				message: localize('mcp.setOAuthClientSecret.sameIssuer', "Was the new client secret issued by the same authorization server?"),
+				detail: localize('mcp.setOAuthClientSecret.sameIssuerDetail', "The stored client secret of OAuth client '{0}' is bound to the authorization server '{1}', and is only ever sent to it. Keep that binding only if the new secret belongs to the same authorization server.", clientId, issuer),
+				primaryButton: localize({ key: 'mcp.setOAuthClientSecret.keepBinding', comment: ['&& denotes a mnemonic'] }, "&&Same Authorization Server"),
+				cancelButton: localize('mcp.setOAuthClientSecret.clearBinding', "Different or Not Sure"),
+			});
+			if (!confirmed) {
+				notificationService.info(localize('mcp.setOAuthClientSecret.bindingCleared', "The client secret of OAuth client '{0}' is no longer bound to the authorization server '{1}'. It is bound to the authorization server of its next successful sign-in.", clientId, issuer));
+				issuer = undefined;
+			}
+		}
+		await secretStorageService.set(key, serializeStoredClientSecret({ clientSecret: result.value, issuer }));
 	}
 }
 

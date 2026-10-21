@@ -794,7 +794,8 @@ export interface McpServerTransportHTTP {
  * MCP server reached over gRPC on a `grpc://` (plaintext HTTP/2) or `grpcs://`
  * (TLS) endpoint. The {@link binding} selects the zig-sdk JSON-RPC tunnel
  * (`/mcp.zig.transport.v1.Mcp/Call`), Google's typed `model_context_protocol.Mcp`
- * service, or `auto` (tunnel first, typed fallback).
+ * service, or `auto` (the default), which is the tunnel: only `typed` speaks
+ * the typed service.
  */
 export interface McpServerTransportGrpc {
 	readonly type: McpServerTransportType.Grpc;
@@ -803,9 +804,20 @@ export interface McpServerTransportGrpc {
 	readonly headers: [string, string][];
 	readonly tls?: IMcpGrpcServerTlsConfiguration;
 	readonly binding?: McpGrpcBinding;
-	/** Per-call deadline in milliseconds; unset means no deadline, including on `tools/call`. */
+	/**
+	 * The deadline in milliseconds of every call except the `subscriptions/listen`
+	 * stream, which never has one. Unset (or not a positive number): 60 seconds for
+	 * `server/discover` and the list, read, prompt and completion requests, and no
+	 * deadline for `tools/call`, the retries of `input_required` rounds and other requests.
+	 */
 	readonly deadlineMs?: number;
-	/** Interval in milliseconds between HTTP/2 keep-alive pings; unset disables them. */
+	/**
+	 * Interval in milliseconds between HTTP/2 keep-alive pings, sent only while a
+	 * call is open, raised to at least 300000 (5 minutes) and doubled for the
+	 * next connection after a `too_many_pings`; 0 sends none. Unset (or not a
+	 * number of milliseconds): a ping every 310000 ms only while a
+	 * `subscriptions/listen` stream is open.
+	 */
 	readonly keepAliveMs?: number;
 	readonly oauth?: McpServerTransportHTTPOAuth;
 }
@@ -1165,6 +1177,8 @@ export type McpClientErrorReason =
 	| 'invalid-input-request'
 	/** The user's elicitation answer does not match the requested schema. */
 	| 'invalid-elicit-content'
+	/** The server requires client capabilities the client did not declare (-32021); the message names them. */
+	| 'missing-capability'
 	/** The transport reported that the request can no longer be answered. */
 	| 'request-aborted';
 

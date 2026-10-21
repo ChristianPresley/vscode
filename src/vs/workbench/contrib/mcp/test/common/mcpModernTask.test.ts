@@ -24,6 +24,7 @@ import { IStorageService } from '../../../../../platform/storage/common/storage.
 import { IOutputService } from '../../../../services/output/common/output.js';
 import { TestLoggerService, TestProductService, TestStorageService } from '../../../../test/common/workbenchTestServices.js';
 import { DEFAULT_MODERN_TASK_POLL_INTERVAL_MS, MIN_MODERN_TASK_POLL_INTERVAL_MS } from '../../common/mcpModernTask.js';
+import { MAX_MRTR_ROUNDS } from '../../common/mcpProtocolMeta.js';
 import { IMcpServerRequestHandlerOptions, McpServerRequestHandler } from '../../common/mcpServerRequestHandler.js';
 import { McpTaskManager } from '../../common/mcpTaskManager.js';
 import { McpClientError, McpConnectionState, MpcResponseError } from '../../common/mcpTypes.js';
@@ -44,6 +45,8 @@ interface ITaskState {
 	readonly inputRequests?: MCP.InputRequests;
 	readonly statusMessage?: string;
 	readonly pollIntervalMs?: number;
+	/** Not part of the extension's task shape; a server may still send one. */
+	readonly requestState?: string;
 }
 
 const ok = (request: IJsonRpcRequest, result: object): JsonRpcMessage => ({ jsonrpc: MCP.JSONRPC_VERSION, id: request.id, result: { resultType: 'complete', ...result } });
@@ -191,17 +194,106 @@ suite('Workbench - MCP - ServerRequestHandler - Modern tasks', () => {
 		assert.deepStrictEqual(transport.getSentEnvelope('tasks/update')?.headers, { 'Mcp-Method': 'tasks/update', 'Mcp-Name': 'task-1' });
 	}));
 
-	test('the same pending requests right after an update are not answered twice without waiting an interval', () => runWithFakedTimers({ useFakeTimers: true, maxTaskCount: 1000 }, async () => {
-		const inputRequests: MCP.InputRequests = { q: { method: 'roots/list' } };
+	const confirmRequest = (message: string): MCP.InputRequest => ({ method: 'elicitation/create', params: { mode: 'form', message, requestedSchema: { type: 'object', properties: { confirm: { type: 'boolean' } } } } });
+
+	test('a server that keeps showing the answered requests for three polls does not get them answered twice', () => runWithFakedTimers({ useFakeTimers: true, maxTaskCount: 1000 }, async () => {
+		const inputRequests: MCP.InputRequests = { confirm: confirmRequest('Delete?'), roots: { method: 'roots/list' } };
 		const { transport } = taskServer([
 			{ status: 'input_required', inputRequests },
 			{ status: 'input_required', inputRequests },
+			{ status: 'input_required', inputRequests: { roots: { method: 'roots/list' }, confirm: confirmRequest('Delete?') } }, // same requests, other key order
+			{ status: 'input_required', inputRequests },
 			{ status: 'completed', result: { content: [] } },
 		], { pollIntervalMs: 200 });
-		const handler = await connect(transport);
-		await handler.callTool({ name: 'roots', arguments: {}, task: {} });
+		const elicitation = sinon.stub().resolves({ action: 'accept', content: { confirm: true } });
+		const handler = await connect(transport, { elicitationRequestHandler: elicitation });
+		await handler.callTool({ name: 'confirm', arguments: {}, task: {} });
+		assert.strictEqual(elicitation.callCount, 1, 'the user is asked once');
 		assert.strictEqual(transport.getSentRequests('tasks/update').length, 1);
-		assert.strictEqual(transport.getSentRequests('tasks/get').length, 3);
+		assert.strictEqual(transport.getSentRequests('tasks/get').length, 5);
+		assert.strictEqual(transport.getSentRequests('tasks/cancel').length, 0);
+	}));
+
+	test('an answered key is answered again only in a new round: after the task worked, under a new requestState, or for a changed request', () => runWithFakedTimers({ useFakeTimers: true, maxTaskCount: 1000 }, async () => {
+		const first: MCP.InputRequests = { confirm: confirmRequest('Delete a?') };
+		const changed: MCP.InputRequests = { confirm: confirmRequest('Delete b?') };
+		const { transport } = taskServer([
+			{ status: 'input_required', inputRequests: first }, // answered (1)
+			{ status: 'input_required', inputRequests: first }, // not taken in yet
+			{ status: 'working' },
+			{ status: 'input_required', inputRequests: first }, // a new round after the task worked: answered (2)
+			{ status: 'input_required', inputRequests: first, requestState: 's2' }, // a new requestState: answered (3)
+			{ status: 'input_required', inputRequests: first, requestState: 's2' },
+			{ status: 'input_required', inputRequests: changed, requestState: 's2' }, // same key, other request: answered (4)
+			{ status: 'input_required', inputRequests: { ...changed, roots: { method: 'roots/list' } }, requestState: 's2' }, // only the new key: answered (5)
+			{ status: 'completed', result: { content: [] } },
+		], { pollIntervalMs: 200 });
+		const elicitation = sinon.stub().resolves({ action: 'accept', content: { confirm: true } });
+		const handler = await connect(transport, { elicitationRequestHandler: elicitation });
+		await handler.callTool({ name: 'confirm', arguments: {}, task: {} });
+		assert.deepStrictEqual(elicitation.getCalls().map(c => (c.args[0] as MCP.ElicitRequestFormParams).message), ['Delete a?', 'Delete a?', 'Delete a?', 'Delete b?']);
+		const updates = transport.getSentRequests('tasks/update').map(u => Object.keys(paramsOf(u).inputResponses as object));
+		assert.deepStrictEqual(updates, [['confirm'], ['confirm'], ['confirm'], ['confirm'], ['roots']]);
+	}));
+
+	test('a failing input handler cancels the server task once and rejects with its error', () => runWithFakedTimers({ useFakeTimers: true, maxTaskCount: 1000 }, async () => {
+		const { transport } = taskServer([{ status: 'input_required', inputRequests: { confirm: confirmRequest('Delete?') } }], { pollIntervalMs: 100 });
+		const handler = await connect(transport, { elicitationRequestHandler: sinon.stub().rejects(new Error('handler crashed')) });
+		await assert.rejects(handler.callTool({ name: 'confirm', arguments: {}, task: {} }), (e: unknown) => e instanceof Error && e.message === 'handler crashed');
+		const cancels = transport.getSentRequests('tasks/cancel');
+		assert.strictEqual(cancels.length, 1);
+		assert.deepStrictEqual(paramsOf(cancels[0]).taskId, 'task-1');
+		assert.strictEqual(transport.getSentRequests('tasks/update').length, 0);
+		const polled = transport.getSentRequests('tasks/get').length;
+		await new Promise(resolve => setTimeout(resolve, 1000));
+		assert.strictEqual(transport.getSentRequests('tasks/get').length, polled, 'no more polls');
+		assert.strictEqual(transport.getSentRequests('tasks/cancel').length, 1);
+	}));
+
+	test('an input request the client cannot answer cancels the server task once', () => runWithFakedTimers({ useFakeTimers: true, maxTaskCount: 1000 }, async () => {
+		const { transport } = taskServer([{ status: 'input_required', inputRequests: { s: { method: 'sampling/createMessage', params: { messages: [], maxTokens: 1 } } } }], { pollIntervalMs: 100 });
+		const handler = await connect(transport); // no sampling handler
+		await assert.rejects(handler.callTool({ name: 'sample', arguments: {}, task: {} }), (e: unknown) => e instanceof McpClientError && e.reason === 'undeclared-input-request');
+		assert.strictEqual(transport.getSentRequests('tasks/cancel').length, 1);
+	}));
+
+	test('a failing tasks/update cancels the server task once and rejects with the error', () => runWithFakedTimers({ useFakeTimers: true, maxTaskCount: 1000 }, async () => {
+		const { transport } = taskServer([{ status: 'input_required', inputRequests: { q: { method: 'roots/list' } } }], { pollIntervalMs: 100 });
+		transport.setResponder('tasks/update', req => ({ jsonrpc: MCP.JSONRPC_VERSION, id: req.id, error: { code: MCP.INTERNAL_ERROR, message: 'update failed' } }));
+		const handler = await connect(transport);
+		await assert.rejects(handler.callTool({ name: 'roots', arguments: {}, task: {} }), (e: unknown) => e instanceof MpcResponseError && e.code === MCP.INTERNAL_ERROR);
+		assert.strictEqual(transport.getSentRequests('tasks/update').length, 1);
+		const cancels = transport.getSentRequests('tasks/cancel');
+		assert.strictEqual(cancels.length, 1);
+		assert.strictEqual(declaresTasks(cancels[0]), true);
+	}));
+
+	test('too many input rounds cancel the server task once', () => runWithFakedTimers({ useFakeTimers: true, maxTaskCount: 1000 }, async () => {
+		const states: ITaskState[] = [];
+		for (let i = 0; i <= MAX_MRTR_ROUNDS; i++) {
+			states.push({ status: 'input_required', inputRequests: { q: { method: 'roots/list' } }, requestState: `round-${i}` });
+		}
+		const { transport } = taskServer(states, { pollIntervalMs: 100 });
+		const handler = await connect(transport);
+		await assert.rejects(handler.callTool({ name: 'roots', arguments: {}, task: {} }), (e: unknown) => e instanceof McpClientError && e.reason === 'too-many-rounds');
+		assert.strictEqual(transport.getSentRequests('tasks/update').length, MAX_MRTR_ROUNDS);
+		assert.strictEqual(transport.getSentRequests('tasks/cancel').length, 1);
+	}));
+
+	test('the task manager disposing a running task cancels it on the server once', () => runWithFakedTimers({ useFakeTimers: true, maxTaskCount: 1000 }, async () => {
+		const taskManager = store.add(new McpTaskManager());
+		const { transport } = taskServer([{ status: 'working' }], { pollIntervalMs: 100 });
+		const handler = await connect(transport, {}, taskManager);
+		const call = handler.callTool({ name: 'slow', arguments: {}, task: {} });
+		await Event.toPromise(Event.filter(transport.onDidReceiveMessage, () => transport.getSentRequests('tasks/get').length >= 1));
+		taskManager.dispose();
+		await assert.rejects(call, (e: unknown) => e instanceof CancellationError);
+		const cancels = transport.getSentRequests('tasks/cancel');
+		assert.strictEqual(cancels.length, 1);
+		assert.deepStrictEqual(paramsOf(cancels[0]).taskId, 'task-1');
+		const polled = transport.getSentRequests('tasks/get').length;
+		await new Promise(resolve => setTimeout(resolve, 1000));
+		assert.strictEqual(transport.getSentRequests('tasks/get').length, polled, 'no more polls');
 	}));
 
 	test('a failed task rejects with its inlined error, a task the server cancelled with a cancellation', () => runWithFakedTimers({ useFakeTimers: true, maxTaskCount: 1000 }, async () => {
@@ -214,6 +306,9 @@ suite('Workbench - MCP - ServerRequestHandler - Modern tasks', () => {
 		const empty = taskServer([{ status: 'completed' }], { pollIntervalMs: 100 });
 		const third = await connect(empty.transport);
 		await assert.rejects(third.callTool({ name: 'job', arguments: {}, task: {} }), (e: unknown) => e instanceof McpClientError && e.reason === 'invalid-result-type');
+		for (const settled of [failing, cancelled, empty]) {
+			assert.strictEqual(settled.transport.getSentRequests('tasks/cancel').length, 0, 'a task that is over on the server is not cancelled');
+		}
 	}));
 
 	test('an unknown task (-32602 on tasks/get) rejects the call', () => runWithFakedTimers({ useFakeTimers: true, maxTaskCount: 1000 }, async () => {
@@ -221,6 +316,7 @@ suite('Workbench - MCP - ServerRequestHandler - Modern tasks', () => {
 		transport.setResponder('tasks/get', req => ({ jsonrpc: MCP.JSONRPC_VERSION, id: req.id, error: { code: MCP.INVALID_PARAMS, message: 'Unknown task' } }));
 		const handler = await connect(transport);
 		await assert.rejects(handler.callTool({ name: 'job', arguments: {}, task: {} }), (e: unknown) => e instanceof MpcResponseError && e.code === MCP.INVALID_PARAMS);
+		assert.strictEqual(transport.getSentRequests('tasks/cancel').length, 0, 'a task the server does not know is not cancelled');
 	}));
 
 	test('cancelling the call sends tasks/cancel once and stops polling', () => runWithFakedTimers({ useFakeTimers: true, maxTaskCount: 1000 }, async () => {

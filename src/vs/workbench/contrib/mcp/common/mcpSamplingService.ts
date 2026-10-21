@@ -413,7 +413,22 @@ function buildLanguageModelRequest(params: MCPLegacy.CreateMessageRequestParams)
 		messages.unshift({ role: ChatMessageRole.System, content: [{ type: 'text', value: params.systemPrompt }] });
 	}
 
-	return { messages, options: buildToolOptions(params) };
+	return { messages, options: { ...buildModelOptions(params), ...buildToolOptions(params) } };
+}
+
+/**
+ * Maps `maxTokens` to the `max_tokens` model option, the output token limit
+ * that language model providers read from the request's `modelOptions` (the
+ * Copilot provider forwards it to the model endpoint). sampling.mdx: "The
+ * client MUST respect the `maxTokens` parameter." `temperature`,
+ * `stopSequences` and `metadata` may be ignored and are.
+ */
+function buildModelOptions(params: MCPLegacy.CreateMessageRequestParams): ILanguageModelChatRequestOptions {
+	// `maxTokens` is required; a request without a usable one is still served, without a limit.
+	if (typeof params.maxTokens !== 'number' || !Number.isFinite(params.maxTokens)) {
+		return {};
+	}
+	return { modelOptions: { max_tokens: params.maxTokens } };
 }
 
 function describeIds(ids: ReadonlySet<string>): string {
@@ -426,7 +441,7 @@ function describeIds(ids: ReadonlySet<string>): string {
  * The language model API knows the modes "auto" and "required" only. A
  * `toolChoice` of `none` is approximated by not offering any tools at all,
  * which is equivalent for the model: it cannot call a tool it was not given.
- * Without tools the options stay empty, as they were before tools existed.
+ * Without tools there are no tool options, as before tools existed.
  */
 function buildToolOptions(params: MCPLegacy.CreateMessageRequestParams): ILanguageModelChatRequestOptions {
 	const mode = params.toolChoice?.mode ?? 'auto';

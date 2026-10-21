@@ -3,8 +3,9 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { AsyncIterableProducer, raceCancellationError, Sequencer } from '../../../../base/common/async.js';
+import { AsyncIterableProducer, disposableTimeout, raceCancellationError, Sequencer } from '../../../../base/common/async.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
+import { isCancellationError } from '../../../../base/common/errors.js';
 import { Iterable } from '../../../../base/common/iterator.js';
 import { normalizeDriveLetter } from '../../../../base/common/labels.js';
 import { Disposable, DisposableStore, IDisposable, IReference, MutableDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
@@ -16,7 +17,7 @@ import { basename } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
 import { createURITransformer } from '../../../../base/common/uriTransformer.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
-import { compileJsonSchema, isCompiledJsonSchema, validateJsonSchemaDocument } from '../../../../base/common/jsonSchemaValidator/index.js';
+import { ICompiledJsonSchema, IJsonSchemaCompileError, isCompiledJsonSchema, PatternAnalysisBudget } from '../../../../base/common/jsonSchemaValidator/index.js';
 import { localize } from '../../../../nls.js';
 import { hasConfigurationVariable } from '../../../../platform/configuration/common/configurationVariables.js';
 import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
@@ -42,8 +43,8 @@ import { McpDevModeServerAttache } from './mcpDevMode.js';
 import { McpIcons, parseAndValidateMcpIcon, StoredMcpIcons } from './mcpIcons.js';
 import { IMcpRegistry } from './mcpRegistryTypes.js';
 import { IMcpSandboxService } from './mcpSandboxService.js';
-import { MAX_CACHED_LIST_TTL_MS, McpProtocolEvent } from './mcpProtocolMeta.js';
-import { IMcpCacheHint, IMcpListResult, McpServerRequestHandler } from './mcpServerRequestHandler.js';
+import { checkServerToolSchemas, checkStructuredContent, describeCompileErrors, MAX_CACHED_LIST_TTL_MS, McpProtocolEvent, readsSchemasLeniently, TOOL_LIST_CHANGE_GRACE_MS } from './mcpProtocolMeta.js';
+import { IMcpCacheHint, IMcpListResult, McpProtocolFailure, McpServerRequestHandler } from './mcpServerRequestHandler.js';
 import { McpTaskManager } from './mcpTaskManager.js';
 import { ElicitationKind, extensionMcpCollectionPrefix, IMcpElicitationService, IMcpIcons, IMcpNegotiationHints, IMcpPotentialSandboxBlock, IMcpPrompt, IMcpPromptMessage, IMcpResource, IMcpResourceTemplate, IMcpSamplingService, IMcpServer, IMcpServerConnection, IMcpServerStartOpts, IMcpTool, IMcpToolCallContext, McpCapability, McpCollectionDefinition, McpCollectionReference, McpConnectionFailedError, McpConnectionState, McpDefinitionReference, mcpPromptReplaceSpecialChars, McpResourceURI, McpServerCacheState, McpServerDefinition, McpServerLaunch, McpServerStaticToolAvailability, McpServerTransportType, McpToolName, McpToolVisibility, MpcResponseError, UserInteractionRequiredError } from './mcpTypes.js';
 import { ContributionEnablementState, IEnablementModel } from '../../chat/common/enablement.js';
@@ -194,6 +195,11 @@ interface IToolCacheEntry {
 interface IStoredProtocol {
 	readonly era: McpProtocolEra;
 	readonly version: string;
+	/**
+	 * The `protocolVersion` pinned in the configuration when this revision was
+	 * negotiated. The revision differs from the pin when the server rejected it.
+	 */
+	readonly pin?: string;
 }
 
 interface IStoredListFreshness {
@@ -694,7 +700,7 @@ export class McpServer extends Disposable implements IMcpServer {
 			const cnx = this._connection.read(reader);
 			const handler = cnx?.handler.read(reader);
 			if (handler) {
-				this._populateLiveData(handler, cnx?.definition.cacheNonce, reader.store);
+				this._populateLiveData(handler, cnx?.definition.cacheNonce, cnx?.definition.protocolVersionHint, reader.store);
 			} else if (this._tools) {
 				this.resetLiveData();
 			}
@@ -733,11 +739,12 @@ export class McpServer extends Disposable implements IMcpServer {
 			staticMetadata
 				.map(m => {
 					const tools = m?.tools?.filter(t => t.availability === McpServerStaticToolAvailability.Initial).map(t => t.definition);
-					return tools?.length ? new ObservablePromise(this._getValidatedTools(tools)) : undefined;
+					// The revision is not known before the server starts: read the static schemas leniently (the live list replaces them).
+					return tools?.length ? new ObservablePromise(this._getValidatedTools(tools, MCPLegacy.LATEST_PROTOCOL_VERSION)) : undefined;
 				})
 				.map((o, reader) => o?.promiseResult.read(reader)?.data),
 			(entry) => entry.tools,
-			(entry, reader) => entry.map(def => this._instantiationService.createInstance(McpTool, this, toolPrefix.read(reader), def)).sort((a, b) => a.compare(b)),
+			(entry, reader) => entry.map(def => this._instantiationService.createInstance(McpTool, this, toolPrefix.read(reader), def, entry)).sort((a, b) => a.compare(b)),
 			[],
 		);
 
@@ -1053,6 +1060,40 @@ export class McpServer extends Disposable implements IMcpServer {
 		}
 	}
 
+	/**
+	 * Tells the user about a request that failed with -32020, -32021 or -32022
+	 * after the automatic recovery, in words and with the output channel one
+	 * click away (the details, including the server's error, are logged there).
+	 */
+	private _notifyProtocolFailure(failure: McpProtocolFailure): void {
+		this._notificationService.prompt(Severity.Error, McpServer._describeProtocolFailure(this.definition.label, failure), [{
+			label: localize('mcp.command.showOutput', "Show Output"),
+			run: () => this.showOutput(),
+		}]);
+	}
+
+	private static _describeProtocolFailure(label: string, failure: McpProtocolFailure): string {
+		switch (failure.kind) {
+			case 'header-mismatch':
+				switch (failure.refresh) {
+					case 'refreshed':
+						return localize('mcp.protocolFailure.headerMismatchRefreshed', "The MCP server {0} rejected a {1} request because its headers do not match the request, even after the tool list was refreshed.", label, failure.method);
+					case 'failed':
+						return localize('mcp.protocolFailure.headerMismatchRefreshFailed', "The MCP server {0} rejected a {1} request because its headers do not match the request, and the tool list could not be refreshed to retry it.", label, failure.method);
+					case 'none':
+						return localize('mcp.protocolFailure.headerMismatch', "The MCP server {0} rejected a {1} request because its headers do not match the request.", label, failure.method);
+				}
+			case 'missing-capability':
+				return failure.capabilities.length
+					? localize('mcp.protocolFailure.missingCapability', "The MCP server {0} requires client capabilities that VS Code does not provide for a {1} request: {2}.", label, failure.method, failure.capabilities.join(', '))
+					: localize('mcp.protocolFailure.missingCapabilityUnnamed', "The MCP server {0} requires a client capability that VS Code does not provide for a {1} request.", label, failure.method);
+			case 'unsupported-version':
+				return failure.supported.length
+					? localize('mcp.protocolFailure.unsupportedVersion', "The MCP server {0} rejected the MCP revision {1}. It supports {2}, and VS Code could not switch to a revision both speak.", label, failure.requested, failure.supported.join(', '))
+					: localize('mcp.protocolFailure.unsupportedVersionUnnamed', "The MCP server {0} rejected the MCP revision {1} without naming one it supports.", label, failure.requested);
+		}
+	}
+
 	public showSandboxConfigSuggestionFromPotentialBlocks(cnx: IMcpServerConnection, potentialBlocks: readonly IMcpPotentialSandboxBlock[]): boolean {
 		if (!cnx.definition.sandboxEnabled || !potentialBlocks.length || this._isSandboxSuggestionDialogVisible) {
 			return false;
@@ -1134,17 +1175,55 @@ export class McpServer extends Disposable implements IMcpServer {
 		return this._connection.get()?.stop() || Promise.resolve();
 	}
 
-	/** Waits for any ongoing tools to be refreshed before resolving. */
-	public awaitToolRefresh() {
+	/**
+	 * Waits, after a tool call, until the live tool list is current for the
+	 * next model turn (#261611). Every `tools/list_changed` replaces the
+	 * listing at once, so a change announced during the call is covered by
+	 * waiting for the current listing. A change announced after the result
+	 * (on a stream not ordered with the call's response, or by a server that
+	 * notifies after it answers) is covered by a grace window of
+	 * {@link TOOL_LIST_CHANGE_GRACE_MS} for servers that announce tool list
+	 * changes: the wait ends when the window passes with the listing complete,
+	 * or earlier when a listing started after the call completes. Resolves at
+	 * once when there is no live tool list (the server stopped), instead of
+	 * waiting for the next connection, and as soon as `token` (the tool call's)
+	 * is cancelled: the request no longer needs the next turn's list.
+	 */
+	public awaitToolRefresh(token: CancellationToken = CancellationToken.None): Promise<void> {
+		if (token.isCancellationRequested) {
+			return Promise.resolve();
+		}
+		const listingAtResult = this._tools.fromServerPromise.get();
+		const capabilities = this.capabilities.get();
+		const announcesChanges = capabilities === undefined || !!(capabilities & McpCapability.ToolsListChanged);
+		const graceOver = observableValue(this, !announcesChanges);
+		const store = new DisposableStore();
+		if (announcesChanges) {
+			store.add(disposableTimeout(() => graceOver.set(true, undefined), TOOL_LIST_CHANGE_GRACE_MS));
+		}
 		return new Promise<void>(resolve => {
-			autorunSelfDisposable(reader => {
-				const promise = this._tools.fromServerPromise.read(reader);
-				const result = promise?.promiseResult.read(reader);
-				if (result) {
+			let settled = false;
+			const finish = () => {
+				if (!settled) {
+					settled = true;
+					store.dispose();
 					resolve();
+				}
+			};
+			store.add(token.onCancellationRequested(finish));
+			const waiting = autorunSelfDisposable(reader => {
+				const listing = this._tools.fromServerPromise.read(reader);
+				const current = !listing || (!!listing.promiseResult.read(reader) && (graceOver.read(reader) || listing !== listingAtResult));
+				if (current) {
 					reader.dispose();
+					finish();
 				}
 			});
+			if (settled) {
+				waiting.dispose();
+			} else {
+				store.add(waiting);
+			}
 		});
 	}
 
@@ -1155,7 +1234,42 @@ export class McpServer extends Disposable implements IMcpServer {
 		});
 	}
 
-	private async _normalizeTool(originalTool: MCPLegacy.Tool): Promise<ValidatedMcpTool | { error: string[] }> {
+	/** The output schemas of the tools of the lists read in this process, as the list read them (see {@link listedOutputSchema}). */
+	private readonly _listedOutputSchemas = new WeakMap<ValidatedMcpTool, { readonly protocolVersion: string | undefined; readonly output: ICompiledJsonSchema | IJsonSchemaCompileError[] | undefined }>();
+
+	/**
+	 * The output schema of `tool`, a tool of `list`, as that list is read for
+	 * `protocolVersion` (see `checkServerToolSchemas`): what the calls of the
+	 * tool check their results with. The schemas of a list share one pattern
+	 * analysis budget, and a pattern the list does not check because of it is
+	 * not checked for a call either. A list read in this process kept what it
+	 * compiled. A list that was not (one restored from storage), or that was
+	 * read for another revision, is read again, whole and once, in the same
+	 * way: this gives what the first reading gave, except that the tools
+	 * dropped from the list for their input schemas no longer take their share
+	 * of the budget. Calls thus compile nothing once their list is read, and
+	 * reading it costs no more than reading a list does.
+	 */
+	public listedOutputSchema(list: readonly ValidatedMcpTool[], tool: ValidatedMcpTool, protocolVersion: string | undefined): ICompiledJsonSchema | IJsonSchemaCompileError[] | undefined {
+		const recorded = this._listedOutputSchemas.get(tool);
+		if (recorded && recorded.protocolVersion === protocolVersion) {
+			return recorded.output;
+		}
+		const patternAnalysis = new PatternAnalysisBudget();
+		for (const listed of list.includes(tool) ? list : [tool]) {
+			this._listedOutputSchemas.set(listed, { protocolVersion, output: checkServerToolSchemas(listed, protocolVersion, patternAnalysis).output });
+		}
+		return this._listedOutputSchemas.get(tool)?.output;
+	}
+
+	/**
+	 * @param protocolVersion The revision the server speaks: it decides how the
+	 * tool's schemas are read (see `checkServerSchemaDocument`).
+	 * @param patternAnalysis The budget of the backtracking analysis of the
+	 * patterns of the schemas of the whole list, so that a list of many tools
+	 * with distinct adversarial patterns takes no more time than one schema may.
+	 */
+	private async _normalizeTool(originalTool: MCPLegacy.Tool, protocolVersion: string | undefined, patternAnalysis: PatternAnalysisBudget): Promise<ValidatedMcpTool | { error: string[] }> {
 		// Parse MCP Apps UI metadata from _meta.ui
 		const uiMeta = originalTool._meta?.ui as McpApps.McpUiToolMeta | undefined;
 
@@ -1197,20 +1311,37 @@ export class McpServer extends Disposable implements IMcpServer {
 			tool.inputSchema = { ...tool.inputSchema, properties: {} };
 		}
 
-		// The schema must be a valid JSON Schema 2020-12 (the default dialect) or
-		// draft-07 document; other dialects and remote references are rejected.
-		const problems = validateJsonSchemaDocument(tool.inputSchema);
-		if (!problems.length) {
+		// The schema must be a valid JSON Schema 2020-12 or draft-07 document. For a
+		// 2026-07-28 server other dialects are rejected; older servers keep the
+		// lenient reading they had. Remote references and limits are rejected for
+		// every server. A pattern that cannot be compiled is not checked (a warning).
+		const { input: check, output } = checkServerToolSchemas(tool, protocolVersion, patternAnalysis);
+		// The calls of the tool check their results with this compilation (see listedOutputSchema).
+		this._listedOutputSchemas.set(tool, { protocolVersion, output });
+		if (check.warnings.length) {
+			this._logger.warn(`Tool ${tool.name}: parts of its input schema are not checked: ${describeCompileErrors(check.warnings)}`);
+		}
+		if (output) {
+			if (!isCompiledJsonSchema(output)) {
+				this._logger.warn(readsSchemasLeniently(protocolVersion)
+					? `Tool ${tool.name}: its output schema does not compile, so its structured results are not checked: ${describeCompileErrors(output)}`
+					: `Tool ${tool.name}: its output schema does not compile, so its structured results will be discarded: ${describeCompileErrors(output)}`);
+			} else if (output.warnings.length) {
+				this._logger.warn(`Tool ${tool.name}: parts of its output schema are not checked: ${describeCompileErrors(output.warnings)}`);
+			}
+		}
+		if (!check.errors.length) {
 			return tool;
 		}
 
-		return { error: problems.map(p => p.message + (p.path ? ` (at ${p.path})` : '')) };
+		return { error: check.errors.map(p => p.message + (p.path ? ` (at ${p.path})` : '')) };
 	}
 
-	private async _getValidatedTools(tools: MCPLegacy.Tool[]): Promise<ValidatedMcpTool[]> {
+	private async _getValidatedTools(tools: MCPLegacy.Tool[], protocolVersion: string | undefined): Promise<ValidatedMcpTool[]> {
 		let error = '';
 
-		const validations = await Promise.all(tools.map(t => this._normalizeTool(t)));
+		const patternAnalysis = new PatternAnalysisBudget();
+		const validations = await Promise.all(tools.map(t => this._normalizeTool(t, protocolVersion, patternAnalysis)));
 		const validated: ValidatedMcpTool[] = [];
 		for (const [i, result] of validations.entries()) {
 			if ('error' in result) {
@@ -1247,15 +1378,31 @@ export class McpServer extends Disposable implements IMcpServer {
 		return parseAndValidateMcpIcon(icons, cnx.launchDefinition, this._logger);
 	}
 
-	private _setServerTools(nonce: string | undefined, toolsPromise: Promise<IMcpListResult<MCPLegacy.Tool>>, tx: ITransaction | undefined) {
+	/**
+	 * Wraps a list from the server for its observable, which keeps the outcome
+	 * (an error included). The wrapper's own promise is never awaited, so its
+	 * rejection is handled here: a list cancelled because the handler went away
+	 * (a disconnect, a stop) is expected, other failures are logged.
+	 */
+	private _observeList<T>(what: string, promise: Promise<T>): ObservablePromise<T> {
+		const observable = new ObservablePromise(promise);
+		observable.promise.catch(error => {
+			if (!isCancellationError(error)) {
+				this._logger.error(`Failed to list the ${what} of the server: ${error}`);
+			}
+		});
+		return observable;
+	}
+
+	private _setServerTools(nonce: string | undefined, toolsPromise: Promise<IMcpListResult<MCPLegacy.Tool>>, tx: ITransaction | undefined, handler: McpServerRequestHandler) {
 		const toolPromiseSafe = toolsPromise.then(async ({ items: tools, cacheHint }) => {
 			this._logger.info(`Discovered ${tools.length} tools`);
-			const data = await this._getValidatedTools(tools);
+			const data = await this._getValidatedTools(tools, handler.currentProtocolVersion);
 			const freshness = { ...this._primitiveCache.get(this.definition.id)?.freshness, tools: toStoredFreshness(cacheHint) };
 			this._primitiveCache.store(this.definition.id, { tools: data, nonce, freshness });
 			return { data, nonce };
 		});
-		this._tools.fromServerPromise.set(new ObservablePromise(toolPromiseSafe), tx);
+		this._tools.fromServerPromise.set(this._observeList('tools', toolPromiseSafe), tx);
 		return toolPromiseSafe;
 	}
 
@@ -1277,7 +1424,7 @@ export class McpServer extends Disposable implements IMcpServer {
 			return { data, nonce };
 		});
 
-		this._prompts.fromServerPromise.set(new ObservablePromise(promptsPromiseSafe), tx);
+		this._prompts.fromServerPromise.set(this._observeList('prompts', promptsPromiseSafe), tx);
 		return promptsPromiseSafe;
 	}
 
@@ -1287,13 +1434,25 @@ export class McpServer extends Disposable implements IMcpServer {
 		return promise;
 	}
 
-	/** The era/revision hint from the cache for the next connection; the probe is skipped when it is right. */
+	/**
+	 * The era/revision hint for the next connection; the probe is skipped when it
+	 * is right. The cached revision is used when it was negotiated for the same
+	 * launch and the same `protocolVersion` pin: a pin the server rejected is not
+	 * sent again until the pin or the launch changes (the log says so on every
+	 * such start). Otherwise a configured pin is used, and without one the server
+	 * is probed.
+	 */
 	private _negotiationHints(connection: IMcpServerConnection): IMcpNegotiationHints | undefined {
+		const pin = connection.definition.protocolVersionHint;
 		const cached = this._primitiveCache.get(this.definition.id);
-		if (cached?.protocol && cached.nonce === connection.definition.cacheNonce) {
+		if (cached?.protocol && cached.nonce === connection.definition.cacheNonce && cached.protocol.pin === pin) {
+			// Logged only when the hint is used: start() also gets here for a connection that already runs.
+			if (pin !== undefined && cached.protocol.version !== pin && McpConnectionState.canBeStarted(connection.state.get().state)) {
+				this._logger.info(`Using MCP ${cached.protocol.version}, negotiated when the server did not accept the configured protocolVersion ${pin}; the pin is tried again when it or the server's connection settings change, or after MCP: Reset Cached Tools`);
+			}
 			return { era: cached.protocol.era, protocolVersion: cached.protocol.version };
 		}
-		return undefined;
+		return pin ? { protocolVersion: pin } : undefined;
 	}
 
 	private _publishProtocolEvent(event: McpProtocolEvent, transport: string) {
@@ -1341,15 +1500,26 @@ export class McpServer extends Disposable implements IMcpServer {
 		this._primitiveCache.store(this.definition.id, { ...serverMetadata, nonce, capabilities: capabilitiesEncoded, protocol });
 	}
 
-	private _populateLiveData(handler: McpServerRequestHandler, cacheNonce: string | undefined, store: DisposableStore) {
+	/** @param pin The `protocolVersion` pinned when the connection started; stored with the negotiated revision. */
+	private _populateLiveData(handler: McpServerRequestHandler, cacheNonce: string | undefined, pin: string | undefined, store: DisposableStore) {
 		const cts = new CancellationTokenSource();
 		store.add(toDisposable(() => cts.dispose(true)));
 
 		const transport = McpServer._transportName(this._connection.get()?.launchDefinition.type);
-		if (handler.lastNegotiation) {
-			this._publishProtocolEvent(handler.lastNegotiation, transport);
+		// The handshake's events (probe renegotiations, then the negotiation) fired before we could subscribe.
+		for (const event of handler.handshakeEvents) {
+			this._publishProtocolEvent(event, transport);
 		}
 		store.add(handler.onDidReportProtocolEvent(e => this._publishProtocolEvent(e, transport)));
+
+		// -32020/-32021/-32022 the handler could not recover from: tell the user once per kind and connection.
+		const reportedFailures = new Set<McpProtocolFailure['kind']>();
+		store.add(handler.onDidReportProtocolFailure(failure => {
+			if (!reportedFailures.has(failure.kind)) {
+				reportedFailures.add(failure.kind);
+				this._notifyProtocolFailure(failure);
+			}
+		}));
 
 		// A public list the server allowed us to cache is reused while it is fresh (2026-07-28 servers);
 		// private lists and lists without a hint are always fetched again.
@@ -1363,7 +1533,7 @@ export class McpServer extends Disposable implements IMcpServer {
 				return this._reuseCachedTools(cacheNonce, cached.tools, tx);
 			}
 			const toolPromise = handler.capabilities.tools ? handler.listToolsEx({}, cts.token) : Promise.resolve<IMcpListResult<MCPLegacy.Tool>>({ items: [], cacheHint: emptyHint });
-			return this._setServerTools(cacheNonce, toolPromise, tx);
+			return this._setServerTools(cacheNonce, toolPromise, tx, handler);
 		};
 
 		const updatePrompts = (tx: ITransaction | undefined, force = false) => {
@@ -1376,6 +1546,7 @@ export class McpServer extends Disposable implements IMcpServer {
 
 		store.add(handler.onDidChangeToolList(() => {
 			this._logger.info('Tool list changed, refreshing tools...');
+			// Replaces the listing at once: awaitToolRefresh waits for this one (#261611).
 			updateTools(undefined, true);
 		}));
 
@@ -1385,7 +1556,8 @@ export class McpServer extends Disposable implements IMcpServer {
 		}));
 
 		transaction(tx => {
-			this._setServerMetadata(cacheNonce, { serverInfo: handler.serverInfo, instructions: handler.serverInstructions, capabilities: handler.capabilities, protocol: { era: handler.era, version: handler.protocolVersion } }, tx);
+			const protocol: IStoredProtocol = pin ? { era: handler.era, version: handler.protocolVersion, pin } : { era: handler.era, version: handler.protocolVersion };
+			this._setServerMetadata(cacheNonce, { serverInfo: handler.serverInfo, instructions: handler.serverInstructions, capabilities: handler.capabilities, protocol }, tx);
 			updatePrompts(tx);
 			const toolUpdate = updateTools(tx);
 
@@ -1398,6 +1570,8 @@ export class McpServer extends Disposable implements IMcpServer {
 					serverName: handler.serverInfo.name,
 					serverVersion: handler.serverInfo.version,
 				});
+			}, () => {
+				// No boot event without a tool list; the failure (if not a cancellation) is logged by _observeList.
 			});
 		});
 	}
@@ -1494,10 +1668,15 @@ export class McpTool implements IMcpTool {
 	public get definition(): MCPLegacy.Tool { return this._definition; }
 	public get uiResourceUri(): string | undefined { return this._definition.uiResourceUri; }
 
+	/**
+	 * @param _list The tool list the definition belongs to: the output schema
+	 * is read as the list reads it (see {@link McpServer.listedOutputSchema}).
+	 */
 	constructor(
 		private readonly _server: McpServer,
 		idPrefix: string,
 		private readonly _definition: ValidatedMcpTool,
+		private readonly _list: readonly ValidatedMcpTool[],
 		@IMcpElicitationService private readonly _elicitationService: IMcpElicitationService,
 	) {
 		this.referenceName = _definition.name.replaceAll('.', '_');
@@ -1568,17 +1747,15 @@ export class McpTool implements IMcpTool {
 				: h.legacyCapabilities?.tasks?.requests?.tools?.call !== undefined && (taskHint === 'required' || taskHint === 'optional');
 
 			try {
-				const result = await h.callTool({
+				const result = this._checkStructuredContent(await h.callTool({
 					name,
 					arguments: params,
 					task: shouldUseTask ? {} : undefined,
 					_meta: meta,
-				}, token, progress ? (message) => progress.report({ message }) : undefined, context);
+				}, token, progress ? (message) => progress.report({ message }) : undefined, context), h);
 
-				this._validateStructuredContent(result, h);
-
-				// Wait for tools to refresh for dynamic servers (#261611)
-				await this._server.awaitToolRefresh();
+				// Wait for tools to refresh for dynamic servers (#261611), unless the request is cancelled
+				await this._server.awaitToolRefresh(token);
 
 				return result;
 			} catch (err) {
@@ -1600,21 +1777,26 @@ export class McpTool implements IMcpTool {
 		}, token);
 	}
 
-	/** Checks `structuredContent` against the tool's `outputSchema`; a mismatch is a server-side protocol error. */
-	private _validateStructuredContent(result: MCPLegacy.CallToolResult, handler: McpServerRequestHandler): void {
-		const outputSchema = this._definition.outputSchema;
-		if (!outputSchema || result.isError || result.structuredContent === undefined) {
-			return;
-		}
-		const compiled = compileJsonSchema(outputSchema);
-		if (!isCompiledJsonSchema(compiled)) {
-			handler.logger.warn(`Cannot validate the structured content of tool "${this._definition.name}": ${compiled.map(e => e.message).join('; ')}`);
-			return;
-		}
-		const validation = compiled.validate(result.structuredContent);
-		if (!validation.valid) {
-			const detail = validation.errors.map(e => `${e.instancePath || '/'}: ${e.message}`).join('; ');
-			throw new MpcResponseError(localize('mcp.outputSchemaMismatch', "The result of tool \"{0}\" does not match its output schema: {1}", this._definition.name, detail), MCPLegacy.INVALID_PARAMS, { errors: validation.errors });
+	/**
+	 * Checks `structuredContent` against the tool's `outputSchema`, as its list
+	 * reads it: a mismatch is a server-side protocol error; an output schema
+	 * that does not compile turns the result into an `isError` result for the
+	 * model.
+	 */
+	private _checkStructuredContent(result: MCPLegacy.CallToolResult, handler: McpServerRequestHandler): MCPLegacy.CallToolResult {
+		const protocolVersion = handler.currentProtocolVersion;
+		const check = checkStructuredContent(this._definition.name, this._definition.outputSchema, result, protocolVersion, () => this._server.listedOutputSchema(this._list, this._definition, protocolVersion));
+		switch (check.kind) {
+			case 'ok':
+				return result;
+			case 'unchecked':
+				handler.logger.warn(`Cannot validate the structured content of tool "${this._definition.name}": ${check.problem}`);
+				return result;
+			case 'invalid-schema':
+				handler.logger.warn(`Discarded the result of tool "${this._definition.name}" because its output schema does not compile: ${check.problem}`);
+				return check.result;
+			case 'mismatch':
+				throw new MpcResponseError(localize('mcp.outputSchemaMismatch', "The result of tool \"{0}\" does not match its output schema: {1}", this._definition.name, check.detail), MCPLegacy.INVALID_PARAMS, { errors: check.errors });
 		}
 	}
 

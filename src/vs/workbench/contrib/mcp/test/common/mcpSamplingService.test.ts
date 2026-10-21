@@ -149,6 +149,7 @@ suite('MCP - Sampling Service', () => {
 
 			assert.strictEqual(languageModels.requests.length, 1);
 			assert.deepStrictEqual(languageModels.requests[0].options, {
+				modelOptions: { max_tokens: 100 },
 				tools: [
 					{ name: 'get_weather', description: 'Get current weather for a city', inputSchema: weatherTool.inputSchema },
 					{ name: 'noop', description: '', inputSchema: { type: 'object' } },
@@ -174,7 +175,7 @@ suite('MCP - Sampling Service', () => {
 		test('toolChoice none withholds the tools, as the language model API has no none mode', async () => {
 			languageModels.scriptedParts = [{ type: 'text', value: 'ok' }];
 			await sample({ tools: [weatherTool], toolChoice: { mode: 'none' } });
-			assert.deepStrictEqual(languageModels.requests[0].options, {});
+			assert.deepStrictEqual(languageModels.requests[0].options, { modelOptions: { max_tokens: 100 } });
 		});
 
 		test('toolChoice required without tools is rejected', async () => {
@@ -182,10 +183,33 @@ suite('MCP - Sampling Service', () => {
 			assert.strictEqual(languageModels.requests.length, 0);
 		});
 
-		test('a request without tools sends empty options', async () => {
+		test('a request without tools sends only the model options', async () => {
 			languageModels.scriptedParts = [{ type: 'text', value: 'ok' }];
 			await sample({});
-			assert.deepStrictEqual(languageModels.requests[0].options, {});
+			assert.deepStrictEqual(languageModels.requests[0].options, { modelOptions: { max_tokens: 100 } });
+		});
+	});
+
+	suite('model options', () => {
+		test('maxTokens is sent to the language model as the max_tokens model option', async () => {
+			languageModels.scriptedParts = [{ type: 'text', value: 'ok' }];
+			await sample({ maxTokens: 321 });
+			await sample({ maxTokens: 7, tools: [weatherTool], toolChoice: { mode: 'required' } });
+			assert.deepStrictEqual(languageModels.requests.map(r => r.options.modelOptions), [{ max_tokens: 321 }, { max_tokens: 7 }]);
+			assert.strictEqual(languageModels.requests[1].options.toolMode, ToolMode.Required);
+		});
+
+		test('temperature, stopSequences and metadata are not sent', async () => {
+			languageModels.scriptedParts = [{ type: 'text', value: 'ok' }];
+			await sample({ maxTokens: 50, temperature: 0.2, stopSequences: ['END'], metadata: { k: 'v' } });
+			assert.deepStrictEqual(languageModels.requests[0].options, { modelOptions: { max_tokens: 50 } });
+		});
+
+		test('a request without a numeric maxTokens is served without a limit', async () => {
+			languageModels.scriptedParts = [{ type: 'text', value: 'ok' }];
+			await sample({ maxTokens: undefined });
+			await sample({ maxTokens: 'many' as unknown as number });
+			assert.deepStrictEqual(languageModels.requests.map(r => r.options), [{}, {}]);
 		});
 	});
 

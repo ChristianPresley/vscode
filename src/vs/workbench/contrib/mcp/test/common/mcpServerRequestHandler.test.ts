@@ -14,7 +14,7 @@ import { IProductService } from '../../../../../platform/product/common/productS
 import { IStorageService } from '../../../../../platform/storage/common/storage.js';
 import { TestLoggerService, TestProductService, TestStorageService } from '../../../../test/common/workbenchTestServices.js';
 import { IMcpHostDelegate } from '../../common/mcpRegistryTypes.js';
-import { IMcpServerRequestHandlerOptions, McpServerRequestHandler, McpTask } from '../../common/mcpServerRequestHandler.js';
+import { IMcpServerRequestHandlerOptions, McpProtocolFailure, McpServerRequestHandler, McpTask } from '../../common/mcpServerRequestHandler.js';
 import { IMcpMessageEnvelope, IMcpRequestAbort, McpClientError, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, MpcResponseError } from '../../common/mcpTypes.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { TEST_MODERN_SERVER_INFO, TestMcpMessageTransport } from './mcpRegistryTypes.js';
@@ -27,9 +27,10 @@ import { DeferredPromise, timeout } from '../../../../../base/common/async.js';
 import { CancellationError } from '../../../../../base/common/errors.js';
 import { IJsonRpcRequest, isJsonRpcNotification, isJsonRpcRequest, isJsonRpcResponse, JsonRpcId, JsonRpcMessage } from '../../../../../base/common/jsonRpcProtocol.js';
 import { Emitter, Event } from '../../../../../base/common/event.js';
-import { LATEST_MCP_PROTOCOL_VERSION, META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_LOG_LEVEL, META_PROTOCOL_VERSION } from '../../../../../platform/mcp/common/mcpProtocolVersions.js';
+import { LATEST_MCP_PROTOCOL_VERSION, META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_LOG_LEVEL, META_PROTOCOL_VERSION, MODERN_MCP_PROTOCOL_VERSIONS } from '../../../../../platform/mcp/common/mcpProtocolVersions.js';
 import { MCP } from '../../../../../platform/mcp/common/modelContextProtocol.js';
 import { buildClientCapabilities, McpProtocolEvent } from '../../common/mcpProtocolMeta.js';
+import { GrpcStatus } from '../../../../../base/common/grpc/status.js';
 
 class TestMcpHostDelegate extends Disposable implements IMcpHostDelegate {
 	private readonly _transport: TestMcpMessageTransport;
@@ -334,33 +335,45 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 		}
 	});
 
-	test('should handle cancelled notification from server', async () => {
-		// Setup request
+	test('a cancelled notification from the server never cancels a client request with the same id', async () => {
+		// notifications/cancelled names a request of its sender: here, a server request that may
+		// already be answered (a late cancel). The client's own request with the same id keeps running.
 		const requestPromise = handler.listResources();
-
-		// Get the request ID
-		const sentMessages = transport.getSentMessages();
-		const listResourcesRequest = sentMessages[3] as MCPLegacy.JSONRPCRequest;
+		const listResourcesRequest = transport.getSentMessages()[3] as MCPLegacy.JSONRPCRequest;
 		const requestId = listResourcesRequest.id;
 
-		// Simulate cancelled notification from server
 		const cancelledNotification: MCPLegacy.JSONRPCNotification & MCPLegacy.CancelledNotification = {
 			jsonrpc: MCPLegacy.JSONRPC_VERSION,
 			method: 'notifications/cancelled',
-			params: {
-				requestId
-			}
+			params: { requestId },
 		};
-
 		transport.simulateReceiveMessage(cancelledNotification);
+		await timeout(0);
 
-		// Verify the promise was cancelled
-		try {
-			await requestPromise;
-			assert.fail('Promise should have been cancelled');
-		} catch (e) {
-			assert.strictEqual(e.name, 'Canceled');
-		}
+		transport.simulateReceiveMessage({ jsonrpc: MCPLegacy.JSONRPC_VERSION, id: requestId, result: { resources: [{ uri: 'resource1', name: 'Still answered' }] } });
+		const resources = await requestPromise;
+		assert.deepStrictEqual(resources.map(r => r.name), ['Still answered']);
+	});
+
+	test('a late cancel of a completed sampling request leaves the client request with the same id running', async () => {
+		const sampling = sinon.stub().resolves({ role: 'assistant', content: { type: 'text', text: 'done' }, model: 'm' });
+		const legacy = store.add(new TestMcpMessageTransport());
+		legacy.setConnectionState({ state: McpConnectionState.Kind.Running });
+		const logger = store.add((instantiationService.get(ILoggerService) as TestLoggerService).createLogger('mcpServerTestLate', { hidden: true, name: 'MCP Test' }));
+		const legacyHandler = store.add(await McpServerRequestHandler.create(instantiationService, { logger, launch: legacy, taskManager: store.add(new McpTaskManager()), createMessageRequestHandler: sampling }));
+
+		const call = legacyHandler.callTool({ name: 'echo', arguments: {} });
+		const callId = legacy.getSentRequests('tools/call')[0].id;
+		// The server asks for sampling with the same numeric id and the client answers it…
+		legacy.simulateReceiveMessage({ jsonrpc: MCPLegacy.JSONRPC_VERSION, id: callId, method: 'sampling/createMessage', params: { messages: [], maxTokens: 1 } });
+		await timeout(0);
+		assert.ok(legacy.getSentMessages().some(m => isJsonRpcResponse(m) && m.id === callId), 'the sampling request was answered');
+		// …then cancels it late: the pending tools/call must not be cancelled.
+		legacy.simulateReceiveMessage({ jsonrpc: MCPLegacy.JSONRPC_VERSION, method: 'notifications/cancelled', params: { requestId: callId } });
+		await timeout(0);
+		legacy.simulateReceiveMessage({ jsonrpc: MCPLegacy.JSONRPC_VERSION, id: callId, result: { content: [{ type: 'text', text: 'call result' }] } });
+		const result = await call;
+		assert.deepStrictEqual(result.content, [{ type: 'text', text: 'call result' }]);
 	});
 
 	test('should dispose properly and cancel pending requests', async () => {
@@ -995,6 +1008,183 @@ suite('Workbench - MCP - ServerRequestHandler - era negotiation', () => {
 		assert.strictEqual(handler.lastNegotiation?.usedHint, true);
 	});
 
+	suite('a pinned legacy revision the server rejects', () => {
+		const pin = { protocolVersion: '2025-11-25' } as const;
+
+		test('over HTTP (-32020, the zig server\'s answer to a 2025-11-25 initialize): re-probes with server/discover and negotiates 2026-07-28', async () => {
+			const transport = store.add(new TestMcpMessageTransport({ era: 'modern' }));
+			transport.setResponder('initialize', req => errorResult(req, MCP.HEADER_MISMATCH, 'Header mismatch: the Mcp-Method header is missing'));
+			const warn = sinon.spy(services.logger, 'warn');
+			try {
+				const handler = await connect(store, services, transport, { transportType: McpServerTransportType.HTTP, negotiationHint: pin });
+
+				assert.deepStrictEqual(sentMethods(transport).slice(0, 2), ['initialize', 'server/discover']);
+				assert.strictEqual(paramsOf(transport.getSentRequests('initialize')[0]).protocolVersion, '2025-11-25');
+				assert.deepStrictEqual(handler.negotiated, { era: 'modern', protocolVersion: '2026-07-28' });
+				assert.strictEqual(sentMethods(transport).includes('notifications/initialized'), false);
+				assert.ok(handler.subscriptions, 'the modern subscriptions run');
+				assert.ok(warn.getCalls().some(call => String(call.args[0]).startsWith('The server rejected MCP 2025-11-25 (MPC -32020: Header mismatch')), JSON.stringify(warn.getCalls().map(call => call.args[0])));
+			} finally {
+				warn.restore();
+			}
+		});
+
+		test('over stdio (-32601 naming its versions, the zig server\'s answer): re-probes with server/discover', async () => {
+			const transport = store.add(new TestMcpMessageTransport({ era: 'modern' }));
+			transport.setResponder('initialize', req => errorResult(req, MCP.METHOD_NOT_FOUND, 'Method not found: initialize. This server supports MCP 2026-07-28 only. Use server/discover.', { supportedVersions: ['2026-07-28'] }));
+			const handler = await connect(store, services, transport, { transportType: McpServerTransportType.Stdio, negotiationHint: pin });
+
+			assert.deepStrictEqual(sentMethods(transport).slice(0, 2), ['initialize', 'server/discover']);
+			assert.deepStrictEqual(handler.negotiated, { era: 'modern', protocolVersion: '2026-07-28' });
+		});
+
+		test('-32022 naming a modern revision: server/discover is probed with it and the renegotiation is reported', async () => {
+			const transport = store.add(new TestMcpMessageTransport({ era: 'modern' }));
+			transport.setResponder('initialize', req => errorResult(req, MCP.UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version 2025-11-25', { supported: ['2026-07-28'], requested: '2025-11-25' }));
+			const handler = await connect(store, services, transport, { transportType: McpServerTransportType.HTTP, negotiationHint: pin });
+
+			assert.deepStrictEqual(sentMethods(transport).slice(0, 2), ['initialize', 'server/discover']);
+			assert.strictEqual(transport.getSentEnvelope('server/discover')?.protocolVersion, '2026-07-28');
+			assert.deepStrictEqual(handler.negotiated, { era: 'modern', protocolVersion: '2026-07-28' });
+			assert.deepStrictEqual(handler.handshakeEvents.map(e => e.kind), ['renegotiation', 'negotiation']);
+			assert.deepStrictEqual(handler.handshakeEvents[0], { kind: 'renegotiation', code: MCP.UNSUPPORTED_PROTOCOL_VERSION, retried: true });
+		});
+
+		test('-32022 naming another legacy revision: the handshake is retried with it, without a probe', async () => {
+			const transport = store.add(new TestMcpMessageTransport({ initializeResult: { protocolVersion: '2025-06-18' } }));
+			transport.setResponder('initialize', req => paramsOf(req).protocolVersion === '2025-06-18'
+				? { jsonrpc: MCPLegacy.JSONRPC_VERSION, id: req.id, result: transport.defaultInitializeResult() }
+				: errorResult(req, MCP.UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version', { supported: ['2025-06-18'], requested: '2025-11-25' }));
+			const handler = await connect(store, services, transport, { negotiationHint: pin });
+
+			assert.deepStrictEqual(transport.getSentRequests('initialize').map(r => paramsOf(r).protocolVersion), ['2025-11-25', '2025-06-18']);
+			assert.strictEqual(transport.getSentRequests('server/discover').length, 0);
+			assert.deepStrictEqual(handler.negotiated, { era: 'legacy', protocolVersion: '2025-06-18' });
+			assert.deepStrictEqual(handler.handshakeEvents[0], { kind: 'renegotiation', code: MCP.UNSUPPORTED_PROTOCOL_VERSION, retried: true });
+		});
+
+		test('-32022 naming no other shared revision: the server is probed from the start', async () => {
+			const transport = store.add(new TestMcpMessageTransport({ era: 'modern' }));
+			transport.setResponder('initialize', req => errorResult(req, MCP.UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version', { supported: ['2025-11-25', '2099-01-01'], requested: '2025-11-25' }));
+			const handler = await connect(store, services, transport, { transportType: McpServerTransportType.HTTP, negotiationHint: pin });
+
+			assert.deepStrictEqual(sentMethods(transport).slice(0, 2), ['initialize', 'server/discover']);
+			assert.strictEqual(transport.getSentEnvelope('server/discover')?.protocolVersion, '2026-07-28');
+			assert.strictEqual(handler.era, 'modern');
+			assert.deepStrictEqual(handler.handshakeEvents[0], { kind: 'renegotiation', code: MCP.UNSUPPORTED_PROTOCOL_VERSION, retried: false });
+		});
+
+		test('a strict pin is never renegotiated: the rejection is surfaced and nothing else is sent', async () => {
+			const transport = store.add(new TestMcpMessageTransport({ era: 'modern' }));
+			transport.setResponder('initialize', req => errorResult(req, MCP.UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version', { supported: ['2026-07-28'], requested: '2025-11-25' }));
+			await assert.rejects(
+				beginConnect(store, services, transport, { transportType: McpServerTransportType.HTTP, negotiationHint: { ...pin, strict: true } }),
+				(e: unknown) => e instanceof MpcResponseError && e.code === MCP.UNSUPPORTED_PROTOCOL_VERSION,
+			);
+			assert.deepStrictEqual(sentMethods(transport), ['initialize']);
+		});
+
+		/** Answers `initialize` the way the HTTP transport does after a 4xx without a 2026-07-28 body whose HTTP+SSE fallback failed too. */
+		const abortInitializeAfterFailedFallback = (transport: TestMcpMessageTransport) => transport.setResponder('initialize', req => {
+			setTimeout(() => transport.simulateAbort({ requestId: req.id, reason: 'http-status', httpStatus: 400, message: '400 status sending message to http://127.0.0.1/mcp, and the fallback to legacy SSE failed: 405 status connecting to http://127.0.0.1/mcp as SSE: ' }));
+			return undefined;
+		});
+
+		test('over HTTP, a 4xx without a 2026-07-28 body whose HTTP+SSE fallback fails too (the transport aborts the initialize): re-probes with server/discover', async () => {
+			const transport = store.add(new TestMcpMessageTransport({ era: 'modern' }));
+			abortInitializeAfterFailedFallback(transport);
+			const handler = await connect(store, services, transport, { transportType: McpServerTransportType.HTTP, negotiationHint: pin });
+
+			assert.deepStrictEqual(sentMethods(transport).slice(0, 2), ['initialize', 'server/discover']);
+			assert.deepStrictEqual(handler.negotiated, { era: 'modern', protocolVersion: '2026-07-28' });
+		});
+
+		test('a strict pin whose initialize the transport aborts fails with the abort and sends nothing else', async () => {
+			const transport = store.add(new TestMcpMessageTransport({ era: 'modern' }));
+			abortInitializeAfterFailedFallback(transport);
+			await assert.rejects(
+				beginConnect(store, services, transport, { transportType: McpServerTransportType.HTTP, negotiationHint: { ...pin, strict: true } }),
+				(e: unknown) => e instanceof McpClientError && e.reason === 'request-aborted' && e.message.includes('the fallback to legacy SSE failed'),
+			);
+			assert.deepStrictEqual(sentMethods(transport), ['initialize']);
+		});
+
+		for (const [name, hint] of [['a cached legacy revision', { era: 'legacy', protocolVersion: '2025-11-25' }], ['a pinned legacy revision', pin]] as const) {
+			test(`${name} whose initialize the transport cannot deliver (transport-error: a server that cannot be reached) fails the start with that error, without a probe`, async () => {
+				// A server that would answer the probe: the failure must come from the unreachable initialize alone.
+				const transport = store.add(new TestMcpMessageTransport({ era: 'modern' }));
+				transport.setResponder('initialize', req => {
+					setTimeout(() => transport.simulateAbort({ requestId: req.id, reason: 'transport-error', message: 'fetch failed: connect ECONNREFUSED 127.0.0.1:39899' }));
+					return undefined;
+				});
+				const warn = sinon.spy(services.logger, 'warn');
+				try {
+					await assert.rejects(
+						beginConnect(store, services, transport, { transportType: McpServerTransportType.HTTP, negotiationHint: hint }),
+						(e: unknown) => e instanceof McpClientError && e.reason === 'request-aborted' && (e.detail as IMcpRequestAbort).reason === 'transport-error' && e.message.includes('ECONNREFUSED'),
+					);
+					assert.deepStrictEqual(sentMethods(transport), ['initialize']);
+					assert.ok(!warn.getCalls().some(call => String(call.args[0]).startsWith('The server rejected')), JSON.stringify(warn.getCalls().map(call => call.args[0])));
+				} finally {
+					warn.restore();
+				}
+			});
+		}
+
+		test('a pinned revision that a stdio server rejects before it exits fails the start with the rejection: nothing is sent to the stopped server', async () => {
+			// The server would answer a probe; once the launch stopped, no request may go out (the pending ones were cancelled already).
+			const transport = store.add(new TestMcpMessageTransport({ era: 'modern' }));
+			transport.setResponder('initialize', req => {
+				setTimeout(() => {
+					transport.simulateReceiveMessage(errorResult(req, -32602, 'Unsupported protocol version'));
+					transport.setConnectionState({ state: McpConnectionState.Kind.Stopped });
+				});
+				return undefined;
+			});
+			await assert.rejects(
+				beginConnect(store, services, transport, { transportType: McpServerTransportType.Stdio, negotiationHint: pin }),
+				(e: unknown) => e instanceof MpcResponseError && e.code === -32602,
+			);
+			assert.deepStrictEqual(sentMethods(transport), ['initialize']);
+		});
+
+		test('over HTTP+SSE (the fallback worked, then the server rejected the pin): the probe is aborted with legacy-probe and the newest legacy revision is tried', async () => {
+			const transport = store.add(new TestMcpMessageTransport());
+			transport.setResponder('initialize', req => paramsOf(req).protocolVersion === '2024-11-05'
+				? errorResult(req, -32602, 'Unsupported protocol version')
+				: { jsonrpc: MCPLegacy.JSONRPC_VERSION, id: req.id, result: transport.defaultInitializeResult() });
+			transport.setResponder('server/discover', req => {
+				setTimeout(() => transport.simulateAbort({ requestId: req.id, reason: 'legacy-probe', message: 'The server uses the legacy HTTP+SSE transport' }));
+				return undefined;
+			});
+			const handler = await connect(store, services, transport, { transportType: McpServerTransportType.HTTP, negotiationHint: { protocolVersion: '2024-11-05' } });
+
+			assert.deepStrictEqual(sentMethods(transport).slice(0, 3), ['initialize', 'server/discover', 'initialize']);
+			assert.deepStrictEqual(transport.getSentRequests('initialize').map(r => paramsOf(r).protocolVersion), ['2024-11-05', '2025-11-25']);
+			assert.deepStrictEqual(handler.negotiated, { era: 'legacy', protocolVersion: '2025-11-25' });
+		});
+
+		test('-32022 naming a modern revision other than the newest: server/discover is probed with that revision', async () => {
+			// Today 2026-07-28 is the only modern revision, so a second (older) one is added for this test.
+			const modern = MODERN_MCP_PROTOCOL_VERSIONS as string[];
+			modern.push('2026-01-15');
+			try {
+				const transport = store.add(new TestMcpMessageTransport({ era: 'modern', discoverResult: { supportedVersions: ['2026-01-15'] } }));
+				transport.setResponder('initialize', req => errorResult(req, MCP.UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version 2025-11-25', { supported: ['2026-01-15'], requested: '2025-11-25' }));
+				const handler = await connect(store, services, transport, { transportType: McpServerTransportType.HTTP, negotiationHint: pin });
+
+				const discover = transport.getSentRequests('server/discover');
+				assert.strictEqual(discover.length, 1, 'probed once, with the offered revision');
+				assert.strictEqual(transport.getSentEnvelope('server/discover')?.protocolVersion, '2026-01-15');
+				assert.strictEqual((paramsOf(discover[0])._meta as Record<string, unknown>)[META_PROTOCOL_VERSION], '2026-01-15');
+				assert.deepStrictEqual(handler.negotiated, { era: 'modern', protocolVersion: '2026-01-15' });
+			} finally {
+				modern.splice(modern.indexOf('2026-01-15'), 1);
+			}
+			assert.deepStrictEqual(MODERN_MCP_PROTOCOL_VERSIONS, ['2026-07-28']);
+		});
+	});
+
 	test('a modern hint is used as-is and still discovers', async () => {
 		const transport = store.add(new TestMcpMessageTransport({ era: 'modern' }));
 		const handler = await connect(store, services, transport, { negotiationHint: { era: 'modern', protocolVersion: '2026-07-28' } });
@@ -1024,6 +1214,51 @@ suite('Workbench - MCP - ServerRequestHandler - era negotiation', () => {
 
 		await assert.rejects(beginConnect(store, services, transport, { negotiationHint: { era: 'modern', strict: true } }), (e: unknown) => e instanceof McpClientError && e.reason === 'no-supported-version');
 		assert.strictEqual(transport.getSentRequests('initialize').length, 0);
+	});
+
+	test('the probe reports its renegotiation as not retried for a strict modern hint against a legacy-only server, and as retried without strict', async () => {
+		// The probe runs inside create(), before anyone can subscribe to the handler: observe every emitter instead.
+		const fire = sinon.spy(Emitter.prototype, 'fire');
+		const renegotiations = () => fire.getCalls()
+			.map(call => call.args[0] as unknown)
+			.filter(e => typeof e === 'object' && e !== null && (e as Partial<McpProtocolEvent>).kind === 'renegotiation');
+		const legacyOnly = (req: IJsonRpcRequest) => errorResult(req, MCP.UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version', { supported: ['2025-11-25'] });
+		try {
+			const strict = store.add(new TestMcpMessageTransport());
+			strict.setResponder('server/discover', legacyOnly);
+			await assert.rejects(beginConnect(store, services, strict, { negotiationHint: { era: 'modern', strict: true } }), (e: unknown) => e instanceof McpClientError && e.reason === 'no-supported-version');
+			assert.deepStrictEqual(renegotiations(), [{ kind: 'renegotiation', code: MCP.UNSUPPORTED_PROTOCOL_VERSION, retried: false }]);
+			assert.strictEqual(strict.getSentRequests('server/discover').length, 1);
+			assert.strictEqual(strict.getSentRequests('initialize').length, 0);
+
+			fire.resetHistory();
+			const lenient = store.add(new TestMcpMessageTransport());
+			lenient.setResponder('server/discover', legacyOnly);
+			const handler = await connect(store, services, lenient, { negotiationHint: { era: 'modern' } });
+			assert.strictEqual(handler.era, 'legacy');
+			assert.deepStrictEqual(renegotiations(), [{ kind: 'renegotiation', code: MCP.UNSUPPORTED_PROTOCOL_VERSION, retried: true }]);
+		} finally {
+			fire.restore();
+		}
+	});
+
+	test('the handshake events (probe renegotiations, then the negotiation) are kept for replay', async () => {
+		// A server that rejects the first probe with -32022 and then accepts the offered revision.
+		const transport = store.add(new TestMcpMessageTransport({ era: 'modern' }));
+		let probes = 0;
+		transport.setResponder('server/discover', req => ++probes === 1
+			? errorResult(req, MCP.UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version', { supported: ['2026-07-28'] })
+			: completeResult(req, transport.defaultDiscoverResult()));
+		const handler = await connect(store, services, transport);
+		assert.strictEqual(handler.era, 'modern');
+		assert.deepStrictEqual(handler.handshakeEvents.map(e => e.kind), ['renegotiation', 'negotiation']);
+		assert.deepStrictEqual(handler.handshakeEvents[0], { kind: 'renegotiation', code: MCP.UNSUPPORTED_PROTOCOL_VERSION, retried: true });
+		assert.strictEqual(handler.handshakeEvents[1], handler.lastNegotiation);
+
+		// Events after the handshake are not added.
+		transport.setResponder('tools/list', req => errorResult(req, MCP.UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version', { supported: ['2026-07-28'] }));
+		await assert.rejects(handler.listTools());
+		assert.strictEqual(handler.handshakeEvents.length, 2);
 	});
 
 	test('a legacy-probe abort from the transport falls back to initialize', async () => {
@@ -1138,6 +1373,21 @@ suite('Workbench - MCP - ServerRequestHandler - era negotiation', () => {
 			assert.strictEqual(handler.era, 'legacy');
 			assert.strictEqual(handler.lastNegotiation?.probeTimedOut, false);
 		});
+
+		test('the gRPC transport never times the probe out: every call is answered or aborted', async () => {
+			const transport = store.add(new TestMcpMessageTransport());
+			transport.setResponder('server/discover', undefined);
+			const pending = beginConnect(store, services, transport, { transportType: McpServerTransportType.Grpc });
+
+			await clock.tickAsync(60_000);
+			assert.deepStrictEqual(sentMethods(transport), ['server/discover']);
+			transport.simulateReceiveMessage({ jsonrpc: MCP.JSONRPC_VERSION, id: transport.getSentRequests('server/discover')[0].id, result: transport.defaultDiscoverResult() });
+			await clock.tickAsync(0);
+			const handler = store.add(await pending);
+			assert.strictEqual(handler.era, 'modern');
+			assert.strictEqual(handler.lastNegotiation?.probeTimedOut, false);
+			assert.strictEqual(sentMethods(transport).includes('initialize'), false);
+		});
 	});
 });
 
@@ -1235,9 +1485,51 @@ suite('Workbench - MCP - ServerRequestHandler - modern requests', () => {
 	});
 
 	test('a header mismatch on other methods is not retried', async () => {
+		const failures: McpProtocolFailure[] = [];
+		store.add(handler.onDidReportProtocolFailure(f => failures.push(f)));
 		transport.setResponder('tools/list', req => errorResult(req, MCP.HEADER_MISMATCH, 'Header mismatch'));
 		await assert.rejects(handler.listTools(), (e: unknown) => e instanceof MpcResponseError && e.code === MCP.HEADER_MISMATCH);
 		assert.strictEqual(transport.getSentRequests('tools/list').length, 1);
+		assert.deepStrictEqual(failures, [{ kind: 'header-mismatch', method: 'tools/list', refresh: 'none' }], 'reported as not refreshed');
+	});
+
+	test('a header mismatch on tools/call whose tool re-list fails is reported as such, without a retry', async () => {
+		const failures: McpProtocolFailure[] = [];
+		store.add(handler.onDidReportProtocolFailure(f => failures.push(f)));
+		transport.setResponder('tools/call', req => errorResult(req, MCP.HEADER_MISMATCH, 'Header mismatch'));
+		transport.setResponder('tools/list', req => errorResult(req, MCP.INTERNAL_ERROR, 'Listing is down'));
+		await assert.rejects(handler.callTool({ name: 'echo', arguments: {} }), (e: unknown) => e instanceof MpcResponseError && e.code === MCP.HEADER_MISMATCH);
+		assert.strictEqual(transport.getSentRequests('tools/call').length, 1);
+		assert.deepStrictEqual(failures, [{ kind: 'header-mismatch', method: 'tools/call', refresh: 'failed' }]);
+	});
+
+	test('a header mismatch whose tool re-list is cancelled, by the call or by the connection going away, rejects with the cancellation and reports nothing', async () => {
+		const failures: McpProtocolFailure[] = [];
+		store.add(handler.onDidReportProtocolFailure(f => failures.push(f)));
+		transport.setResponder('tools/call', req => errorResult(req, MCP.HEADER_MISMATCH, 'Header mismatch'));
+
+		// the user cancels the call while the re-list is pending
+		const cts = store.add(new CancellationTokenSource());
+		transport.setResponder('tools/list', () => {
+			setTimeout(() => cts.cancel());
+			return undefined;
+		});
+		await assert.rejects(handler.callTool({ name: 'echo', arguments: {} }, cts.token), (e: unknown) => e instanceof CancellationError);
+		assert.deepStrictEqual(failures, [], 'a cancelled call is not a refresh failure');
+		assert.strictEqual(transport.getSentRequests('tools/call').length, 1, 'and it is not retried');
+
+		// a genuine failure afterwards is still reported
+		transport.setResponder('tools/list', req => errorResult(req, MCP.INTERNAL_ERROR, 'Listing is down'));
+		await assert.rejects(handler.callTool({ name: 'echo', arguments: {} }), (e: unknown) => e instanceof MpcResponseError && e.code === MCP.HEADER_MISMATCH);
+		assert.deepStrictEqual(failures, [{ kind: 'header-mismatch', method: 'tools/call', refresh: 'failed' }]);
+
+		// the connection goes away while the re-list is pending
+		transport.setResponder('tools/list', () => {
+			setTimeout(() => handler.dispose());
+			return undefined;
+		});
+		await assert.rejects(handler.callTool({ name: 'echo', arguments: {} }), (e: unknown) => e instanceof CancellationError);
+		assert.strictEqual(failures.length, 1);
 	});
 
 	test('an unsupported protocol version on a request renegotiates and retries once', async () => {
@@ -1278,6 +1570,70 @@ suite('Workbench - MCP - ServerRequestHandler - modern requests', () => {
 		store.add(handler.onDidReportProtocolEvent(e => events.push(e)));
 		await assert.rejects(handler.listTools());
 		assert.deepStrictEqual(events, [{ kind: 'renegotiation', code: MCP.UNSUPPORTED_PROTOCOL_VERSION, retried: false }]);
+	});
+
+	test('-32021 becomes a missing-capability client error naming the capabilities, and is reported', async () => {
+		transport.setResponder('tools/call', req => errorResult(req, MCP.MISSING_REQUIRED_CLIENT_CAPABILITY, 'Missing required client capability', { requiredCapabilities: { elicitation: { url: {} }, sampling: {}, extensions: { 'io.modelcontextprotocol/tasks': {} } } }));
+		const failures: McpProtocolFailure[] = [];
+		store.add(handler.onDidReportProtocolFailure(f => failures.push(f)));
+
+		await assert.rejects(handler.callTool({ name: 'echo', arguments: {} }), (e: unknown) => {
+			assert.ok(e instanceof McpClientError, String(e));
+			assert.strictEqual(e.reason, 'missing-capability');
+			assert.ok(e.message.includes('elicitation.url, sampling, extensions.io.modelcontextprotocol/tasks'), e.message);
+			assert.ok(e.message.includes('tools/call'), e.message);
+			assert.ok(!e.message.includes('{'), 'no raw JSON in the message');
+			return true;
+		});
+		assert.deepStrictEqual(failures, [{ kind: 'missing-capability', method: 'tools/call', capabilities: ['elicitation.url', 'sampling', 'extensions.io.modelcontextprotocol/tasks'] }]);
+		assert.strictEqual(transport.getSentRequests('tools/call').length, 1, '-32021 is not retried');
+	});
+
+	test('capability names from the server are reduced to plain names before they are shown', async () => {
+		transport.setResponder('tools/call', req => errorResult(req, MCP.MISSING_REQUIRED_CLIENT_CAPABILITY, 'Missing', { requiredCapabilities: { '[open](command:workbench.action.quit)': {}, ['x'.repeat(300)]: {}, '()': {} } }));
+		const failures: McpProtocolFailure[] = [];
+		store.add(handler.onDidReportProtocolFailure(f => failures.push(f)));
+		await assert.rejects(handler.callTool({ name: 'echo', arguments: {} }));
+		assert.strictEqual(failures.length, 1);
+		const failure = failures[0];
+		assert.ok(failure.kind === 'missing-capability');
+		assert.deepStrictEqual(failure.capabilities, ['opencommand:workbench.action.quit', 'x'.repeat(100) + '…']);
+	});
+
+	test('a -32021 without data names no capability but is still a missing-capability error', async () => {
+		transport.setResponder('tools/list', req => errorResult(req, MCP.MISSING_REQUIRED_CLIENT_CAPABILITY, 'Missing required client capability'));
+		const failures: McpProtocolFailure[] = [];
+		store.add(handler.onDidReportProtocolFailure(f => failures.push(f)));
+		await assert.rejects(handler.listTools(), (e: unknown) => e instanceof McpClientError && e.reason === 'missing-capability');
+		assert.deepStrictEqual(failures, [{ kind: 'missing-capability', method: 'tools/list', capabilities: [] }]);
+	});
+
+	test('-32020 and -32022 that the retries do not resolve are reported once each request', async () => {
+		const failures: McpProtocolFailure[] = [];
+		store.add(handler.onDidReportProtocolFailure(f => failures.push(f)));
+
+		transport.setResponder('tools/call', req => errorResult(req, MCP.HEADER_MISMATCH, 'Header mismatch'));
+		await assert.rejects(handler.callTool({ name: 'echo', arguments: {} }), (e: unknown) => e instanceof MpcResponseError && e.code === MCP.HEADER_MISMATCH);
+		assert.deepStrictEqual(failures, [{ kind: 'header-mismatch', method: 'tools/call', refresh: 'refreshed' }], 'reported after the retry, not before');
+
+		transport.setResponder('prompts/get', req => errorResult(req, MCP.UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version', { supported: ['2026-07-28', 'x'.repeat(500)] }));
+		await assert.rejects(handler.getPrompt({ name: 'p' }), (e: unknown) => e instanceof MpcResponseError && e.code === MCP.UNSUPPORTED_PROTOCOL_VERSION);
+		assert.strictEqual(failures.length, 2);
+		const versionFailure = failures[1];
+		assert.ok(versionFailure.kind === 'unsupported-version');
+		assert.strictEqual(versionFailure.method, 'prompts/get');
+		assert.strictEqual(versionFailure.requested, '2026-07-28');
+		assert.strictEqual(versionFailure.supported[0], '2026-07-28');
+		assert.ok(versionFailure.supported[1].length <= 101, 'server-provided names are bounded');
+	});
+
+	test('a recovered -32020 or -32022 is not reported', async () => {
+		const failures: McpProtocolFailure[] = [];
+		store.add(handler.onDidReportProtocolFailure(f => failures.push(f)));
+		let calls = 0;
+		transport.setResponder('tools/call', req => ++calls === 1 ? errorResult(req, MCP.HEADER_MISMATCH, 'Header mismatch') : completeResult(req, { content: [] }));
+		await handler.callTool({ name: 'echo', arguments: {} });
+		assert.deepStrictEqual(failures, []);
 	});
 
 	test('a strict negotiation does not switch revisions on -32022', async () => {
@@ -1778,6 +2134,34 @@ suite('Workbench - MCP - ServerRequestHandler - errors and aborts', () => {
 			return true;
 		});
 		assert.strictEqual(sentMethods(transport).includes('notifications/cancelled'), false);
+	});
+
+	test('a gRPC status-only abort with a JSON-RPC equivalent is a protocol error; transport statuses stay request-aborted', async () => {
+		const transport = store.add(new TestMcpMessageTransport({ era: 'modern' }));
+		const handler = await connect(store, services, transport);
+
+		const invalid = handler.listTools();
+		transport.simulateAbort({ requestId: transport.getSentRequests('tools/list')[0].id, reason: 'grpc-status', grpcStatus: GrpcStatus.INVALID_ARGUMENT, message: 'bad cursor' });
+		await assert.rejects(invalid, (e: unknown) => {
+			assert.ok(e instanceof MpcResponseError, String(e));
+			assert.strictEqual(e.code, MCP.INVALID_PARAMS);
+			assert.ok(e.message.includes('bad cursor'), e.message);
+			assert.deepStrictEqual(e.data, { grpcStatus: GrpcStatus.INVALID_ARGUMENT });
+			return true;
+		});
+
+		const unimplemented = handler.listPrompts();
+		transport.simulateAbort({ requestId: transport.getSentRequests('prompts/list')[0].id, reason: 'grpc-status', grpcStatus: GrpcStatus.UNIMPLEMENTED });
+		await assert.rejects(unimplemented, (e: unknown) => e instanceof MpcResponseError && e.code === MCP.METHOD_NOT_FOUND);
+
+		const unavailable = handler.listResources();
+		transport.simulateAbort({ requestId: transport.getSentRequests('resources/list')[0].id, reason: 'grpc-status', grpcStatus: GrpcStatus.UNAVAILABLE, message: 'connection reset' });
+		await assert.rejects(unavailable, (e: unknown) => {
+			assert.ok(e instanceof McpClientError, String(e));
+			assert.strictEqual(e.reason, 'request-aborted');
+			assert.strictEqual((e.detail as IMcpRequestAbort).grpcStatus, GrpcStatus.UNAVAILABLE);
+			return true;
+		});
 	});
 
 	test('an aborted request without a message gets a default one', async () => {

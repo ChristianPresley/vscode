@@ -37,14 +37,39 @@ export type ParsedMcpIcons = IIcon[];
 export type StoredMcpIcons = Dto<IIcon>[];
 
 
+/**
+ * The MIME types an icon states: its declared `mimeType`, the media type of a
+ * `data:` URI (`text/plain` when it names none, RFC 2397), and the type its
+ * file name implies. A declared type does not override the others: an SVG
+ * declared as `image/png` still states `image/svg+xml`.
+ */
+function statedMimeTypes(icon: MCPLegacy.Icon, uri: URI): string[] {
+	const types: string[] = [];
+	const declared = icon.mimeType?.trim().toLowerCase();
+	if (declared) {
+		types.push(declared);
+	}
+	if (uri.scheme === 'data') {
+		const mediaType = /^\s*data:([^;,]*)/i.exec(icon.src)?.[1].trim().toLowerCase();
+		types.push(mediaType || 'text/plain');
+	} else {
+		const derived = getMediaMime(uri.path);
+		if (derived) {
+			types.push(derived);
+		}
+	}
+	return types;
+}
+
 function validateIcon(icon: MCPLegacy.Icon, launch: McpServerLaunch, logger: ILogger): URI | undefined {
-	const mimeType = icon.mimeType?.toLowerCase() || getMediaMime(icon.src);
-	if (!mimeType || !mcpAllowableContentTypes.includes(mimeType)) {
-		logger.debug(`Ignoring icon with unsupported mime type: ${icon.src} (${mimeType}), allowed: ${mcpAllowableContentTypes.join(', ')}`);
+	const uri = URI.parse(icon.src);
+	// Every type the icon states must be on the allow list, and it must state one.
+	const mimeTypes = statedMimeTypes(icon, uri);
+	if (mimeTypes.length === 0 || !mimeTypes.every(mimeType => mcpAllowableContentTypes.includes(mimeType))) {
+		logger.debug(`Ignoring icon with unsupported mime type: ${icon.src} (${mimeTypes.join(', ') || 'none'}), allowed: ${mcpAllowableContentTypes.join(', ')}`);
 		return;
 	}
 
-	const uri = URI.parse(icon.src);
 	if (uri.scheme === 'data') {
 		return uri;
 	}

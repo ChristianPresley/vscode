@@ -18,6 +18,7 @@ import { IOutputService } from '../../../../services/output/common/output.js';
 import { TestLoggerService, TestProductService, TestStorageService } from '../../../../test/common/workbenchTestServices.js';
 import { IMcpHostDelegate, IMcpMessageTransport } from '../../common/mcpRegistryTypes.js';
 import { McpServerConnection } from '../../common/mcpServerConnection.js';
+import { McpServerRequestHandler } from '../../common/mcpServerRequestHandler.js';
 import { McpCollectionDefinition, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, McpServerTrust } from '../../common/mcpTypes.js';
 import { TestMcpMessageTransport } from './mcpRegistryTypes.js';
 import { ConfigurationTarget } from '../../../../../platform/configuration/common/configuration.js';
@@ -161,6 +162,39 @@ suite('Workbench - MCP - ServerConnection', () => {
 
 		transport.simulateInitialized();
 		assert.ok(await waitForHandler(connection));
+	});
+
+	test('without caller hints, a protocolVersion pinned in the configuration is used', async () => {
+		const pinned: McpServerDefinition = { ...serverDefinition, protocolVersionHint: '2025-11-25' };
+		const connection = store.add(instantiationService.createInstance(
+			McpServerConnection, collection, pinned, delegate, pinned.launch,
+			new NullLogger(), false, store.add(new McpTaskManager()),
+		));
+		const started = connection.start({});
+		transport.setConnectionState({ state: McpConnectionState.Kind.Running });
+		assert.strictEqual((await started).state, McpConnectionState.Kind.Running);
+		const handler = await waitForHandler(connection) as McpServerRequestHandler;
+
+		assert.strictEqual(handler.protocolVersion, '2025-11-25');
+		assert.strictEqual(handler.lastNegotiation?.usedHint, true);
+		assert.strictEqual(transport.getSentRequests('server/discover').length, 0, 'the pin skips the modern probe');
+		assert.strictEqual((transport.getSentRequests('initialize')[0].params as { protocolVersion?: string } | undefined)?.protocolVersion, '2025-11-25');
+	});
+
+	test('caller hints are used as given: McpServer has already weighed the pin against its cache', async () => {
+		// McpServer passes the revision it cached for this pin, for instance the one negotiated after the server rejected the pin.
+		const pinned: McpServerDefinition = { ...serverDefinition, protocolVersionHint: '2025-06-18' };
+		const connection = store.add(instantiationService.createInstance(
+			McpServerConnection, collection, pinned, delegate, pinned.launch,
+			new NullLogger(), false, store.add(new McpTaskManager()),
+		));
+		const started = connection.start({}, { era: 'legacy', protocolVersion: '2025-11-25' });
+		transport.setConnectionState({ state: McpConnectionState.Kind.Running });
+		assert.strictEqual((await started).state, McpConnectionState.Kind.Running);
+		const handler = await waitForHandler(connection) as McpServerRequestHandler;
+
+		assert.strictEqual(handler.protocolVersion, '2025-11-25');
+		assert.deepStrictEqual(transport.getSentRequests('initialize').map(r => (r.params as { protocolVersion?: string } | undefined)?.protocolVersion), ['2025-11-25'], 'the caller hint, not the pin, is sent');
 	});
 
 	test('should handle errors during start', async () => {

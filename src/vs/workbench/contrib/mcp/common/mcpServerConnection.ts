@@ -40,6 +40,17 @@ export class McpServerConnection extends Disposable implements IMcpServerConnect
 		super();
 	}
 
+	/**
+	 * The negotiation hint for the handler. The caller's hints are used as
+	 * given: McpServer already weighs the `protocolVersion` pinned in the
+	 * configuration against the revision it cached (a cached revision only
+	 * counts when it was negotiated under the same pin, so a rejected pin is
+	 * not sent again). Without caller hints, the pin is used.
+	 */
+	private static _negotiationHint(pinnedVersion: string | undefined, hints: IMcpNegotiationHints | undefined): IMcpNegotiationHints | undefined {
+		return hints ?? (pinnedVersion ? { protocolVersion: pinnedVersion } : undefined);
+	}
+
 	/** @inheritdoc */
 	public async start(methods: IMcpClientMethods, hints?: IMcpNegotiationHints): Promise<McpConnectionState> {
 		if (this._store.isDisposed) {
@@ -100,7 +111,7 @@ export class McpServerConnection extends Disposable implements IMcpServerConnect
 					requestLogLevel: this.definition.devMode ? LogLevel.Info : LogLevel.Debug,
 					taskManager: this._taskManager,
 					transportType: this.launchDefinition.type,
-					negotiationHint: hints ?? (this.definition.protocolVersionHint ? { protocolVersion: this.definition.protocolVersionHint } : undefined),
+					negotiationHint: McpServerConnection._negotiationHint(this.definition.protocolVersionHint, hints),
 					defaultServerInfo: { name: this.definition.label, version: '' },
 				}, cts.token).then(
 					handler => {

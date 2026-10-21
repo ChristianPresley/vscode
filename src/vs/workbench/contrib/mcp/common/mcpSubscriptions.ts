@@ -41,6 +41,10 @@ class ListenStream extends Disposable {
 	private _id: JsonRpcId | undefined;
 	private _acknowledged = false;
 	private _everAcknowledged = false;
+	/** The current stream was acknowledged at least {@link LISTEN_STABLE_MS} ago. */
+	private _stable = false;
+	/** The stream is being re-opened after it was lost (not because its filter changed). */
+	private _afterOutage = false;
 	private _backoffMs = 0;
 	private _disabled = false;
 	private _wanted = false;
@@ -51,7 +55,13 @@ class ListenStream extends Disposable {
 		readonly kind: McpListenStreamKind,
 		private readonly _host: IMcpListenHost,
 		private readonly _filterProvider: () => MCP.SubscriptionFilter | undefined,
-		private readonly _onAcknowledged: (filter: MCP.SubscriptionFilter, isReconnect: boolean) => void,
+		/**
+		 * @param isReconnect a stream of this kind was acknowledged before.
+		 * @param afterOutage the stream was re-opened because the previous one
+		 * was lost (cancelled, closed, timed out, or the transport restarted),
+		 * so notifications may have been missed in between.
+		 */
+		private readonly _onAcknowledged: (filter: MCP.SubscriptionFilter, isReconnect: boolean, afterOutage: boolean) => void,
 		private readonly _onReconnect: (reconnect: IMcpListenReconnect) => void,
 		private readonly _schedule: (fn: () => void, delayMs: number) => IDisposable,
 	) {
@@ -82,6 +92,12 @@ class ListenStream extends Disposable {
 		this._open(filter!);
 	}
 
+	/** Re-opens the stream after it was lost outside of our control (a transport restart). */
+	reopen(): void {
+		this._afterOutage = true;
+		this.refresh();
+	}
+
 	/** The server cancelled or closed the stream; reconnect with backoff when it is still wanted. */
 	handleCancelled(id: JsonRpcId): boolean {
 		if (this._id !== id) {
@@ -96,15 +112,21 @@ class ListenStream extends Disposable {
 	handleAcknowledged(filter: MCP.SubscriptionFilter): void {
 		this._acknowledged = true;
 		const isReconnect = this._everAcknowledged;
+		const afterOutage = this._afterOutage;
 		this._everAcknowledged = true;
-		this._run.value?.add(this._schedule(() => { this._backoffMs = 0; }, LISTEN_STABLE_MS));
-		this._onAcknowledged(filter, isReconnect);
+		this._afterOutage = false;
+		this._run.value?.add(this._schedule(() => {
+			this._backoffMs = 0;
+			this._stable = true;
+		}, LISTEN_STABLE_MS));
+		this._onAcknowledged(filter, isReconnect, afterOutage);
 	}
 
 	private _open(filter: MCP.SubscriptionFilter): void {
 		const run = new DisposableStore();
 		this._run.value = run;
 		this._acknowledged = false;
+		this._stable = false;
 		this._cancelledByUs = false;
 		const { id, result } = this._host.listen(filter);
 		this._id = id;
@@ -123,10 +145,18 @@ class ListenStream extends Disposable {
 					return;
 				}
 				this._id = undefined;
-				// A graceful close: the server is shedding load or restarting; reconnect at once.
-				if (this._wanted && !this._store.isDisposed) {
+				if (!this._wanted || this._store.isDisposed) {
+					return;
+				}
+				if (this._stable) {
+					// A graceful close of a stream that lived a while: the server is shedding load or restarting; reconnect at once.
+					this._afterOutage = true;
 					this._onReconnect({ stream: this.kind, reason: 'closed by the server', backoffMs: 0 });
 					this.refresh();
+				} else {
+					// Closed before its acknowledgement or soon after it: back off, or a server that
+					// answers subscriptions/listen at once would get a tight request loop.
+					this._reconnectLater(this._acknowledged ? 'closed by the server soon after the acknowledgement' : 'closed by the server before the acknowledgement', LISTEN_BACKOFF_MS);
 				}
 			},
 			(err: unknown) => {
@@ -159,12 +189,13 @@ class ListenStream extends Disposable {
 		}
 	}
 
-	private _reconnectLater(reason: string): void {
+	private _reconnectLater(reason: string, minimumDelayMs = 0): void {
 		if (!this._wanted || this._disabled || this._store.isDisposed) {
 			return;
 		}
-		const delay = this._backoffMs;
-		this._backoffMs = Math.min(this._backoffMs === 0 ? LISTEN_BACKOFF_MS : this._backoffMs * 2, LISTEN_MAX_BACKOFF_MS);
+		this._afterOutage = true;
+		const delay = Math.max(this._backoffMs, minimumDelayMs);
+		this._backoffMs = Math.min(delay === 0 ? LISTEN_BACKOFF_MS : delay * 2, LISTEN_MAX_BACKOFF_MS);
 		this._onReconnect({ stream: this.kind, reason, backoffMs: delay });
 		const run = new DisposableStore();
 		this._run.value = run;
@@ -212,7 +243,7 @@ export class McpSubscriptionManager extends Disposable {
 	) {
 		super();
 		this._lists = this._register(new ListenStream('lists', host, () => this._currentListFilter(), (filter, isReconnect) => this._onListsAcknowledged(filter, isReconnect), r => this._onDidReconnect.fire(r), this._schedule));
-		this._resources = this._register(new ListenStream('resources', host, () => this._currentResourceFilter(), () => { }, r => this._onDidReconnect.fire(r), this._schedule));
+		this._resources = this._register(new ListenStream('resources', host, () => this._currentResourceFilter(), (filter, _isReconnect, afterOutage) => this._onResourcesAcknowledged(filter, afterOutage), r => this._onDidReconnect.fire(r), this._schedule));
 	}
 
 	/** The URIs with live subscriptions. */
@@ -228,8 +259,8 @@ export class McpSubscriptionManager extends Disposable {
 
 	/** Re-opens the streams (after a transport restart the previous streams are gone). */
 	restart(): void {
-		this._lists.refresh();
-		this._resources.refresh();
+		this._lists.reopen();
+		this._resources.reopen();
 	}
 
 	/** Subscribes to `resources/updated` for a URI (ref-counted; the resources stream is swapped after a short debounce). */
@@ -344,6 +375,19 @@ export class McpSubscriptionManager extends Disposable {
 		}
 		if (filter.resourcesListChanged) {
 			this._onDidChangeResourceList.fire();
+		}
+	}
+
+	private _onResourcesAcknowledged(filter: MCP.SubscriptionFilter, afterOutage: boolean): void {
+		if (!afterOutage) {
+			return; // a new filter (a subscription added or released) loses nothing
+		}
+		// Updates may have happened while the stream was down: let the subscribers read again.
+		const uris = Array.isArray(filter.resourceSubscriptions) ? filter.resourceSubscriptions : [...this._resourceRefs.keys()];
+		for (const uri of uris) {
+			if (typeof uri === 'string' && this._resourceRefs.has(uri)) {
+				this._onDidUpdateResource.fire({ uri });
+			}
 		}
 	}
 }

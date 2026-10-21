@@ -4,9 +4,11 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { renderMarkdown } from '../../../../../base/browser/markdownRenderer.js';
 import { timeout } from '../../../../../base/common/async.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../../base/common/cancellation.js';
 import { Emitter } from '../../../../../base/common/event.js';
+import { IMarkdownString, MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { constObservable } from '../../../../../base/common/observable.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { upcastPartial } from '../../../../../base/test/common/mock.js';
@@ -32,7 +34,7 @@ import { ChatModel } from '../../../chat/common/model/chatModel.js';
 import { ChatQuestionCarouselData } from '../../../chat/common/model/chatProgressTypes/chatQuestionCarouselData.js';
 import { ChatAgentService, IChatAgentService } from '../../../chat/common/participants/chatAgents.js';
 import { MockChatService } from '../../../chat/test/common/chatService/mockChatService.js';
-import { buildUrlElicitationMessage, isEmptyFormSchema, McpElicitationService, punycodeHostnameToUnicode, resolveUrlElicitationPlan } from '../../browser/mcpElicitationService.js';
+import { buildUrlElicitationMessage, isEmptyFormSchema, literalMarkdown, mayRenderAsLink, McpElicitationService, punycodeHostnameToUnicode, resolveUrlElicitationPlan } from '../../browser/mcpElicitationService.js';
 import { McpServerRequestHandler } from '../../common/mcpServerRequestHandler.js';
 import { ElicitationKind, ElicitResult, IMcpServer, IMcpServerConnection, IMcpToolCallContext, IUrlModeElicitResult, McpConnectionState } from '../../common/mcpTypes.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
@@ -54,6 +56,13 @@ class RecordingNotificationService extends TestNotificationService {
 
 suite('McpElicitationService', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
+
+	/** Renders Markdown through the renderer the chat uses (marked, with GFM autolinks). */
+	function render(md: string | IMarkdownString): HTMLElement {
+		return store.add(renderMarkdown(typeof md === 'string' ? new MarkdownString(md) : md)).element;
+	}
+
+	const countLinks = (element: HTMLElement) => element.getElementsByTagName('a').length;
 
 	suite('resolveUrlElicitationPlan', () => {
 		const url = (u: string, options?: { resume?: boolean }, era: McpProtocolEra | undefined = 'legacy') => resolveUrlElicitationPlan({ url: u }, options, era);
@@ -120,16 +129,74 @@ suite('McpElicitationService', () => {
 		});
 	});
 
+	suite('literalMarkdown', () => {
+		const linkish = [
+			'Sign in at https://evil.example/login',
+			'or visit www.evil.example today',
+			'write to admin@evil.example',
+			'[Click here](https://evil.example/)',
+			'![pixel](https://evil.example/pixel.png)',
+			'<https://evil.example/>',
+			'<a href="https://evil.example/">here</a>',
+			'[terms]\n\n[terms]: https://evil.example/terms',
+		];
+
+		test('renders no link, autolink or image', () => {
+			for (const text of linkish) {
+				const element = render(literalMarkdown(text));
+				assert.deepStrictEqual([countLinks(element), element.getElementsByTagName('img').length], [0, 0], text);
+			}
+		});
+
+		test('the renderer links the same text when it is Markdown or appendText', () => {
+			// Guards the test above: these do turn into links when not made literal.
+			assert.strictEqual(countLinks(render(new MarkdownString().appendText('Sign in at https://evil.example/login'))), 1);
+			assert.strictEqual(countLinks(render(new MarkdownString('[Click here](https://evil.example/)'))), 1);
+		});
+
+		test('shows the text as it is, one paragraph per line', () => {
+			const lines = [
+				'**not bold** _not emphasis_ `not code`',
+				'# not a heading',
+				'  - not a list item',
+				'1. not a list',
+				'> not a quote',
+				'| not | a table |',
+				'\\ $(not-an-icon) &amp; <b>not bold</b>',
+			];
+			const element = render(literalMarkdown(lines.join('\n')));
+			assert.deepStrictEqual([...element.getElementsByTagName('p')].map(p => p.textContent?.replace(/\xa0/g, ' ')), lines);
+			assert.deepStrictEqual(['strong', 'em', 'code', 'h1', 'li', 'blockquote', 'table', 'b'].map(tag => element.getElementsByTagName(tag).length), [0, 0, 0, 0, 0, 0, 0, 0]);
+		});
+
+		test('mayRenderAsLink spots link syntax, URLs, www hosts and e-mail addresses', () => {
+			assert.deepStrictEqual(
+				[...linkish, 'WWW.Example.org', 'ftp://example.org', 'Name', 'Age (years)', 'Note: optional', 'e.g. 42'].map(mayRenderAsLink),
+				[true, true, true, true, true, true, true, true, true, true, false, false, false, false],
+			);
+		});
+	});
+
 	suite('buildUrlElicitationMessage', () => {
 		test('shows the full URL and the host', () => {
 			const plan = resolveUrlElicitationPlan({ url: 'https://example.com/auth?state=abc' }, undefined, 'modern');
 			assert.strictEqual(plan.kind, 'open');
-			// appendText encodes spaces as non-breaking spaces; the renderer shows them as plain spaces.
-			const message = buildUrlElicitationMessage('Please sign in.', plan).value.replace(/&nbsp;/g, ' ');
-			assert.ok(message.includes('Please sign in.'), message);
-			assert.ok(message.includes('https://example.com/auth?state=abc'), message);
-			assert.ok(message.includes('`example.com`'), message);
-			assert.ok(!message.includes('internationalized'), message);
+			const md = buildUrlElicitationMessage('Please sign in.', plan);
+			const text = render(md).textContent ?? '';
+			assert.ok(text.includes('Please sign in.'), text);
+			assert.ok(text.includes('https://example.com/auth?state=abc'), text);
+			assert.ok(md.value.includes('`example.com`'), md.value);
+			assert.ok(!text.includes('internationalized'), text);
+		});
+
+		test('shows the server message literally and the URL as code, so nothing is a link', () => {
+			const plan = resolveUrlElicitationPlan({ url: 'https://example.com/auth' }, undefined, 'modern');
+			assert.strictEqual(plan.kind, 'open');
+			const message = 'Sign in at [the portal](https://evil.example/) or https://evil.example/ instead.';
+			const element = render(buildUrlElicitationMessage(message, plan));
+			assert.strictEqual(countLinks(element), 0);
+			assert.strictEqual(element.getElementsByTagName('p')[0]?.textContent, message);
+			assert.ok([...element.getElementsByTagName('code')].some(code => code.textContent?.includes('https://example.com/auth')), element.innerHTML);
 		});
 
 		test('shows both spellings and a warning for an IDN host', () => {
@@ -197,6 +264,7 @@ suite('McpElicitationService', () => {
 			const onDidComplete = store.add(new Emitter<MCPLegacy.ElicitationCompleteNotification>());
 			const handler = era === undefined ? undefined : upcastPartial<McpServerRequestHandler>({
 				era,
+				currentProtocolVersion: era === 'modern' ? '2026-07-28' : '2025-11-25',
 				onDidReceiveElicitationCompleteNotification: onDidComplete.event,
 			});
 			const connection = upcastPartial<IMcpServerConnection>({ handler: constObservable(handler) });
@@ -535,6 +603,149 @@ suite('McpElicitationService', () => {
 				chat.carouselPart()!.completion.complete({ answers: undefined });
 				const result = await pending;
 				assert.deepStrictEqual(result.value, { action: 'cancel' });
+				result.dispose();
+			});
+		});
+
+		suite('no live links (Safe URL Handling)', () => {
+			const message = 'Read [the terms](https://evil.example/terms) or https://evil.example/faq first.';
+
+			test('a form shows its message and link-like titles literally', async () => {
+				const { server } = createServer('modern');
+				const chat = createChat();
+				const params: MCPLegacy.ElicitRequestFormParams = {
+					mode: 'form',
+					message,
+					requestedSchema: {
+						type: 'object',
+						properties: {
+							page: { type: 'string', title: 'Your page at https://evil.example/me', description: 'See www.evil.example' },
+							name: { type: 'string', title: 'Name' },
+						},
+					},
+				};
+				const pending = service.elicit(server, chat.context, params, CancellationToken.None);
+				const carousel = chat.carouselPart();
+				assert.ok(carousel?.message, 'expected a question carousel with a message');
+				const renderedMessage = render(carousel.message);
+				assert.deepStrictEqual([countLinks(renderedMessage), renderedMessage.textContent], [0, message]);
+
+				const [page, name] = carousel.questions;
+				assert.ok(page.message, 'a title that could form a link is given as literal Markdown');
+				const renderedTitle = render(page.message);
+				assert.deepStrictEqual([countLinks(renderedTitle), renderedTitle.textContent], [0, 'Your page at https://evil.example/me']);
+				assert.deepStrictEqual([page.title, page.description, name.title, name.message], ['Your page at https://evil.example/me', 'See www.evil.example', 'Name', undefined]);
+
+				carousel.completion.complete({ answers: undefined });
+				(await pending).dispose();
+			});
+
+			test('a consent prompt shows its message literally', async () => {
+				const { server } = createServer('legacy');
+				const chat = createChat();
+				const pending = service.elicit(server, chat.context, { mode: 'form', message, requestedSchema: { type: 'object', properties: {} } }, CancellationToken.None);
+				const part = chat.elicitationPart();
+				assert.ok(part, 'expected a consent part');
+				const rendered = render(part.message);
+				assert.deepStrictEqual([countLinks(rendered), rendered.textContent], [0, message]);
+				await part.reject!();
+				(await pending).dispose();
+			});
+
+			test('a URL elicitation shows its message literally and its URL as code', async () => {
+				const { server } = createServer('modern');
+				const chat = createChat();
+				const pending = service.elicit(server, chat.context, { ...urlElicitation('https://example.com/auth'), message }, CancellationToken.None);
+				const part = chat.elicitationPart();
+				assert.ok(part, 'expected a URL consent part');
+				const rendered = render(part.message);
+				assert.strictEqual(countLinks(rendered), 0);
+				assert.strictEqual(rendered.getElementsByTagName('p')[0]?.textContent, message);
+				assert.ok([...rendered.getElementsByTagName('code')].some(code => code.textContent?.includes('https://example.com/auth')), rendered.innerHTML);
+				await part.reject!();
+				(await pending).dispose();
+			});
+		});
+
+		suite('requested schema that does not compile', () => {
+			const schemas: Record<string, unknown> = {
+				'an unsupported dialect': { $schema: 'http://json-schema.org/draft-04/schema#', type: 'object', properties: { name: { type: 'string' } } },
+				'an unresolved remote $ref': { type: 'object', properties: { name: { $ref: 'https://evil.example/name.json' } } },
+				'an invalid keyword value': { type: 'object', properties: { name: { type: 'string', minLength: -1 } } },
+				'a consent form in an unsupported dialect': { $schema: 'http://json-schema.org/draft-04/schema#', type: 'object', properties: {} },
+			};
+
+			test('a form whose requested schema does not compile is declined without showing anything, and the reason logged', async () => {
+				for (const [label, requestedSchema] of Object.entries(schemas)) {
+					const { server } = createServer('modern');
+					const chat = createChat();
+					const warningsBefore = logService.warnings.length;
+					const params = { mode: 'form', message: 'Name?', requestedSchema } as unknown as MCPLegacy.ElicitRequestFormParams;
+					const result = await service.elicit(server, chat.context, params, CancellationToken.None);
+					assert.deepStrictEqual(
+						{ kind: result.kind, value: result.value, parts: chat.parts().length, notifications: notificationService.notifications.length },
+						{ kind: ElicitationKind.Form, value: { action: 'decline' }, parts: 0, notifications: 0 },
+						label,
+					);
+					const warnings = logService.warnings.slice(warningsBefore);
+					assert.strictEqual(warnings.length, 1, label);
+					assert.ok(warnings[0].includes('does not compile'), warnings[0]);
+					result.dispose();
+				}
+			});
+
+			test('from a server speaking 2025-11-25, such a form is shown as before (not declined), with a warning in the log', async () => {
+				for (const [label, requestedSchema] of Object.entries(schemas)) {
+					const { server } = createServer('legacy');
+					const chat = createChat();
+					const warningsBefore = logService.warnings.length;
+					const params = { mode: 'form', message: 'Name?', requestedSchema } as unknown as MCPLegacy.ElicitRequestFormParams;
+					const pending = service.elicit(server, chat.context, params, CancellationToken.None);
+					const carousel = chat.carouselPart();
+					if (carousel) {
+						carousel.completion.complete({ answers: { [carousel.questions[0].id]: 'Ada' } });
+					} else {
+						const consent = chat.elicitationPart();
+						assert.ok(consent, `${label}: the form is shown`);
+						await consent.accept(true);
+					}
+					const result = await pending;
+					assert.strictEqual(result.value.action, 'accept', label);
+					const warnings = logService.warnings.slice(warningsBefore);
+					assert.strictEqual(warnings.length, 1, `${label}: ${warnings.join('\n')}`);
+					result.dispose();
+				}
+			});
+
+			test('a pattern that cannot be compiled does not decline a form', async () => {
+				const { server } = createServer('modern');
+				const chat = createChat();
+				const params: MCPLegacy.ElicitRequestFormParams = { mode: 'form', message: 'Host?', requestedSchema: { type: 'object', properties: { host: { type: 'string', pattern: '^([a-z0-9-]+\\.)+[a-z]{2,}$' } } } as MCPLegacy.ElicitRequestFormParams['requestedSchema'] };
+				const pending = service.elicit(server, chat.context, params, CancellationToken.None);
+				const carousel = chat.carouselPart();
+				assert.ok(carousel, 'expected a question carousel');
+				assert.strictEqual(logService.warnings.length, 1, 'the unchecked pattern is logged');
+				carousel.completion.complete({ answers: { [carousel.questions[0].id]: 'a.example' } });
+				const result = await pending;
+				assert.deepStrictEqual(result.value, { action: 'accept', content: { host: 'a.example' } });
+				result.dispose();
+			});
+
+			test('a draft-07 schema still compiles and is shown, as for 2025-11-25 servers', async () => {
+				const { server } = createServer('legacy');
+				const chat = createChat();
+				const params = {
+					mode: 'form',
+					message: 'Name?',
+					requestedSchema: { $schema: 'http://json-schema.org/draft-07/schema#', type: 'object', properties: { name: { type: 'string', minLength: 1 } }, required: ['name'] },
+				} as unknown as MCPLegacy.ElicitRequestFormParams;
+				const pending = service.elicit(server, chat.context, params, CancellationToken.None);
+				const carousel = chat.carouselPart();
+				assert.ok(carousel, 'expected a question carousel');
+				assert.strictEqual(logService.warnings.length, 0);
+				carousel.completion.complete({ answers: { [carousel.questions[0].id]: 'Ada' } });
+				const result = await pending;
+				assert.deepStrictEqual(result.value, { action: 'accept', content: { name: 'Ada' } });
 				result.dispose();
 			});
 		});

@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { Emitter } from '../../../../../base/common/event.js';
 import { constObservable } from '../../../../../base/common/observable.js';
 import { mock, upcastPartial } from '../../../../../base/test/common/mock.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
@@ -14,7 +15,10 @@ import { IConfigurationService } from '../../../../../platform/configuration/com
 import { TestConfigurationService } from '../../../../../platform/configuration/test/common/testConfigurationService.js';
 import { TestInstantiationService } from '../../../../../platform/instantiation/test/common/instantiationServiceMock.js';
 import { IMcpServerConfiguration } from '../../../../../platform/mcp/common/mcpPlatformTypes.js';
-import { IInputOptions, IQuickInputService, IQuickPickItem, QuickPickInput } from '../../../../../platform/quickinput/common/quickInput.js';
+import { IConfirmation, IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
+import { INotificationService, NotificationMessage } from '../../../../../platform/notification/common/notification.js';
+import { IInputBox, IInputOptions, IQuickInputButton, IQuickInputHideEvent, IQuickInputService, IQuickPickItem, QuickInputHideReason, QuickPickInput } from '../../../../../platform/quickinput/common/quickInput.js';
+import { ISecretStorageService } from '../../../../../platform/secrets/common/secrets.js';
 import { ITelemetryService } from '../../../../../platform/telemetry/common/telemetry.js';
 import { IWorkspaceContextService, WorkbenchState } from '../../../../../platform/workspace/common/workspace.js';
 import { IChatWidgetService } from '../../../chat/browser/chat.js';
@@ -26,8 +30,8 @@ import { AICustomizationManagementCommands, AICustomizationManagementSection } f
 import { ContributionEnablementState } from '../../../chat/common/enablement.js';
 import { IExtensionsWorkbenchService } from '../../../extensions/common/extensions.js';
 import { IViewsService } from '../../../../services/views/common/viewsService.js';
-import { findLocalMcpServer, McpBrowseCommand, McpBrowsePageCommand, ShowInstalledMcpServersCommand } from '../../browser/mcpCommands.js';
-import { IMcpServer, IMcpService, InstalledMcpServersViewId } from '../../common/mcpTypes.js';
+import { findLocalMcpServer, McpBrowseCommand, McpBrowsePageCommand, SetOAuthClientSecret, ShowInstalledMcpServersCommand } from '../../browser/mcpCommands.js';
+import { IMcpServer, IMcpService, InstalledMcpServersViewId, mcpOAuthClientSecretStorageKey } from '../../common/mcpTypes.js';
 
 type AgentHostMcpServer = ReturnType<IAgentHostCustomizationService['getMcpServers']>[number];
 
@@ -208,6 +212,99 @@ suite('MCP commands', () => {
 		await instantiationService.invokeFunction(accessor => new McpBrowsePageCommand().run(accessor));
 
 		assert.deepStrictEqual(searches, ['@mcp ']);
+	});
+
+	suite('set OAuth client secret', () => {
+		const serverUrl = 'https://mcp.example/mcp';
+		const key = mcpOAuthClientSecretStorageKey(serverUrl, 'client-id');
+
+		interface ISetClientSecretRun {
+			/** What the input box showed before the user typed. */
+			readonly shown: string;
+			readonly stored: unknown;
+			readonly confirmations: string[];
+			readonly notifications: string[];
+		}
+
+		/** Runs the command against the stored value `initial`, the user entering `typed` and answering the binding question with `sameIssuer`. */
+		async function runSetClientSecret(initial: string | undefined, typed: string, sameIssuer = false): Promise<ISetClientSecretRun> {
+			const instantiationService = store.add(new TestInstantiationService());
+			const secrets = new Map<string, string>(initial === undefined ? [] : [[key, initial]]);
+			const confirmations: string[] = [];
+			const notifications: string[] = [];
+			let shown = '';
+			instantiationService.stub(IQuickInputService, upcastPartial<IQuickInputService>({
+				createInputBox: () => {
+					const onDidAccept = new Emitter<void>();
+					const onDidHide = new Emitter<IQuickInputHideEvent>();
+					const onDidTriggerButton = new Emitter<IQuickInputButton>();
+					const box = {
+						value: '',
+						onDidAccept: onDidAccept.event,
+						onDidHide: onDidHide.event,
+						onDidTriggerButton: onDidTriggerButton.event,
+						show() {
+							shown = box.value;
+							box.value = typed;
+							onDidAccept.fire();
+						},
+						hide() { onDidHide.fire({ reason: QuickInputHideReason.Other }); },
+						dispose() {
+							onDidAccept.dispose();
+							onDidHide.dispose();
+							onDidTriggerButton.dispose();
+						},
+					};
+					return box as unknown as IInputBox;
+				},
+			}));
+			instantiationService.stub(ISecretStorageService, upcastPartial<ISecretStorageService>({
+				get: async (k: string) => secrets.get(k),
+				set: async (k: string, value: string) => { secrets.set(k, value); },
+				delete: async (k: string) => { secrets.delete(k); },
+			}));
+			instantiationService.stub(IDialogService, upcastPartial<IDialogService>({
+				confirm: async (confirmation: IConfirmation) => {
+					confirmations.push(confirmation.message);
+					return { confirmed: sameIssuer };
+				},
+			}));
+			instantiationService.stub(INotificationService, upcastPartial<INotificationService>({
+				info: (message: NotificationMessage | NotificationMessage[]) => { notifications.push(String(message)); },
+			}));
+
+			await instantiationService.invokeFunction(accessor => new SetOAuthClientSecret().run(accessor, 'client-id', serverUrl, 'Server'));
+			const value = secrets.get(key);
+			return { shown, stored: value === undefined ? undefined : JSON.parse(value), confirmations, notifications };
+		}
+
+		const bound = JSON.stringify({ clientSecret: 'old-secret', issuer: 'https://as.example' });
+
+		test('shows only the secret of the stored { clientSecret, issuer } value', async () => {
+			const fromBound = await runSetClientSecret(bound, 'old-secret');
+			const fromBare = await runSetClientSecret('bare-secret', 'bare-secret');
+			assert.deepStrictEqual([fromBound, fromBare].map(run => ({ shown: run.shown, stored: run.stored, confirmations: run.confirmations.length })), [
+				// The same secret again: the binding stays without asking.
+				{ shown: 'old-secret', stored: { clientSecret: 'old-secret', issuer: 'https://as.example' }, confirmations: 0 },
+				{ shown: 'bare-secret', stored: { clientSecret: 'bare-secret' }, confirmations: 0 },
+			]);
+		});
+
+		test('a replaced secret keeps the issuer binding only when the user confirms the same authorization server', async () => {
+			const confirmed = await runSetClientSecret(bound, 'new-secret', true);
+			const declined = await runSetClientSecret(bound, 'new-secret', false);
+			const unbound = await runSetClientSecret(undefined, 'first-secret');
+			assert.deepStrictEqual([confirmed, declined, unbound].map(run => ({ stored: run.stored, asked: run.confirmations.length, told: run.notifications.length })), [
+				{ stored: { clientSecret: 'new-secret', issuer: 'https://as.example' }, asked: 1, told: 0 },
+				{ stored: { clientSecret: 'new-secret' }, asked: 1, told: 1 },
+				{ stored: { clientSecret: 'first-secret' }, asked: 0, told: 0 },
+			]);
+			assert.ok(declined.notifications[0].includes('https://as.example'), declined.notifications[0]);
+		});
+
+		test('an empty value deletes the stored secret', async () => {
+			assert.strictEqual((await runSetClientSecret(bound, '')).stored, undefined);
+		});
 	});
 
 	test('show installed resets the Extensions search before opening the view', async () => {

@@ -4,6 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import * as sinon from 'sinon';
+import { DeferredPromise } from '../../../../base/common/async.js';
+import { CancellationTokenSource } from '../../../../base/common/cancellation.js';
+import { isCancellationError } from '../../../../base/common/errors.js';
 import { OAuthClientError } from '../../../../base/common/oauth.js';
 import { IOAuthFetchResponse } from '../../../../base/common/oauthClient.js';
 import { URI } from '../../../../base/common/uri.js';
@@ -12,9 +16,9 @@ import { bearerChallenge, createOAuthFixture, IOAuthFixture, IOAuthFixtureOption
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { ILogService, LogLevel, NullLogService } from '../../../../platform/log/common/log.js';
 import { IMcpRemoteServerOAuthConfiguration } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
-import { McpConnectionState, McpServerTransportHTTP, McpServerTransportType } from '../../../contrib/mcp/common/mcpTypes.js';
-import { IAuthMetadataSource, IMcpAuthenticationDetails, IMcpAuthenticationOptions, MainThreadMcpShape } from '../../common/extHost.protocol.js';
-import { CommonRequestInit, CommonResponse, IMcpAuthHeaderProviderHost, McpAuthHeaderProvider, McpHTTPHandle } from '../../common/extHostMcp.js';
+import { IMcpRequestAbort, McpConnectionState, McpServerTransportHTTP, McpServerTransportType } from '../../../contrib/mcp/common/mcpTypes.js';
+import { IAuthMetadataSource, IMcpAuthenticationDetails, IMcpAuthenticationOptions, IMcpRegisteredAuthorizationServer, MainThreadMcpShape } from '../../common/extHost.protocol.js';
+import { CommonRequestInit, CommonResponse, createAuthMetadata, fetchMetadataWithin, IMcpAuthHeaderProviderHost, McpAuthHeaderProvider, McpHTTPHandle } from '../../common/extHostMcp.js';
 
 /** The headers the transport reads from a response. */
 const RESPONSE_HEADERS = ['www-authenticate', 'content-type', 'location', 'mcp-session-id', 'set-cookie'];
@@ -32,7 +36,7 @@ function toCommonResponse(url: string, response: IOAuthFetchResponse): CommonRes
 
 /** The transport's private request paths, which these tests drive directly. */
 interface IHandleInternals {
-	_fetchWithAuthRetry(mcpUrl: string, init: { method: string; headers: Record<string, string> }, headers: Record<string, string>): Promise<CommonResponse>;
+	_fetchWithAuthRetry(mcpUrl: string, init: { method: string; headers: Record<string, string> }, headers: Record<string, string>, transportHeaders?: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<CommonResponse>;
 	_fetch(url: string, init: { method: string; headers: Record<string, string> }): Promise<CommonResponse>;
 }
 
@@ -59,16 +63,21 @@ suite('McpAuthHeaderProvider', () => {
 
 	function createHarness(options: {
 		readonly fixture?: IOAuthFixtureOptions;
+		/** An existing fixture (the same servers across connections); {@link fixture} is ignored then. */
+		readonly fixtureInstance?: IOAuthFixture;
 		readonly launch?: Partial<McpServerTransportHTTP>;
 		readonly stepUps?: Map<string, number>;
 		/** Answers the main thread's token request; defaults to `token-<n>`. */
 		readonly getToken?: (call: ITokenCall, index: number) => Promise<string | undefined>;
+		/** The registrations the main thread keeps for the resource; without it the host offers no lookup. */
+		readonly registered?: (resource: string) => IMcpRegisteredAuthorizationServer[];
 	} = {}): IHarness {
-		const fixture = createOAuthFixture(options.fixture);
+		const fixture = options.fixtureInstance ?? createOAuthFixture(options.fixture);
 		const calls: ITokenCall[] = [];
 		const setups: IAuthMetadataSource[] = [];
 		const logs: string[] = [];
 		const states: McpConnectionState[] = [];
+		const registered = options.registered;
 		const proxy: IMcpAuthHeaderProviderHost['proxy'] = {
 			async $getTokenFromServerMetadata(_id, details, tokenOptions) {
 				const call = { details, options: tokenOptions };
@@ -78,6 +87,7 @@ suite('McpAuthHeaderProvider', () => {
 			async $getTokenForProviderId() { return undefined; },
 			$onDidChangeState(_id, state) { states.push(state); },
 			$logMcpAuthSetup(data) { setups.push(data); },
+			$getRegisteredAuthorizationServers: registered ? async (_id, resource) => registered(resource) : undefined,
 		};
 		const provider = store.add(new McpAuthHeaderProvider({
 			id: 1,
@@ -203,6 +213,127 @@ suite('McpAuthHeaderProvider', () => {
 		assert.deepStrictEqual(calls.map(c => c.details.authorizationServerMetadata.issuer), ['https://as2.example.test', 'https://as2.example.test']);
 	});
 
+	test('the first listed authorization server the main thread holds a registration with is selected, also after a restart', async () => {
+		let servers = ['https://as.example.test'];
+		const fixture = createOAuthFixture({ rs: { authorizationServers: () => servers } });
+		fixture.router.handle('https://as2.example.test', request => request.url.pathname === '/.well-known/oauth-authorization-server'
+			? { status: 200, body: { ...fixture.as.metadata(), issuer: 'https://as2.example.test' } }
+			: undefined);
+		// The main thread keeps a dynamic provider per authorization server that issued a token for the resource.
+		const registrations: IMcpRegisteredAuthorizationServer[] = [];
+		const lookups: string[] = [];
+		const registered = (resource: string) => {
+			lookups.push(resource);
+			return [...registrations];
+		};
+		const getToken = async (call: ITokenCall) => {
+			registrations.push({ authorizationServer: URI.revive(call.details.authorizationServer).toString(true), resource: call.details.resourceMetadata?.resource });
+			return 'token';
+		};
+
+		const beforeRestart = createHarness({ fixtureInstance: fixture, registered, getToken });
+		await beforeRestart.provider.handleChallenge(401, challenge(fixture), {});
+		// The resource now lists a new authorization server first, and the window restarted: a new connection.
+		servers = ['https://as2.example.test', 'https://as.example.test'];
+		const afterRestart = createHarness({ fixtureInstance: fixture, registered, getToken });
+		await afterRestart.provider.handleChallenge(401, challenge(fixture), {});
+		// Without a registration the first listed one is selected.
+		const unregistered = createHarness({ fixtureInstance: fixture, registered: () => [] });
+		await unregistered.provider.handleChallenge(401, challenge(fixture), {});
+
+		assert.deepStrictEqual({
+			issuers: [beforeRestart, afterRestart, unregistered].map(h => h.calls[0].details.authorizationServerMetadata.issuer),
+			lookups,
+		}, {
+			issuers: ['https://as.example.test', 'https://as.example.test', 'https://as2.example.test'],
+			lookups: [fixture.resource, fixture.resource],
+		});
+	});
+
+	test('a metadata request that never answers times out, and cancelling the token ends discovery', async () => {
+		const requested: string[] = [];
+		const hung = (url: string) => {
+			requested.push(url);
+			// A fetch that ignores its signal.
+			return new Promise<CommonResponse>(() => { });
+		};
+		const timedOut = await createAuthMetadata('https://mcp.example.test/mcp', new Headers(), { fetch: hung, log: () => { }, metadataTimeoutMs: 5 });
+
+		const started = new DeferredPromise<void>();
+		const cts = new CancellationTokenSource();
+		const pending = createAuthMetadata('https://mcp.example.test/mcp', new Headers(), {
+			fetch: url => {
+				started.complete();
+				return hung(url);
+			},
+			log: () => { },
+			token: cts.token,
+		});
+		await started.p;
+		cts.cancel();
+		await assert.rejects(pending, (error: unknown) => isCancellationError(error));
+		cts.dispose();
+
+		assert.deepStrictEqual({
+			telemetry: timedOut.telemetry,
+			// Every protected resource and authorization server metadata location was tried in turn.
+			triedResourceMetadata: requested.some(url => url.includes('/.well-known/oauth-protected-resource')),
+			triedServerMetadata: requested.some(url => url.includes('/.well-known/oauth-authorization-server')),
+		}, {
+			telemetry: { resourceMetadataSource: 'none', serverMetadataSource: 'default' },
+			triedResourceMetadata: true,
+			triedServerMetadata: true,
+		});
+	});
+
+	test('a metadata response whose body is never read keeps no timer and no listener on the caller\'s signal; a body read has its own deadline', async () => {
+		const clock = sinon.useFakeTimers();
+		try {
+			const url = 'https://mcp.example.test/.well-known/oauth-protected-resource/mcp';
+			const signals: AbortSignal[] = [];
+			const respond = (json: () => Promise<unknown>) => async (_url: string, init: { signal?: AbortSignal }): Promise<CommonResponse> => {
+				signals.push(init.signal!);
+				return { status: 404, statusText: 'Not Found', headers: new Headers(), body: null, url, json, text: async () => '' };
+			};
+
+			// A probe answered 404: the client does not read the body.
+			const caller = new AbortController();
+			await fetchMetadataWithin(respond(async () => ({})), url, { method: 'GET', headers: {} }, caller.signal, 30_000);
+			const timersAfterProbe = clock.countTimers();
+			// The caller's signal outlives the request: aborting it must not reach the finished request.
+			caller.abort();
+
+			// A body that is read: its deadline ends with the read.
+			const read = await fetchMetadataWithin(respond(async () => ({ resource: 'https://mcp.example.test/mcp' })), url, { method: 'GET', headers: {} }, undefined, 30_000);
+			const body = await read.json();
+			const timersAfterRead = clock.countTimers();
+
+			// A body that never arrives times out and aborts the request.
+			const hung = await fetchMetadataWithin(respond(() => new Promise(() => { })), url, { method: 'GET', headers: {} }, undefined, 30_000);
+			const reading = assert.rejects(hung.json(), /timed out after 30000 ms/);
+			clock.tick(30_000);
+			await reading;
+
+			assert.deepStrictEqual({
+				timersAfterProbe,
+				probeAbortedByCaller: signals[0].aborted,
+				body,
+				timersAfterRead,
+				hungAborted: signals[2].aborted,
+				timersAfterTimeout: clock.countTimers(),
+			}, {
+				timersAfterProbe: 0,
+				probeAbortedByCaller: false,
+				body: { resource: 'https://mcp.example.test/mcp' },
+				timersAfterRead: 0,
+				hungAborted: true,
+				timersAfterTimeout: 0,
+			});
+		} finally {
+			clock.restore();
+		}
+	});
+
 	test('discovery failures are terminal and send nothing', async () => {
 		const cases: Array<[string, IOAuthFixtureOptions, string]> = [
 			['a resource metadata document naming another resource', { rs: { prmResource: 'https://evil.example.com/mcp' } }, 'resource_mismatch'],
@@ -216,6 +347,27 @@ suite('McpAuthHeaderProvider', () => {
 			assert.deepStrictEqual(calls, [], description);
 			assert.deepStrictEqual(fixture.as.registrations, [], description);
 		}
+	});
+
+	test('a plain-HTTP registration endpoint does not fail discovery: a pre-registered or metadata-document client never uses it, and the dynamic registration applies the endpoint rule where it registers', async () => {
+		const withPlainRegistration = (): IOAuthFixture => {
+			const fixture = createOAuthFixture();
+			fixture.router.handle(new URL(fixture.issuer).origin, request => request.url.pathname === '/.well-known/oauth-authorization-server'
+				? { status: 200, body: { ...fixture.as.metadata(), registration_endpoint: 'http://as.example.test/register' } }
+				: undefined);
+			return fixture;
+		};
+		const strict = createHarness({ fixtureInstance: withPlainRegistration() });
+		assert.ok(await strict.provider.handleChallenge(401, challenge(strict.fixture), {}));
+		const oauth: IMcpRemoteServerOAuthConfiguration = { allowInsecureHttp: true };
+		const lenient = createHarness({ fixtureInstance: withPlainRegistration(), launch: { oauth } });
+		assert.ok(await lenient.provider.handleChallenge(401, challenge(lenient.fixture), {}));
+		// The main thread creates the dynamic provider with `oauth.allowInsecureHttp`, and the provider refuses
+		// a plain-HTTP registration endpoint without it (mainThreadMcp.test.ts, extHostAuthentication.test.ts).
+		assert.deepStrictEqual({
+			registrationEndpoint: [...strict.calls, ...lenient.calls].map(call => call.details.authorizationServerMetadata.registration_endpoint),
+			cleartextRequests: [...strict.fixture.requests, ...lenient.fixture.requests].filter(r => r.url.startsWith('http://')).length,
+		}, { registrationEndpoint: ['http://as.example.test/register', 'http://as.example.test/register'], cleartextRequests: 0 });
 	});
 
 	test('a server without protected resource metadata falls back to the 2025-03-26 default endpoints', async () => {
@@ -280,13 +432,16 @@ suite('McpAuthHeaderProvider', () => {
 suite('McpHTTPHandle authorization', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
-	function createHandle(fixture: IOAuthFixture, logLevel = LogLevel.Info) {
+	/** @param hang Requests that never get an answer (the fetch ignores its signal too); it sees the signal the request was sent with. */
+	function createHandle(fixture: IOAuthFixture, logLevel = LogLevel.Info, hang?: (url: string, signal: AbortSignal | undefined) => boolean) {
 		const logs: string[] = [];
 		const states: McpConnectionState[] = [];
+		const aborts: IMcpRequestAbort[] = [];
 		const tokenCalls: IMcpAuthenticationOptions[] = [];
 		let issued = 0;
 		const proxy = Object.assign(new class extends mock<MainThreadMcpShape>() {
 			override $onDidChangeState(_id: number, state: McpConnectionState): void { states.push(state); }
+			override $onDidAbortRequest(_id: number, abort: IMcpRequestAbort): void { aborts.push(abort); }
 			override $onDidReceiveMessage(): void { }
 			override $onDidPublishLog(_id: number, _level: LogLevel, message: string): void { logs.push(message); }
 			override $logMcpAuthSetup(): void { }
@@ -300,11 +455,14 @@ suite('McpHTTPHandle authorization', () => {
 		}();
 		const handle = store.add(new class extends McpHTTPHandle {
 			protected override async _fetchInternal(url: string, init?: CommonRequestInit): Promise<CommonResponse> {
+				if (hang?.(url, init?.signal)) {
+					return new Promise<CommonResponse>(() => { });
+				}
 				const response = await fixture.fetch(url, { method: init?.method, headers: init?.headers, body: init?.body ? new TextDecoder().decode(init.body) : undefined });
 				return toCommonResponse(url, response);
 			}
 		}(1, { type: McpServerTransportType.HTTP, uri: URI.parse(fixture.resource), headers: [] }, proxy, logService));
-		return { handle, logs, states, tokenCalls };
+		return { handle, logs, states, aborts, tokenCalls };
 	}
 
 	test('stops answering challenges after three cycles and returns the challenged response', async () => {
@@ -322,12 +480,95 @@ suite('McpHTTPHandle authorization', () => {
 		]);
 	});
 
+	test('cancelling the request or disposing the handle ends a hung discovery', async () => {
+		const outcomes: Record<string, { cancelled: boolean; tokenCalls: number }> = {};
+		for (const end of ['cancel the request', 'dispose the handle'] as const) {
+			const fixture = createOAuthFixture();
+			const discovering = new DeferredPromise<void>();
+			const { handle, tokenCalls } = createHandle(fixture, LogLevel.Info, url => {
+				if (url.includes('/.well-known/')) {
+					discovering.complete();
+					return true;
+				}
+				return false;
+			});
+			const request = new AbortController();
+			const headers: Record<string, string> = {};
+			const pending = internals(handle)._fetchWithAuthRetry(fixture.resource, { method: 'POST', headers }, headers, undefined, request.signal);
+			await discovering.p;
+			if (end === 'cancel the request') {
+				request.abort();
+			} else {
+				handle.dispose();
+			}
+			let cancelled = false;
+			try {
+				await pending;
+			} catch (error) {
+				cancelled = isCancellationError(error);
+			}
+			outcomes[end] = { cancelled, tokenCalls: tokenCalls.length };
+		}
+		assert.deepStrictEqual(outcomes, {
+			'cancel the request': { cancelled: true, tokenCalls: 0 },
+			'dispose the handle': { cancelled: true, tokenCalls: 0 },
+		});
+	});
+
+	test('cancelling a request aborts the discovery fetch its challenge started', async () => {
+		const fixture = createOAuthFixture();
+		const discovery = new DeferredPromise<AbortSignal | undefined>();
+		const { handle, tokenCalls, states } = createHandle(fixture, LogLevel.Info, (url, signal) => {
+			if (url.includes('/.well-known/')) {
+				discovery.complete(signal);
+				return true;
+			}
+			return false;
+		});
+		// A 2026-07-28 request: the 401 to it starts discovery, whose first metadata request hangs.
+		const sending = handle.send(JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/list' }), { kind: 'request', requestId: 7, protocolVersion: '2026-07-28', method: 'tools/list' });
+		const signal = await discovery.p;
+		const abortedBeforeCancel = signal?.aborted;
+		handle.cancelRequest(7);
+		await sending;
+		assert.deepStrictEqual({
+			abortedBeforeCancel,
+			abortedAfterCancel: signal?.aborted,
+			tokenCalls: tokenCalls.length,
+			failed: states.some(state => state.state === McpConnectionState.Kind.Error),
+		}, { abortedBeforeCancel: false, abortedAfterCancel: true, tokenCalls: 0, failed: false });
+	});
+
 	test('a terminal authorization failure fails the request', async () => {
 		const fixture = createOAuthFixture({ rs: { prmResource: 'https://evil.example.com/mcp' } });
 		const { handle, tokenCalls } = createHandle(fixture);
 		const headers: Record<string, string> = {};
 		await assert.rejects(internals(handle)._fetchWithAuthRetry(fixture.resource, { method: 'POST', headers }, headers), (error: unknown) => error instanceof OAuthClientError && error.code === 'resource_mismatch');
 		assert.deepStrictEqual(tokenCalls, []);
+	});
+
+	test('a terminal authorization failure of a 2025-11-25 request fails that request and the connection at once', async () => {
+		// auth/scope-retry-limit: a fresh token is refused for the very scope it was issued for (step_up_limit).
+		const fixture = createOAuthFixture({
+			rs: {
+				authorize: ({ accessToken, metadataUrl }) => accessToken === undefined
+					? { status: 401, headers: { 'WWW-Authenticate': bearerChallenge({ scope: 'mcp:admin', resource_metadata: metadataUrl }) }, body: { error: 'invalid_token' } }
+					: { status: 403, headers: { 'WWW-Authenticate': bearerChallenge({ error: 'insufficient_scope', scope: 'mcp:admin', resource_metadata: metadataUrl }) }, body: { error: 'insufficient_scope' } },
+			},
+		});
+		const { handle, states, aborts, tokenCalls } = createHandle(fixture);
+		await handle.send(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list' }), { kind: 'request', requestId: 3, protocolVersion: '2025-11-25', method: 'tools/list' });
+		assert.deepStrictEqual({
+			accesses: fixture.rs.accesses.map(access => access.status),
+			tokenCalls: tokenCalls.length,
+			aborts: aborts.map(abort => ({ requestId: abort.requestId, reason: abort.reason, insufficientScope: !!abort.message?.includes('insufficient scope') })),
+			failed: states.some(state => state.state === McpConnectionState.Kind.Error),
+		}, {
+			accesses: [401, 403],
+			tokenCalls: 1,
+			aborts: [{ requestId: 3, reason: 'transport-error', insufficientScope: true }],
+			failed: true,
+		});
 	});
 
 	test('trace logs blank the credential-bearing headers', async () => {
