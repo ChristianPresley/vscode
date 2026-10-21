@@ -48,7 +48,6 @@ import { IExtHostVariableResolverProvider } from '../../common/extHostVariableRe
 import { IExtHostWorkspace } from '../../common/extHostWorkspace.js';
 import { SingleProxyRPCProtocol } from '../common/testRPCProtocol.js';
 import { createGrpcConnectionFactory, DEFAULT_GRPC_DEADLINE_MS, DEFAULT_GRPC_LISTEN_KEEPALIVE_MS, extensionHostProxyLookup, grpcDeadlineFor, grpcKeepAliveFor, IGrpcConnectionFactoryOptions, IGrpcProxyLookup, IMcpGrpcChannel, IMcpGrpcHandleOptions, isLoopbackHost, mapGrpcTrailersToJsonRpc, MAX_GRPC_TIMER_MS, McpGrpcHandle, MIN_GRPC_KEEPALIVE_MS } from '../../node/extHostMcpGrpc.js';
-import { loadFetchCaCertificates } from '../../node/proxyResolver.js';
 import { GrpcTestTransport } from './extHostMcpGrpcTestUtils.js';
 
 //#region Fakes
@@ -1303,7 +1302,13 @@ suite('McpGrpcHandle', () => {
 		}
 	});
 
-	test('loadFetchCaCertificates: the bundled roots and the additional certificates under either http.systemCertificates version, nothing when it is off', async () => {
+	test('loadFetchCaCertificates: the bundled roots and the additional certificates under either http.systemCertificates version, nothing when it is off', async function () {
+		// proxyResolver.js pulls in the extension host's static `node:` imports, which the Electron unit-test
+		// renderer cannot resolve, so it is imported here (not at the top of the file) and only under Node.
+		if (process.versions.electron) {
+			this.skip();
+		}
+		const { loadFetchCaCertificates } = await import('../../node/proxyResolver.js');
 		const outcomes: (readonly string[] | undefined)[] = [];
 		for (const [v1, v2] of [[true, false], [false, true], [false, false]]) {
 			proxyAgent.resetCaches();
