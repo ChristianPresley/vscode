@@ -100,6 +100,57 @@ suite('NodeExtHostMpcService - launches that cannot start', () => {
 	});
 });
 
+suite('NodeExtHostMpcService - stdio launches', () => {
+	const store = ensureNoDisposablesAreLeakedInTestSuite();
+
+	async function waitUntil(condition: () => boolean, what: () => string): Promise<void> {
+		for (let waited = 0; !condition(); waited += 10) {
+			assert.ok(waited < 10_000, `timed out waiting for ${what()}`);
+			await timeout(10);
+		}
+	}
+
+	test('an envelope does not change what is written to the server, and $cancelRequest writes nothing and leaves the server running', async () => {
+		const states: McpConnectionState[] = [];
+		const received: string[] = [];
+		const proxy = new class extends mock<MainThreadMcpShape>() {
+			override $onDidChangeState(_id: number, state: McpConnectionState): void { states.push(state); }
+			override $onDidReceiveMessage(_id: number, message: string): void { received.push(message); }
+			override $onDidPublishLog(): void { }
+		};
+		const service = store.add(new NodeExtHostMpcService(SingleProxyRPCProtocol(proxy), new NullLogService(), new class extends mock<IExtHostInitDataService>() { }, new class extends mock<IExtHostWorkspace>() { }, new class extends mock<IExtHostVariableResolverProvider>() { }));
+		// A server that answers every line it reads with that line, line break included, as a JSON string; it exits when its input ends.
+		const script = [
+			`let pending = '';`,
+			`process.stdin.setEncoding('utf8');`,
+			`process.stdin.on('data', chunk => { pending += chunk; for (let end = pending.indexOf('\\n'); end >= 0; end = pending.indexOf('\\n')) { process.stdout.write(JSON.stringify({ frame: pending.slice(0, end + 1) }) + '\\n'); pending = pending.slice(end + 1); } });`,
+			`process.stdin.on('end', () => process.exit(0));`,
+		].join(' ');
+		// ELECTRON_RUN_AS_NODE lets the Electron test runner's executable run the script as Node does.
+		const launch = McpServerLaunch.toSerialized({ type: McpServerTransportType.Stdio, command: process.execPath, args: ['-e', script], env: { ELECTRON_RUN_AS_NODE: '1' }, envFile: undefined, cwd: undefined, sandbox: undefined });
+		service.$startMcp(1, { launch });
+		await waitUntil(() => states.some(s => s.state === McpConnectionState.Kind.Running), () => `the server to run: ${JSON.stringify(states)}`);
+
+		const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
+		service.$sendMessage(1, request, { kind: 'request', requestId: 1, protocolVersion: '2026-07-28', method: 'tools/list', headers: { 'Mcp-Method': 'tools/list' } });
+		await waitUntil(() => received.length === 1, () => `the request to reach the server: ${JSON.stringify(received)}`);
+
+		service.$cancelRequest(1, 1);
+		service.$cancelRequest(1, 'never-sent');
+		// Lines reach the server in order: anything the cancellation wrote would come before this one.
+		const after = JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'ping' });
+		service.$sendMessage(1, after, { kind: 'request', requestId: 2, protocolVersion: '2025-11-25', method: 'ping' });
+		await waitUntil(() => received.length === 2, () => `the next request to reach the server: ${JSON.stringify(received)}`);
+
+		assert.deepStrictEqual(received.map(line => JSON.parse(line).frame), [`${request}\n`, `${after}\n`]);
+		assert.deepStrictEqual(states.map(s => s.state), [McpConnectionState.Kind.Starting, McpConnectionState.Kind.Running]);
+
+		service.$stopMcp(1);
+		await waitUntil(() => states.length > 2, () => `the server to stop: ${JSON.stringify(states)}`);
+		assert.deepStrictEqual(states.slice(2), [{ state: McpConnectionState.Kind.Stopped }]);
+	});
+});
+
 suite('NodeExtHostMpcService - gRPC launches', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 

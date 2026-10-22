@@ -6,13 +6,17 @@
 import assert from 'assert';
 import * as sinon from 'sinon';
 import { DeferredPromise } from '../../../../base/common/async.js';
+import { CancellationError } from '../../../../base/common/errors.js';
 import { URI } from '../../../../base/common/uri.js';
 import { mock } from '../../../../base/test/common/mock.js';
+import { createOAuthFixture, IOAuthFixture } from '../../../../base/test/common/oauthClientFixture.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { LogLevel, NullLogService } from '../../../../platform/log/common/log.js';
+import product from '../../../../platform/product/common/product.js';
 import { IMcpMessageEnvelope, IMcpRequestAbort, McpConnectionState, McpServerTransportType } from '../../../contrib/mcp/common/mcpTypes.js';
 import { MainThreadMcpShape } from '../../common/extHost.protocol.js';
 import { CommonRequestInit, CommonResponse, McpHTTPHandle } from '../../common/extHostMcp.js';
+import { IRecordedHttpRequest, LEGACY_FRAMES_CONFIGURED_HEADERS, LEGACY_FRAMES_SESSION_ID, LEGACY_FRAMES_URL, LEGACY_INITIALIZE_FRAME, LEGACY_INITIALIZED_FRAME, LEGACY_TOOLS_LIST_FRAME, legacyHttpRequests } from './extHostMcpLegacyFrames.js';
 
 const TEST_MCP_URL = 'https://example.com/mcp';
 
@@ -77,7 +81,8 @@ suite('ExtHostMcp - dual-era Streamable HTTP', () => {
 
 	teardown(() => sinon.restore());
 
-	function createHandle(respond: Responder) {
+	/** @param getToken Answers the token requests of the authorization flow; defaults to one fixed token. */
+	function createHandle(respond: Responder, getToken: () => Promise<string> = async () => 'test-access-token') {
 		const requests: IRecordedRequest[] = [];
 		const messages: string[] = [];
 		const aborts: IMcpRequestAbort[] = [];
@@ -104,7 +109,7 @@ suite('ExtHostMcp - dual-era Streamable HTTP', () => {
 			}
 			override $onDidAbortRequest(_id: number, abort: IMcpRequestAbort): void { aborts.push(abort); }
 			override $onDidPublishLog(_id: number, _level: LogLevel, message: string): void { logs.push(message); }
-			override async $getTokenFromServerMetadata(): Promise<string> { return 'test-access-token'; }
+			override $getTokenFromServerMetadata(): Promise<string> { return getToken(); }
 			override $logMcpAuthSetup(): void { }
 		}, {
 			async $checkMcpServerAllowed(): Promise<string | undefined> { return undefined; }
@@ -336,6 +341,96 @@ suite('ExtHostMcp - dual-era Streamable HTTP', () => {
 			assert.ok(!states.some(s => s.state === McpConnectionState.Kind.Error), 'one failed request does not fail the connection');
 		});
 
+		test('once the server speaks 2026-07-28, an HTTP error with a JSON-RPC error body is the answer to the request', async () => {
+			const readMissing = JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'resources/read', params: { uri: 'test://missing' } });
+			const notFound = { code: -32602, message: 'Resource not found', data: { uri: 'test://missing' } };
+			const answers = [
+				{ status: 400, body: JSON.stringify({ jsonrpc: '2.0', id: 2, error: notFound }) },
+				{ status: 400, body: JSON.stringify({ jsonrpc: '2.0', id: null, error: notFound }) },
+				// A placeholder id still answers the one request of the POST.
+				{ status: 400, body: JSON.stringify({ jsonrpc: '2.0', id: 'server-error', error: notFound }) },
+				{ status: 500, body: JSON.stringify({ jsonrpc: '2.0', id: 2, error: { code: -32603, message: 'Internal error' } }) },
+			];
+			for (const answer of answers) {
+				const { handle, messages, aborts, states } = createHandle((_req, index) => index === 0
+					? response({ headers: { 'Content-Type': 'application/json' }, body: resultFor(1) })
+					: response({ status: answer.status, headers: { 'Content-Type': 'application/json' }, body: answer.body }));
+				await handle.send(toolsCall, modernEnvelope({ method: 'tools/call' }));
+				await handle.send(readMissing, modernEnvelope({ requestId: 2, method: 'resources/read' }));
+				const expected = { ...JSON.parse(answer.body), id: 2 };
+				assert.deepStrictEqual(messages.map(m => JSON.parse(m)), [JSON.parse(resultFor(1)), expected], answer.body);
+				assert.deepStrictEqual(aborts, [], answer.body);
+				assert.ok(!states.some(s => s.state === McpConnectionState.Kind.Error), answer.body);
+			}
+		});
+
+		test('once the server speaks 2026-07-28, an HTTP error without a JSON-RPC error body, or one the request may outlive, still aborts with http-status', async () => {
+			const answers = [
+				{ status: 400, body: 'Bad Request' },
+				{ status: 400, body: JSON.stringify({ jsonrpc: '2.0', id: 2, result: {} }) },
+				{ status: 400, body: JSON.stringify([{ jsonrpc: '2.0', id: 2, error: { code: -32602, message: 'x' } }]) },
+				// A REST error of a front end, not JSON-RPC.
+				{ status: 400, body: JSON.stringify({ error: { code: 400, message: 'x', status: 'INVALID_ARGUMENT' } }) },
+				// Timeouts, rate limits and unavailable upstreams stay aborts (a listen stream reconnects after one).
+				...[408, 429, 502, 503, 504].map(status => ({ status, body: JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message: 'x' } }) })),
+				{ status: 429, body: JSON.stringify({ error: { code: 429, message: 'x', status: 'RESOURCE_EXHAUSTED' } }) },
+			];
+			for (const answer of answers) {
+				const { handle, messages, aborts } = createHandle((_req, index) => index === 0
+					? response({ headers: { 'Content-Type': 'application/json' }, body: resultFor(1) })
+					: response({ status: answer.status, body: answer.body }));
+				await handle.send(toolsCall, modernEnvelope({ method: 'tools/call' }));
+				await handle.send(toolsCall.replace('"id":1', '"id":2'), modernEnvelope({ requestId: 2, method: 'tools/call' }));
+				assert.deepStrictEqual(messages, [resultFor(1)], answer.body);
+				assert.deepStrictEqual(aborts.map(a => [a.requestId, a.reason, a.httpStatus]), [[2, 'http-status', answer.status]], `${answer.status} ${answer.body}`);
+			}
+		});
+
+		test('a request whose fetch fails (a network error) is aborted with transport-error, and the next request is sent as usual', async () => {
+			const { handle, requests, messages, aborts, states } = createHandle((_req, index) => {
+				if (index === 0) {
+					throw new TypeError('fetch failed', { cause: new Error('connect ECONNREFUSED 93.184.215.14:443') });
+				}
+				return response({ headers: { 'Content-Type': 'application/json' }, body: resultFor(2) });
+			});
+			await handle.send(toolsCall, modernEnvelope({ method: 'tools/call' }));
+			assert.deepStrictEqual(aborts, [{ requestId: 1, reason: 'transport-error', message: 'TypeError: fetch failed: connect ECONNREFUSED 93.184.215.14:443' }]);
+			assert.deepStrictEqual(states, [{ state: McpConnectionState.Kind.Running }], 'the connection neither fails nor stops');
+
+			await handle.send(toolsCall.replace('"id":1', '"id":2'), modernEnvelope({ requestId: 2, method: 'tools/call' }));
+			assert.strictEqual(requests.length, 2, 'the handle was not disposed');
+			assert.deepStrictEqual(messages, [resultFor(2)]);
+			assert.strictEqual(aborts.length, 1);
+			assert.deepStrictEqual(states, [{ state: McpConnectionState.Kind.Running }]);
+		});
+
+		test('a request cancelled because the sign-in needs the user releases the connection without an error', async () => {
+			// The token request has published the Stopped state (needs-user-interaction) and throws a cancellation.
+			const { handle, aborts, states, logs } = createHandle(() => { throw new CancellationError(); });
+			await handle.send(toolsCall, modernEnvelope({ method: 'tools/call' }));
+			assert.deepStrictEqual(aborts.map(a => [a.requestId, a.reason]), [[1, 'transport-error']]);
+			assert.deepStrictEqual(states, [{ state: McpConnectionState.Kind.Running }], 'no Error over the Stopped state');
+			assert.ok(!logs.some(l => l.startsWith('Error sending')), JSON.stringify(logs));
+			assert.ok((handle as unknown as { _store: { isDisposed: boolean } })._store.isDisposed, 'the handle is released');
+		});
+
+		test('a notification whose fetch fails leaves the connection up', async () => {
+			const { handle, requests, messages, aborts, states, logs } = createHandle((_req, index) => {
+				if (index === 0) {
+					throw new TypeError('fetch failed');
+				}
+				return response({ headers: { 'Content-Type': 'application/json' }, body: resultFor(1) });
+			});
+			await handle.send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 9 } }), modernEnvelope({ kind: 'notification', requestId: undefined, method: 'notifications/cancelled' }));
+			assert.deepStrictEqual(aborts, [], 'there is no request to abort');
+			assert.deepStrictEqual(states, [{ state: McpConnectionState.Kind.Running }]);
+			assert.ok(logs.some(l => l.startsWith('Error sending notifications/cancelled to https://example.com/mcp: TypeError: fetch failed')), JSON.stringify(logs));
+
+			await handle.send(toolsCall, modernEnvelope({ method: 'tools/call' }));
+			assert.strictEqual(requests.length, 2);
+			assert.deepStrictEqual(messages, [resultFor(1)]);
+		});
+
 		test('cancelRequest aborts the in-flight request without reporting an abort', async () => {
 			const gate = new DeferredPromise<CommonResponse>();
 			const { handle, requests, aborts } = createHandle(req => {
@@ -370,6 +465,64 @@ suite('ExtHostMcp - dual-era Streamable HTTP', () => {
 		});
 	});
 
+	suite('terminal authorization failures', () => {
+		/** Answers every request, the MCP server's and the authorization metadata requests, from `fixture`. */
+		const fromFixture = (fixture: IOAuthFixture): Responder => async req => {
+			const answer = await fixture.fetch(req.url, { method: req.method, headers: req.headers, body: req.body });
+			const headers = new Headers();
+			for (const name of ['www-authenticate', 'content-type']) {
+				const value = answer.headers.get(name);
+				if (value !== null) {
+					headers.set(name, value);
+				}
+			}
+			return { status: answer.status, statusText: answer.statusText ?? '', headers, body: null, url: req.url, json: () => answer.json(), text: () => answer.text() };
+		};
+		const toolsList = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
+
+		const cases: { readonly name: string; readonly envelope: IMcpMessageEnvelope; readonly fixture: () => IOAuthFixture; readonly getToken?: () => Promise<string>; readonly error: RegExp }[] = [
+			{
+				name: 'a 2026-07-28 request whose protected resource metadata names another resource (resource_mismatch)',
+				envelope: modernEnvelope(),
+				fixture: () => createOAuthFixture({ rs: { resource: TEST_MCP_URL, prmResource: 'https://evil.example.com/mcp' } }),
+				error: /^Error sending message to https:\/\/example\.com\/mcp: OAuthClientError: The protected resource metadata at .* names resource 'https:\/\/evil\.example\.com\/mcp'/,
+			},
+			{
+				name: 'a 2026-07-28 request whose token request fails with a terminal error from the main thread (iss_mismatch)',
+				envelope: modernEnvelope(),
+				fixture: () => createOAuthFixture({ rs: { resource: TEST_MCP_URL } }),
+				// How a terminal OAuthClientError of the main thread arrives over the RPC protocol: by name.
+				getToken: async () => { throw Object.assign(new Error('The authorization response iss parameter does not match'), { name: 'OAuthClientError' }); },
+				error: /^Error sending message to https:\/\/example\.com\/mcp: OAuthClientError: The authorization response iss parameter does not match$/,
+			},
+			{
+				name: 'a 2025-11-25 request whose protected resource metadata names another resource (resource_mismatch)',
+				envelope: legacyEnvelope({ method: 'tools/list' }),
+				fixture: () => createOAuthFixture({ rs: { resource: TEST_MCP_URL, prmResource: 'https://evil.example.com/mcp' } }),
+				error: /^Error sending message to https:\/\/example\.com\/mcp: OAuthClientError: The protected resource metadata at .* names resource 'https:\/\/evil\.example\.com\/mcp'/,
+			},
+		];
+		for (const { name, envelope, fixture, getToken, error } of cases) {
+			test(`${name} fails the request and the connection`, async () => {
+				const server = fixture();
+				const { handle, requests, aborts, states } = createHandle(fromFixture(server), getToken);
+				await handle.send(toolsList, envelope);
+
+				assert.deepStrictEqual(server.rs.accesses.map(a => a.status), [401], 'the request was challenged once and not sent again');
+				assert.deepStrictEqual(aborts.map(a => [a.requestId, a.reason]), [[1, 'transport-error']]);
+				assert.deepStrictEqual(states.map(s => s.state), [McpConnectionState.Kind.Running, McpConnectionState.Kind.Error]);
+				const failed = states[1];
+				assert.ok(failed.state === McpConnectionState.Kind.Error && error.test(failed.message), JSON.stringify(failed));
+
+				// The handle is disposed: nothing more goes on the wire.
+				const sent = requests.length;
+				await handle.send(toolsList.replace('"id":1', '"id":2'), { ...envelope, requestId: 2 });
+				assert.strictEqual(requests.length, sent);
+			});
+		}
+
+	});
+
 	suite('legacy era', () => {
 		test('a message without an envelope goes on the wire exactly as before', async () => {
 			const { handle, requests } = createHandle(req => req.method === 'GET' ? response({ status: 405 }) : response({ status: 202 }));
@@ -377,6 +530,35 @@ suite('ExtHostMcp - dual-era Streamable HTTP', () => {
 			const post = requests[0];
 			assert.deepStrictEqual(Object.keys(post.headers).sort(), ['Accept', 'Content-Type', 'X-Custom', 'user-agent'].sort());
 			assert.strictEqual(post.headers['MCP-Protocol-Version'], undefined);
+		});
+
+		test('golden: without an envelope, initialize and tools/list go on the wire byte for byte as recorded', async () => {
+			// The harness serves the recorded server: same URL, same configured headers.
+			assert.deepStrictEqual([TEST_MCP_URL, [['X-Custom', 'configured']]], [LEGACY_FRAMES_URL, LEGACY_FRAMES_CONFIGURED_HEADERS]);
+			const backchannel = new DeferredPromise<void>();
+			const { handle, requests, messages } = createHandle(req => {
+				if (req.method === 'GET') {
+					backchannel.complete();
+					return response({ status: 405 });
+				}
+				if (req.body === LEGACY_INITIALIZE_FRAME) {
+					return response({ headers: { 'Content-Type': 'application/json', 'Mcp-Session-Id': LEGACY_FRAMES_SESSION_ID }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-11-25', capabilities: { tools: {} }, serverInfo: { name: 's', version: '1' } } }) });
+				}
+				if (req.body === LEGACY_TOOLS_LIST_FRAME) {
+					return response({ headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 2, result: { tools: [] } }) });
+				}
+				return response({ status: 202 });
+			});
+			await handle.send(LEGACY_INITIALIZE_FRAME);
+			await backchannel.p;
+			await handle.send(LEGACY_INITIALIZED_FRAME);
+			await handle.send(LEGACY_TOOLS_LIST_FRAME);
+			assert.strictEqual(messages.length, 2, 'the server answered initialize and tools/list');
+
+			const asRecorded = (request: IRecordedRequest): IRecordedHttpRequest => ({ method: request.method, url: request.url, headers: Object.entries(request.headers), body: request.body });
+			const recorded = legacyHttpRequests(`${product.nameLong}/${product.version}`);
+			assert.deepStrictEqual(requests.filter(r => r.method === 'POST').map(asRecorded), [recorded.initialize, recorded.initialized, recorded.toolsList]);
+			assert.deepStrictEqual(requests.filter(r => r.method === 'GET').map(asRecorded), [recorded.backchannel]);
 		});
 
 		test('a legacy envelope adds the protocol version header to POST and the GET backchannel', async () => {

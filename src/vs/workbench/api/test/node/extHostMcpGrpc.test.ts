@@ -2150,6 +2150,44 @@ suite('ExtHostMcpService - the mcpGrpcServerDefinition proposal', () => {
 		]);
 	});
 
+	test('a McpGrpcServerDefinition whose tls or binding has the wrong type fails the server data validation, and nothing is upserted', async function () {
+		// As above: the rejection is observed through process 'unhandledRejection', which the Electron unit-test renderer does not use.
+		if (process.versions.electron) {
+			this.skip();
+		}
+		// Extensions written in JavaScript can pass anything.
+		const definitionWith = (tls: unknown, binding: unknown) => new McpGrpcServerDefinition('server', URI.parse('grpcs://mcp.example:443'), undefined, undefined, tls as McpGrpcServerDefinition['tls'], binding as McpGrpcBinding | undefined);
+		const cases: [string, McpGrpcServerDefinition][] = [
+			['tls is a string', definitionWith('x', undefined)],
+			['tls.insecure is a string', definitionWith({ insecure: 'yes' }, undefined)],
+			['binding is a string', definitionWith(undefined, 'typed')],
+			['binding is a number outside the enum', definitionWith(undefined, 7)],
+			['well-formed', definitionWith({ ca: '/certs/ca.pem', insecure: false, serverName: 'mcp.example' }, McpGrpcBinding.Typed)],
+		];
+		const outcomes: Record<string, unknown> = {};
+		for (const [name, definition] of cases) {
+			const upserts: IUpsert[] = [];
+			const service = createService(upserts);
+			const rejections = await unhandledRejectionsOf(async () => {
+				store.add(service.registerMcpConfigurationProvider(extensionWith(['mcpGrpcServerDefinition']), 'servers', { provideMcpServerDefinitions: () => [definition] }));
+				await service.$waitForInitialCollectionProviders();
+			});
+			const launch = upserts.length ? await service.$resolveMcpLaunch(upserts[0].collectionId, 'server') : undefined;
+			outcomes[name] = {
+				upserts: upserts.map(u => u.launchTypes),
+				rejections: rejections.map(r => r instanceof Error ? r.message : String(r)),
+				...(launch?.type === McpServerTransportType.Grpc ? { tls: launch.tls, binding: launch.binding } : {}),
+			};
+		}
+		assert.deepStrictEqual(outcomes, {
+			'tls is a string': { upserts: [], rejections: [`Error in property 'tls': Expected object`] },
+			'tls.insecure is a string': { upserts: [], rejections: [`Error in property 'tls': Error in property 'insecure': Expected boolean, but got string`] },
+			'binding is a string': { upserts: [], rejections: [`Error in property 'binding': Expected McpGrpcBinding.Auto, .Tunnel or .Typed, but got string`] },
+			'binding is a number outside the enum': { upserts: [], rejections: [`Error in property 'binding': Expected McpGrpcBinding.Auto, .Tunnel or .Typed, but got 7`] },
+			'well-formed': { upserts: [[McpServerTransportType.Grpc]], rejections: [], tls: { ca: '/certs/ca.pem', insecure: false, serverName: 'mcp.example' }, binding: 'typed' },
+		});
+	});
+
 	test('a gRPC definition whose URI is not grpc:// or grpcs:// is left out with an error, and the other servers of the provider stay', async () => {
 		const upserts: IUpsert[] = [];
 		const log = new ErrorCapturingLogService();

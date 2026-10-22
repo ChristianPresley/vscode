@@ -14,7 +14,7 @@ import { AUTH_SCOPE_SEPARATOR, IAuthorizationProtectedResourceMetadata, IAuthori
 import { IOAuthClientRecord, IOAuthClientStorage, OAuthLogLevel, parseBearerChallenge, redact } from '../../../base/common/oauthClient.js';
 import { SSEParser } from '../../../base/common/sseParser.js';
 import { URI, UriComponents } from '../../../base/common/uri.js';
-import { vArray, vBoolean, vNumber, vObj, vObjAny, vOptionalProp, vString } from '../../../base/common/validation.js';
+import { IValidator, vArray, vBoolean, vNumber, vObj, vObjAny, vOptionalProp, vString } from '../../../base/common/validation.js';
 import { localize } from '../../../nls.js';
 import { ConfigurationTarget } from '../../../platform/configuration/common/configuration.js';
 import { ExtensionIdentifier, IExtensionDescription } from '../../../platform/extensions/common/extensions.js';
@@ -57,6 +57,18 @@ export interface IExtHostMpcService extends ExtHostMcpShape {
 	startMcpGateway(chatSessionResource: URI | undefined, options: vscode.McpGatewayStartOptions | undefined): Promise<vscode.McpGateway | undefined>;
 }
 
+/** A value of the proposed `McpGrpcBinding` enum (Auto = 1, Tunnel = 2, Typed = 3); any other number is invalid too. */
+const vGrpcBinding: IValidator<number> = {
+	validate(content: unknown) {
+		return content === 1 || content === 2 || content === 3
+			? { content, error: undefined }
+			: { content: undefined, error: { message: `Expected McpGrpcBinding.Auto, .Tunnel or .Typed, but got ${typeof content === 'number' ? content : typeof content}` } };
+	},
+	getJSONSchema() {
+		return { enum: [1, 2, 3] };
+	},
+};
+
 const serverDataValidation = vObj({
 	label: vString(),
 	version: vOptionalProp(vString()),
@@ -78,7 +90,7 @@ const serverDataValidation = vObj({
 		insecure: vOptionalProp(vBoolean()),
 		serverName: vOptionalProp(vString()),
 	})),
-	binding: vOptionalProp(vNumber()),
+	binding: vOptionalProp(vGrpcBinding),
 });
 
 // Can be validated with:
@@ -451,6 +463,22 @@ function tryParseJson(text: string): unknown {
 	}
 }
 
+/**
+ * HTTP error statuses whose JSON-RPC body, if any, is not the server's answer to
+ * the request: the authorization flow (401, 403) and conditions the request may
+ * outlive (a timeout, a rate limit, an unavailable upstream).
+ */
+const NOT_AN_ANSWER_STATUS_CODES: ReadonlySet<number> = new Set([401, 403, 408, 429, 502, 503, 504]);
+
+/** True when `body` is one JSON-RPC 2.0 error response: an object with `jsonrpc: "2.0"` whose `error` has a numeric `code`. */
+function isJsonRpcErrorResponse(body: unknown): body is { jsonrpc: '2.0'; error: { code: number } } {
+	if (typeof body !== 'object' || body === null || Array.isArray(body) || (body as { jsonrpc?: unknown }).jsonrpc !== '2.0') {
+		return false;
+	}
+	const error = (body as { error?: unknown }).error;
+	return typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'number';
+}
+
 /** True when `data` (one JSON-RPC message or a batch) carries the response to `requestId`. */
 function isResponseFor(data: string, requestId: JsonRpcId): boolean {
 	const parsed = tryParseJson(data);
@@ -481,7 +509,12 @@ function asResponseToRequest(text: string, body: unknown, requestId: JsonRpcId |
 	if (Array.isArray(body)) {
 		return body.some(lacksId) ? JSON.stringify(body.map(message => lacksId(message) ? { ...message, id: requestId } : message)) : text;
 	}
-	return lacksId(body) ? JSON.stringify({ ...body, id: requestId }) : text;
+	// A single error answers the one request of the POST whatever id it carries
+	// (some servers put a placeholder such as "server-error" there).
+	const answersOtherId = typeof body === 'object' && body !== null
+		&& Object.prototype.hasOwnProperty.call(body, 'error')
+		&& (body as { id?: unknown }).id !== requestId;
+	return lacksId(body) || answersOtherId ? JSON.stringify({ ...body as Record<string, unknown>, id: requestId }) : text;
 }
 
 /** The outcome of a legacy HTTP+SSE attachment: the message endpoint the server named, or why there is none. */
@@ -550,6 +583,9 @@ function isSameSocketEndpoint(url: string, configuredUrl: string): boolean {
  * rejection still tries the HTTP+SSE fallback; when that fails too, the
  * enveloped request is aborted rather than the server failed, and the engine
  * renegotiates (a hinted handshake) or fails the start.
+ * A 2026-07-28 request that cannot be sent (a network error) is aborted with
+ * `transport-error` and the connection stays up; a legacy one, or a terminal
+ * authorization failure in either revision, fails the connection.
  */
 export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 	private readonly _requestSequencer = new Sequencer();
@@ -617,6 +653,21 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 			}
 			if (envelope?.requestId !== undefined) {
 				this._abortRequest(envelope, { reason: 'transport-error', message: stringifyError(err) });
+			}
+			// A 2026-07-28 request has no session that its failure (a network error,
+			// for instance) could have broken: only that request fails, and the next
+			// one is sent as usual. A terminal authorization failure still fails the
+			// connection, in either revision.
+			if (era === 'modern' && envelope && !isTerminalAuthorizationError(err)) {
+				if (isCancellationError(err)) {
+					// The sign-in needs the user: the Stopped state was published and this
+					// connection is done, so release it (and its other in-flight requests)
+					// without reporting an error over that state.
+					this.dispose();
+					return;
+				}
+				this._log(LogLevel.Warning, `Error sending ${envelope.method} to ${this._launch.uri}: ${stringifyError(err)}`);
+				return;
 			}
 			this._handleSendError(err);
 		}
@@ -779,6 +830,21 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 			if (this._mode.value === HttpMode.Unknown) {
 				this._log(LogLevel.Info, `${res.status} status for a ${envelope.protocolVersion} request to ${this._launch.uri}; the server does not speak this revision`);
 				this._abortRequest(envelope, { reason: 'legacy-probe', httpStatus: res.status, message: errText });
+				return;
+			}
+		}
+
+		// A server known to speak 2026-07-28 may answer a request with an HTTP error
+		// status and a JSON-RPC error in the body (-32602 with a 400 for a resource
+		// that does not exist, for instance): that error is the server's answer, so
+		// deliver it. 401/403 belong to the authorization flow, which already ran;
+		// a timeout, rate limit or unavailable upstream stays an abort, which the
+		// engine may retry (a listen stream reconnects; gRPC maps them to UNAVAILABLE).
+		if (this._mode.value === HttpMode.Modern && envelope.requestId !== undefined && !NOT_AN_ANSWER_STATUS_CODES.has(res.status)) {
+			const body = tryParseJson(errText);
+			if (isJsonRpcErrorResponse(body)) {
+				this._untrackRequest(envelope);
+				this._proxy.$onDidReceiveMessage(this._id, asResponseToRequest(errText, body, envelope.requestId));
 				return;
 			}
 		}
