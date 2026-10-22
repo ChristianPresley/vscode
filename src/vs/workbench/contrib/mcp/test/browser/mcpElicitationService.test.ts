@@ -20,7 +20,7 @@ import { TestInstantiationService } from '../../../../../platform/instantiation/
 import { MockContextKeyService } from '../../../../../platform/keybinding/test/common/mockKeybindingService.js';
 import { ILogService, NullLogService } from '../../../../../platform/log/common/log.js';
 import { McpProtocolEra } from '../../../../../platform/mcp/common/mcpProtocolVersions.js';
-import { INotification, INotificationHandle, INotificationService } from '../../../../../platform/notification/common/notification.js';
+import { INotification, INotificationHandle, INotificationService, NoOpNotification } from '../../../../../platform/notification/common/notification.js';
 import { TestNotificationService } from '../../../../../platform/notification/test/common/testNotificationService.js';
 import { IOpenerService, OpenExternalOptions, OpenInternalOptions } from '../../../../../platform/opener/common/opener.js';
 import { IQuickInputService } from '../../../../../platform/quickinput/common/quickInput.js';
@@ -46,11 +46,21 @@ class RecordingLogService extends NullLogService {
 	}
 }
 
+class RecordingNotificationHandle extends NoOpNotification {
+	closed = 0;
+	override close(): void {
+		this.closed++;
+	}
+}
+
 class RecordingNotificationService extends TestNotificationService {
 	readonly notifications: INotification[] = [];
+	readonly handles: RecordingNotificationHandle[] = [];
 	override notify(notification: INotification): INotificationHandle {
 		this.notifications.push(notification);
-		return super.notify(notification);
+		const handle = new RecordingNotificationHandle();
+		this.handles.push(handle);
+		return handle;
 	}
 }
 
@@ -457,6 +467,39 @@ suite('McpElicitationService', () => {
 			result.dispose();
 		});
 
+		test('Cancel in the notification answers decline, closes it and opens nothing', async () => {
+			// Cancel is a secondary action (More Actions...), which does not close a notification by itself;
+			// left open, its Open URL would still open the declined URL.
+			const { server } = createServer('modern');
+			const pending = service.elicit(server, undefined, urlElicitation('https://example.com/auth'), CancellationToken.None);
+			const notification = notificationService.notifications[0];
+			assert.deepStrictEqual([notification.actions?.primary?.map(a => a.label), notification.actions?.secondary?.map(a => a.label)], [['Open URL'], ['Cancel']]);
+			await notification.actions!.secondary![0].run();
+			const result = await pending;
+			assert.deepStrictEqual({ value: result.value, closed: notificationService.handles[0].closed, opened: opened.length }, { value: { action: 'decline' }, closed: 1, opened: 0 });
+			result.dispose();
+		});
+
+		test('Open URL in the notification opens the URL and closes it', async () => {
+			const { server } = createServer('modern');
+			const pending = service.elicit(server, undefined, urlElicitation('https://example.com/auth'), CancellationToken.None);
+			await notificationService.notifications[0].actions!.primary![0].run();
+			const result = await pending;
+			assert.deepStrictEqual({ value: result.value, closed: notificationService.handles[0].closed, opened: opened.map(o => o.target) }, { value: { action: 'accept' }, closed: 1, opened: ['https://example.com/auth'] });
+			result.dispose();
+		});
+
+		test('a cancelled call closes the URL notification and answers cancel', async () => {
+			const { server } = createServer('modern');
+			const cts = store.add(new CancellationTokenSource());
+			const pending = service.elicit(server, undefined, urlElicitation('https://example.com/auth'), cts.token);
+			assert.strictEqual(notificationService.handles[0].closed, 0);
+			cts.cancel();
+			const result = await pending;
+			assert.deepStrictEqual({ value: result.value, closed: notificationService.handles[0].closed, opened: opened.length }, { value: { action: 'cancel' }, closed: 1, opened: 0 });
+			result.dispose();
+		});
+
 		suite('form without properties', () => {
 			const consent: MCPLegacy.ElicitRequestFormParams = { mode: 'form', message: 'Delete the branch?', requestedSchema: { type: 'object', properties: {} } };
 
@@ -518,10 +561,28 @@ suite('McpElicitationService', () => {
 				const second = service.elicit(server, undefined, consent, CancellationToken.None);
 				await notificationService.notifications[1].actions!.secondary![0].run();
 				assert.deepStrictEqual((await second).value, { action: 'decline' });
+
+				const third = service.elicit(server, undefined, consent, CancellationToken.None);
+				await notificationService.notifications[2].actions!.secondary![1].run();
+				assert.deepStrictEqual((await third).value, { action: 'cancel' });
+				// Each notification is closed once it is answered, a secondary action (Decline, Cancel) included.
+				assert.deepStrictEqual(notificationService.handles.map(h => h.closed), [1, 1, 1]);
 			});
 		});
 
 		suite('form with properties', () => {
+			test('without a chat session, Cancel in the notification answers decline and closes it', async () => {
+				const { server } = createServer('modern');
+				const params: MCPLegacy.ElicitRequestFormParams = { mode: 'form', message: 'Your name', requestedSchema: { type: 'object', properties: { name: { type: 'string' } } } };
+				const pending = service.elicit(server, undefined, params, CancellationToken.None);
+				const notification = notificationService.notifications[0];
+				assert.deepStrictEqual([notification.actions?.primary?.map(a => a.label), notification.actions?.secondary?.map(a => a.label)], [['Respond'], ['Cancel']]);
+				await notification.actions!.secondary![0].run();
+				const result = await pending;
+				assert.deepStrictEqual({ value: result.value, closed: notificationService.handles[0].closed }, { value: { action: 'decline' }, closed: 1 });
+				result.dispose();
+			});
+
 			test('pre-fills defaults (SEP-1034) and converts the answers', async () => {
 				const { server } = createServer('modern');
 				const chat = createChat();

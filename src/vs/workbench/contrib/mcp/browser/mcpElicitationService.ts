@@ -8,7 +8,7 @@ import { assertNever, softAssertNever } from '../../../../base/common/assert.js'
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { CancellationError } from '../../../../base/common/errors.js';
 import { MarkdownString } from '../../../../base/common/htmlContent.js';
-import { DisposableStore } from '../../../../base/common/lifecycle.js';
+import { DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
 import { autorun } from '../../../../base/common/observable.js';
 import { isDefined } from '../../../../base/common/types.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
@@ -353,6 +353,7 @@ export class McpElicitationService implements IMcpElicitationService {
 			});
 			store.add(handle.onDidClose(() => resolve({ action: 'cancel' })));
 			store.add(token.onCancellationRequested(() => resolve({ action: 'cancel' })));
+			store.add(toDisposable(() => handle.close()));
 
 		}).finally(() => store.dispose());
 
@@ -420,6 +421,7 @@ export class McpElicitationService implements IMcpElicitationService {
 			});
 			store.add(handle.onDidClose(() => resolve({ action: 'cancel' })));
 			store.add(token.onCancellationRequested(() => resolve({ action: 'cancel' })));
+			store.add(toDisposable(() => handle.close()));
 		}).finally(() => store.dispose());
 
 		return { kind: ElicitationKind.Form, value, dispose: () => part?.hide() };
@@ -515,6 +517,9 @@ export class McpElicitationService implements IMcpElicitationService {
 				});
 				store.add(handle.onDidClose(() => resolve({ action: 'cancel' })));
 				store.add(token.onCancellationRequested(() => resolve({ action: 'cancel' })));
+				// A secondary action (Cancel) or a cancelled call answers without closing the
+				// notification, and its Open URL would still open the URL: close it once answered.
+				store.add(toDisposable(() => handle.close()));
 			}
 		}).finally(() => store.dispose());
 
