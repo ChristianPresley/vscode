@@ -50,7 +50,7 @@ function readRun(runsDir: string, id: string, exitCode: number | undefined): IRu
 	const dir = path.join(runsDir, id);
 	const tests = new Map<string, ITestRow>();
 	let failedScreenshots = 0;
-	for (const suite of ['api', 'ui']) {
+	for (const suite of ['api', 'ui', 'policy']) {
 		const results = readJson<{ tests: ITestRow[]; screenshots?: { ok: boolean }[] }>(path.join(dir, suite, `${suite}-results.json`));
 		for (const t of results?.tests ?? []) {
 			tests.set(`${suite}: ${t.name}`, t);

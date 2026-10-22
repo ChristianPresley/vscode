@@ -5,12 +5,12 @@
 
 // Prints the results of one run and writes <run dir>/summary.json and summary.md.
 // Exit code: 0 when every test passed (or failed in an allowed group, or was skipped) and every
-// screenshot of the UI suite passed its DOM checks, 1 when a test or a screenshot failed (a
+// screenshot of the UI suite and the policy phase passed its DOM checks, 1 when a test or a screenshot failed (a
 // screenshot whose checks failed, a screenshot section that threw, or a screenshot the UI never
 // showed; `visual` in MCP_E2E_ALLOW_FAIL reports them as allowed failures), 2 when a suite produced
 // no results.
 //
-// Usage: node runner/summarize.ts <run dir> [--api-exit <code>] [--ui-exit <code>]
+// Usage: node runner/summarize.ts <run dir> [--api-exit <code>] [--ui-exit <code>] [--policy-exit <code>]
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -126,12 +126,14 @@ function main(argv: readonly string[]): number {
 	const allowFail = (process.env.MCP_E2E_ALLOW_FAIL ?? '').split(',').map(s => s.trim()).filter(Boolean);
 	const runDir = argv[0];
 	if (!runDir) {
-		console.error('usage: summarize.ts <run dir> [--api-exit <code>] [--ui-exit <code>]');
+		console.error('usage: summarize.ts <run dir> [--api-exit <code>] [--ui-exit <code>] [--policy-exit <code>]');
 		return 2;
 	}
 	const suites: { name: string; file: string; exit: string | undefined }[] = [
 		{ name: 'api', file: path.join(runDir, 'api', 'api-results.json'), exit: argValue(argv, '--api-exit') },
 		{ name: 'ui', file: path.join(runDir, 'ui', 'ui-results.json'), exit: argValue(argv, '--ui-exit') },
+		// The enterprise policy phase (ui/policy.ts).
+		{ name: 'policy', file: path.join(runDir, 'policy', 'policy-results.json'), exit: argValue(argv, '--policy-exit') },
 	];
 	const md: string[] = [`# MCP end-to-end run ${path.basename(runDir)}`, ''];
 	let code = 0;

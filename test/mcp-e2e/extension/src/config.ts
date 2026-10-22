@@ -87,6 +87,12 @@ export interface IE2eEnvironment {
 	readonly mutations: ReadonlySet<string>;
 	/** The throw-away CA of the grpcs:// servers (MCP_E2E_TLS_DIR/ca.pem), for the API definitions. */
 	readonly tlsCa: string | undefined;
+	/**
+	 * Whether the UI-mode control server starts the configured servers itself before it is ready
+	 * (default). `MCP_E2E_START_SERVERS=0` (the policy phase, ui/policy.ts): ready at once, the
+	 * driver starts each server.
+	 */
+	readonly startServers: boolean;
 }
 
 /** Features that older builds lack: only a test that requires one of them, on a build without it, may skip. */
@@ -122,6 +128,7 @@ export function readEnvironment(): IE2eEnvironment {
 		expected: expectedFeatures(),
 		mutations: new Set(list(process.env.MCP_E2E_MUTATIONS)),
 		tlsCa: process.env.MCP_E2E_TLS_DIR ? path.join(process.env.MCP_E2E_TLS_DIR, 'ca.pem') : undefined,
+		startServers: process.env.MCP_E2E_START_SERVERS !== '0',
 	};
 }
 

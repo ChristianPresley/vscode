@@ -20,8 +20,12 @@ const CURSOR = '$CURSOR$';
  * workbench commands that have no UI entry point (for example opening the
  * output channel of one MCP server).
  *
- * - `GET /ready` -> `{ ready, outcomes }`
+ * - `GET /ready` -> `{ ready, outcomes }` (with `MCP_E2E_START_SERVERS=0` ready at once, without outcomes)
  * - `GET /tools?server=<label>` -> the tool ids of a server
+ * - `GET /config?key=<setting>` -> `{ key, value, inspect }`: the effective value and the extension
+ *   API's `inspect` (whose `defaultValue` is the policy value when a policy sets the setting)
+ * - `GET /documents?contains=<text>` -> `[{ uri, languageId, text }]` of the open text documents
+ *   (untitled ones included) whose text contains `<text>`
  * - `POST /scenario { id }` -> the test result of a UI scenario
  * - `POST /command { command, args, wait? }` -> `{ ok, result | error }` (`wait: false` answers at once)
  * - `POST /open { path }` -> opens a file in an editor
@@ -29,8 +33,11 @@ const CURSOR = '$CURSOR$';
  */
 export function startControlServer(h: E2eHarness, port: number): vscode.Disposable {
 	const scenarios = uiScenarios(h);
-	let ready = false;
-	h.startServers().then(() => { ready = true; }, e => log(`starting the servers failed: ${e}`));
+	// The policy phase (ui/policy.ts) starts each server itself, one start per server.
+	let ready = !h.env.startServers;
+	if (h.env.startServers) {
+		h.startServers().then(() => { ready = true; }, e => log(`starting the servers failed: ${e}`));
+	}
 
 	const readBody = (req: http.IncomingMessage) => new Promise<Record<string, unknown>>((resolve, reject) => {
 		const chunks: Buffer[] = [];
@@ -55,12 +62,21 @@ export function startControlServer(h: E2eHarness, port: number): vscode.Disposab
 		try {
 			const url = new URL(req.url ?? '/', 'http://127.0.0.1');
 			if (req.method === 'GET' && url.pathname === '/ready') {
-				send(res, 200, { ready, outcomes: ready ? await h.startServers() : undefined });
+				send(res, 200, { ready, outcomes: ready && h.env.startServers ? await h.startServers() : undefined });
 			} else if (req.method === 'GET' && url.pathname === '/scenarios') {
 				// The id and test name of every UI scenario (the driver filters MCP_E2E_ONLY by both).
 				send(res, 200, [...scenarios].map(([id, test]) => ({ id, name: test.name })));
 			} else if (req.method === 'GET' && url.pathname === '/tools') {
 				send(res, 200, mcpToolsOf(url.searchParams.get('server') ?? '').map(t => t.name));
+			} else if (req.method === 'GET' && url.pathname === '/config') {
+				const key = url.searchParams.get('key') ?? '';
+				const configuration = vscode.workspace.getConfiguration();
+				send(res, 200, { key, value: configuration.get(key), inspect: configuration.inspect(key) });
+			} else if (req.method === 'GET' && url.pathname === '/documents') {
+				const contains = url.searchParams.get('contains') ?? '';
+				send(res, 200, vscode.workspace.textDocuments
+					.filter(d => d.getText().includes(contains))
+					.map(d => ({ uri: d.uri.toString(), languageId: d.languageId, text: d.getText() })));
 			} else if (req.method === 'POST' && url.pathname === '/scenario') {
 				const { id } = await readBody(req);
 				const test = typeof id === 'string' ? scenarios.get(id) : undefined;

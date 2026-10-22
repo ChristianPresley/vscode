@@ -19,13 +19,15 @@
 // MCP_E2E_SCREENSHOTS, MCP_E2E_PLAYWRIGHT (the folder Playwright is installed in),
 // MCP_E2E_CONTROL_PORT (default 47811), MCP_E2E_ONLY (comma-separated: scenario ids or test names,
 // `screenshots` for every screenshot section, `shot:<section name>` for one).
+//
+// The enterprise policy phase (ui/policy.ts) reuses `launch` and the helpers exported here.
 
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import type { ElectronApplication, Locator, Page } from 'playwright';
 
-interface ITestResult {
+export interface ITestResult {
 	name: string;
 	group: string;
 	status: 'passed' | 'failed' | 'skipped';
@@ -36,7 +38,7 @@ interface ITestResult {
 	details: Record<string, unknown>;
 }
 
-interface IScreenshot {
+export interface IScreenshot {
 	readonly file: string;
 	readonly title: string;
 	/** What must be visible (the rows of visual-verification.md). */
@@ -47,7 +49,7 @@ interface IScreenshot {
 	readonly note?: string;
 }
 
-const env = {
+export const env = {
 	app: process.env.MCP_E2E_APP ?? '/usr/share/code-oss/code-oss',
 	userData: process.env.MCP_E2E_USER_DATA ?? '/tmp/e2e/user-data-ui',
 	extensions: process.env.MCP_E2E_EXTENSIONS ?? '/tmp/e2e/extensions',
@@ -67,7 +69,7 @@ const { _electron } = requireFromTools('playwright') as typeof import('playwrigh
 const WIDTH = 1600;
 const HEIGHT = 1000;
 const tests: ITestResult[] = [];
-const screenshots: IScreenshot[] = [];
+export const screenshots: IScreenshot[] = [];
 /** Modal dialogs that showed up outside a scenario (and were dismissed). */
 const unexpectedDialogs: string[] = [];
 
@@ -75,11 +77,11 @@ function log(message: string): void {
 	console.log(`[ui] ${message}`);
 }
 
-function sleep(ms: number): Promise<void> {
+export function sleep(ms: number): Promise<void> {
 	return new Promise(r => setTimeout(r, ms));
 }
 
-async function control<T>(method: 'GET' | 'POST', route: string, body?: unknown, timeoutMs = 60_000): Promise<T> {
+export async function control<T>(method: 'GET' | 'POST', route: string, body?: unknown, timeoutMs = 60_000): Promise<T> {
 	const res = await fetch(`http://127.0.0.1:${env.port}${route}`, {
 		method,
 		headers: body === undefined ? undefined : { 'content-type': 'application/json' },
@@ -93,14 +95,14 @@ async function control<T>(method: 'GET' | 'POST', route: string, body?: unknown,
 	return JSON.parse(text) as T;
 }
 
-async function command(id: string, args: unknown[] = [], wait = true): Promise<void> {
+export async function command(id: string, args: unknown[] = [], wait = true): Promise<void> {
 	const result = await control<{ ok: boolean; error?: string }>('POST', '/command', { command: id, args, wait });
 	if (!result.ok) {
 		throw new Error(`${id} failed: ${result.error}`);
 	}
 }
 
-async function waitForControl(timeoutMs: number): Promise<unknown> {
+export async function waitForControl(timeoutMs: number): Promise<unknown> {
 	const deadline = Date.now() + timeoutMs;
 	let last: unknown;
 	while (Date.now() < deadline) {
@@ -118,7 +120,7 @@ async function waitForControl(timeoutMs: number): Promise<unknown> {
 	throw new Error(`the E2E extension's control server was not ready within ${timeoutMs}ms: ${String(last)}`);
 }
 
-async function visibleText(page: Page, selector: string): Promise<string> {
+export async function visibleText(page: Page, selector: string): Promise<string> {
 	const loc = page.locator(selector);
 	const n = await loc.count();
 	const out: string[] = [];
@@ -136,7 +138,7 @@ async function visibleText(page: Page, selector: string): Promise<string> {
  * exist in the DOM), read while scrolling the list (from its top) that holds the first row containing
  * `anchor` (default: the first row); scrolls back to the top afterwards.
  */
-async function listTextScrolled(page: Page, container: string, anchor?: string, maxSteps = 40): Promise<string> {
+export async function listTextScrolled(page: Page, container: string, anchor?: string, maxSteps = 40): Promise<string> {
 	const rows = page.locator(`${container} .monaco-list-row`);
 	const anchorRow = anchor ? rows.filter({ hasText: anchor }).first() : rows.first();
 	if (!await anchorRow.count()) {
@@ -209,7 +211,7 @@ async function rowWithText(page: Page, container: string, text: string, maxSteps
 }
 
 /** Records and dismisses a modal dialog (none is expected outside the scenarios). */
-async function dismissDialogs(page: Page): Promise<void> {
+export async function dismissDialogs(page: Page): Promise<void> {
 	const dialog = page.locator('.monaco-dialog-box');
 	for (let i = 0; i < 3 && await dialog.isVisible(); i++) {
 		const text = await dialog.innerText();
@@ -220,7 +222,7 @@ async function dismissDialogs(page: Page): Promise<void> {
 	}
 }
 
-async function shot(page: Page, file: string, title: string, expect: string, checks: Record<string, boolean>, note?: string): Promise<void> {
+export async function shot(page: Page, file: string, title: string, expect: string, checks: Record<string, boolean>, note?: string): Promise<void> {
 	const target = path.join(env.screenshots, file);
 	await page.screenshot({ path: target });
 	const ok = Object.values(checks).every(Boolean);
@@ -228,7 +230,7 @@ async function shot(page: Page, file: string, title: string, expect: string, che
 	log(`screenshot ${file}: ${ok ? 'checks ok' : `checks FAILED ${JSON.stringify(checks)}`}${note ? ` (${note})` : ''}`);
 }
 
-async function closeTransientUi(page: Page): Promise<void> {
+export async function closeTransientUi(page: Page): Promise<void> {
 	for (let i = 0; i < 3; i++) {
 		await page.keyboard.press('Escape');
 		await sleep(150);
@@ -236,12 +238,12 @@ async function closeTransientUi(page: Page): Promise<void> {
 }
 
 /** Clears notifications so that the next screenshot shows only what it is about. */
-async function clearNotifications(): Promise<void> {
+export async function clearNotifications(): Promise<void> {
 	await command('notifications.clearAll').catch(() => undefined);
 }
 
 /** Polls `probe` until it returns a truthy value (returned) or `timeoutMs` passed (`undefined`). */
-async function waitUntil<T>(timeoutMs: number, probe: () => T | undefined | false | Promise<T | undefined | false>, stepMs = 250): Promise<T | undefined> {
+export async function waitUntil<T>(timeoutMs: number, probe: () => T | undefined | false | Promise<T | undefined | false>, stepMs = 250): Promise<T | undefined> {
 	for (const deadline = Date.now() + timeoutMs; ;) {
 		const value = await probe();
 		if (value) {
@@ -257,7 +259,7 @@ async function waitUntil<T>(timeoutMs: number, probe: () => T | undefined | fals
 // --- What the screenshot sections read from the run's own files ------------------------------------
 
 /** The definition id of a server of the user-level mcp.json (extension/src/config.ts userConfigDefinitionId). */
-function userDefinitionId(label: string): string {
+export function userDefinitionId(label: string): string {
 	return `mcp.config.usrlocal.${label}`;
 }
 
@@ -281,7 +283,7 @@ interface ILoggedMessage {
 }
 
 /** The MCP log of a server of this window (`<logs>/<session>/window1/mcpServer.<definition id>.log`), '' before it exists. */
-function serverLog(label: string): string {
+export function serverLog(label: string): string {
 	const logs = path.join(env.userData, 'logs');
 	const name = `mcpServer.${userDefinitionId(label)}.log`;
 	let files: string[] = [];
@@ -459,7 +461,7 @@ interface IScenarioHooks {
 	readonly checkTrace?: (trace: IElicitationTrace) => string | undefined;
 }
 
-function escapeRegExp(text: string): string {
+export function escapeRegExp(text: string): string {
 	return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
@@ -625,7 +627,7 @@ function childEnvironment(extra: Record<string, string>): Record<string, string>
 	return { ...out, ...extra };
 }
 
-async function launch(): Promise<{ app: ElectronApplication; page: Page }> {
+export async function launch(): Promise<{ app: ElectronApplication; page: Page }> {
 	const args = [
 		'--no-sandbox', '--disable-gpu', '--password-store=basic', '--log', 'debug', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust',
 		`--user-data-dir=${env.userData}`, `--extensions-dir=${env.extensions}`,
@@ -1630,4 +1632,7 @@ async function main(): Promise<number> {
 	return summary.failed || (summary.screenshotFailures && !env.allowFail.includes('visual')) ? 1 : 0;
 }
 
-process.exitCode = await main();
+// ui/policy.ts imports the launch and the helpers of this driver.
+if (import.meta.main) {
+	process.exitCode = await main();
+}
