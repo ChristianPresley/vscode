@@ -643,6 +643,17 @@ export interface IToolInvokedEvent {
 
 export const ILanguageModelToolsService = createDecorator<ILanguageModelToolsService>('ILanguageModelToolsService');
 
+/**
+ * Decides, before a tool call is prepared, whether the user must confirm it
+ * themselves. A call a gate holds is never approved automatically: not by
+ * settings, remembered approvals, an auto-approve permission level, a
+ * preToolUse hook that allows it, or an out-of-band pre-approval.
+ */
+export interface IToolInvocationGate {
+	/** The reason shown with the confirmation when the user must confirm this call, else undefined. */
+	confirmationRequired(invocation: IToolInvocation, tool: IToolData, token: CancellationToken): Promise<string | undefined>;
+}
+
 export type CountTokensCallback = (input: string, token: CancellationToken) => Promise<number>;
 
 export interface ILanguageModelToolsService {
@@ -657,6 +668,8 @@ export interface ILanguageModelToolsService {
 	registerToolData(toolData: IToolData): IDisposable;
 	registerToolImplementation(id: string, tool: IToolImpl): IDisposable;
 	registerTool(toolData: IToolData, tool: IToolImpl): IDisposable;
+	/** Registers a gate that can require the user to confirm a tool call; see {@link IToolInvocationGate}. */
+	registerToolInvocationGate(gate: IToolInvocationGate): IDisposable;
 
 	/**
 	 * Get all tools currently enabled (matching `when` clauses and model).

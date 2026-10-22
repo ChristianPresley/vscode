@@ -16,7 +16,8 @@ export const IAICustomizationWorkspaceService = createDecorator<IAICustomization
  * Extended storage type for AI Customization that includes built-in prompts
  * shipped with the application, alongside the core `PromptsStorage` values.
  */
-export type AICustomizationSource = 'local' | 'user' | 'extension' | 'plugin' | 'builtin';
+/** `mcp`: served by an MCP server (MCP-served agent skills, SEP-2640); not one of {@link AICustomizationSources.all}. */
+export type AICustomizationSource = 'local' | 'user' | 'extension' | 'plugin' | 'builtin' | 'mcp';
 
 export namespace AICustomizationSources {
 	export const local: AICustomizationSource = 'local';
@@ -24,6 +25,7 @@ export namespace AICustomizationSources {
 	export const extension: AICustomizationSource = 'extension';
 	export const plugin: AICustomizationSource = 'plugin';
 	export const builtin: AICustomizationSource = 'builtin';
+	export const mcp: AICustomizationSource = 'mcp';
 	export const all: AICustomizationSource[] = [local, user, extension, plugin, builtin];
 }
 

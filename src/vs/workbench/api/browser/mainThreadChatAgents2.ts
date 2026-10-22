@@ -213,6 +213,9 @@ export class MainThreadChatAgents2 extends Disposable implements MainThreadChatA
 				return 'plugin';
 			case PromptsStorage.builtIn:
 				return 'builtin';
+			case PromptsStorage.mcp:
+				// MCP-served skills are not passed to extensions, see $provideSkills
+				throw new Error('An MCP-served customization has no source an extension knows');
 		}
 	}
 
@@ -303,7 +306,9 @@ export class MainThreadChatAgents2 extends Disposable implements MainThreadChatA
 
 	async $provideSkills(token: CancellationToken): Promise<ISkillDto[]> {
 		const skills = await this._promptsService.findAgentSkills(token) ?? [];
-		return skills.map(skill => this._toSkillDto(skill));
+		// An MCP-served skill (SEP-2640) is no file and loads only through the MCP skill tool, by
+		// server and URI: an extension would read it by name or through its URI without its origin.
+		return skills.filter(skill => !skill.mcp).map(skill => this._toSkillDto(skill));
 	}
 
 	async $provideSlashCommands(token: CancellationToken): Promise<ISlashCommandDto[]> {

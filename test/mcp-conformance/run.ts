@@ -2231,7 +2231,7 @@ export const FEATURE_ROWS: readonly { readonly feature: string; readonly status:
 	{ feature: 'Sampling with tools (`sampling.tools`, `tools` and `toolChoice` in `sampling/createMessage`)', status: 'in', notes: 'The client declares `sampling.tools` when a language model with tool calling is offered and maps `tool_use` / `tool_result` blocks to the language model API (`mcpSamplingService.test.ts`).' },
 	{ feature: 'Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663)', status: 'in', notes: 'Client: opt-in polling of `tasks/get` (`mcpModernTask.test.ts`). Gateway: `tasks/get`, `tasks/update`, `tasks/cancel` (M9); the suite\'s `tasks-*` server scenarios run not scored.' },
 	{ feature: 'MCP Apps (`io.modelcontextprotocol/ui`)', status: 'in', notes: 'The client declares the extension on the 2026-07-28 wire and renders app-only tools in the chat, not for the language model.' },
-	{ feature: 'Skills extension (`io.modelcontextprotocol/skills`, SEP-2640)', status: 'in', notes: 'Client: `skills/list`, `skills/get` and `resources/directory/read` (only with `directoryRead: true`) in the protocol engine; a skill is loaded through `McpLoadedSkill` (`mcpSkills.ts`), which validates the entry and verifies every file it reads (listed, size, SHA-256 digest, and the `SKILL.md` frontmatter field by field); `IMcpServer.skills()` lists without reading any file. VS Code does not yet put MCP-served skills into a chat model\'s context (see the n/a rows below). Gateway: passes the skills of the server behind a route through (`skills/list`, `skills/get`, `resources/directory/read`) and advertises the extension exactly when the server does. The suite\'s seven `sep-2640-*` extension scenarios run forced at both revisions, not scored (see Extension scenarios: SEP-2640).' },
+	{ feature: 'Skills extension (`io.modelcontextprotocol/skills`, SEP-2640)', status: 'in', notes: 'Client: `skills/list`, `skills/get` and `resources/directory/read` (only with `directoryRead: true`) in the protocol engine; a skill is loaded through `McpLoadedSkill` (`mcpSkills.ts`), which validates the entry and verifies every file it reads (listed, size, SHA-256 digest, and the `SKILL.md` frontmatter field by field); `IMcpServer.skills()` lists without reading any file. Chat (`mcpSkillsChat.ts`): the skills of running servers join the agent skill list through a provider of the prompts service, keyed by server and `SKILL.md` URI and shown to the model with their server; `readMcpSkill` loads one by (server, URI) after a per-skill approval bound to its `resources` set, and tags the content with its server; `readMcpSkillFile` reads files of a loaded skill from its own server only; while a chat acts on an MCP-served skill, a tool invocation gate makes each code-execution call need confirmation, and `allowed-tools` grants nothing. Gateway: passes the skills of the server behind a route through (`skills/list`, `skills/get`, `resources/directory/read`) and advertises the extension exactly when the server does. The suite\'s seven `sep-2640-*` extension scenarios run forced at both revisions, not scored (see Extension scenarios: SEP-2640).' },
 	{ feature: 'OAuth client credentials (`auth/client-credentials-jwt`, `auth/client-credentials-basic`)', status: 'excluded', notes: 'An authorization extension for machine clients; VS Code signs in users. The scenarios run not scored and are baselined whole.' },
 	{ feature: 'Enterprise-managed authorization (`auth/enterprise-managed-authorization`)', status: 'excluded', notes: 'The product has a preview of ID-JAG sign-in for enterprise-managed servers (`oauth.enterpriseManaged`), which the conformance client does not drive; the scenario is baselined whole in `expected-failures-unscored.yml`.' },
 	{ feature: 'DPoP (`auth/dpop`, `auth/dpop-nonce`)', status: 'excluded', notes: 'Baselined whole in `expected-failures-unscored.yml`.' },
@@ -2246,13 +2246,14 @@ const GATEWAY_SKILLS_TESTS = 'src/vs/platform/mcp/test/node/mcpGatewaySkills.tes
 const SKILL_LOADER_TESTS = 'src/vs/workbench/contrib/mcp/test/common/mcpSkills.test.ts';
 const HANDLER_TESTS = 'src/vs/workbench/contrib/mcp/test/common/mcpServerRequestHandler.test.ts';
 const SCENARIO_DRIVER_TESTS = 'src/vs/workbench/api/test/node/mcpConformanceScenarios.test.ts';
+const CHAT_SKILLS_TESTS = 'src/vs/workbench/contrib/mcp/test/common/mcpSkillsChat.test.ts';
+const PROMPTS_SERVICE_TESTS = 'src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptsService.test.ts';
+const SKILL_LISTING_TESTS = 'src/vs/workbench/contrib/chat/test/common/promptSyntax/computeAutomaticInstructions.test.ts';
+const TOOL_GATE_TESTS = 'src/vs/workbench/contrib/chat/test/browser/tools/languageModelToolsService.test.ts';
 
 function skillsCheck(leg: Leg, scenario: string, ...checks: string[]): IExtensionCheckCitation[] {
 	return checks.map(check => ({ leg, scenario, check: `sep-2640-${check}` }));
 }
-
-/** Not applicable to VS Code for now: the reason of the rows about a skill in a model's context. */
-const NO_MODEL_CONTEXT = 'VS Code does not put MCP-served skills into a language model\'s context yet: chat has no registry entry and no loading tool for them. The skill API (`IMcpServer.skills()`, `IMcpServer.loadSkill()`, `McpLoadedSkill`) serves the gateway and the conformance client; a chat integration has to meet this row.';
 
 /** The sentences of the Skills extension (SEP-2640), which the requirements file of the core specification does not contain. */
 export const EXTENSION_REQUIREMENTS: readonly IExtensionRequirement[] = [
@@ -2377,19 +2378,39 @@ export const EXTENSION_REQUIREMENTS: readonly IExtensionRequirement[] = [
 		checks: [],
 	},
 	{
-		id: 'SEP-2640#origin-visible', extension: 'SEP-2640', anchor: 'security-implications', party: 'client', level: 'must', status: 'n-a',
+		id: 'SEP-2640#origin-visible', extension: 'SEP-2640', anchor: 'security-implications', party: 'client', level: 'must', status: 'tested',
 		text: 'Hosts MUST tag MCP-served skill content with its originating server identity at the point it enters model context and MUST NOT present an MCP-served skill to the model as indistinguishable from a local filesystem skill.',
-		reason: NO_MODEL_CONTEXT, tests: [], checks: [],
+		tests: [
+			{ file: SKILL_LISTING_TESTS, test: 'an MCP-served skill is listed with its server and URI, marked untrusted, and only when its loading tool is enabled' },
+			{ file: CHAT_SKILLS_TESTS, test: 'listing adds the skills of running servers that declare the extension, keyed by server and URI, and reads no file' },
+			{ file: CHAT_SKILLS_TESTS, test: 'loading needs approval by the user first, then enters context tagged with its server as untrusted input' },
+			{ file: CHAT_SKILLS_TESTS, test: 'skill content cannot close the element that tags its origin' },
+			{ file: PROMPTS_SERVICE_TESTS, test: 'provided MCP skills join the skill files, keyed by URI; a colliding name is qualified and never shadows a skill file' },
+			{ file: PROMPTS_SERVICE_TESTS, test: 'colliding provided names are qualified by server label, then by server id, never dropped' },
+		],
+		checks: [],
 	},
 	{
-		id: 'SEP-2640#approval', extension: 'SEP-2640', anchor: 'security-implications', party: 'client', level: 'must_not', status: 'n-a',
+		id: 'SEP-2640#approval', extension: 'SEP-2640', anchor: 'security-implications', party: 'client', level: 'must_not', status: 'tested',
 		text: 'Hosts MUST NOT allow MCP-served skill content to cause host-side code execution without explicit per-skill user approval, and MUST ignore `allowed-tools` for MCP-origin skills unless the user has explicitly approved that grant.',
-		reason: NO_MODEL_CONTEXT, tests: [], checks: [],
+		tests: [
+			{ file: CHAT_SKILLS_TESTS, test: 'loading needs approval by the user first, then enters context tagged with its server as untrusted input' },
+			{ file: CHAT_SKILLS_TESTS, test: 'the approval is bound to the resources set: a changed file revokes it, and a dynamic skill is never approved ahead' },
+			{ file: CHAT_SKILLS_TESTS, test: 'while a chat acts on an MCP-served skill, each code-execution tool call needs confirmation by the user' },
+			{ file: CHAT_SKILLS_TESTS, test: 'allowed-tools of an MCP-served skill grants nothing' },
+			{ file: TOOL_GATE_TESTS, test: 'a call a gate holds waits for the user, though a hook allows it, the session auto-approves and it was pre-approved' },
+			{ file: TOOL_GATE_TESTS, test: 'a gate that fails holds the call; a gate that does not hold it, or is gone, changes nothing' },
+		],
+		checks: [],
 	},
 	{
-		id: 'SEP-2640#origin-scoped-reads', extension: 'SEP-2640', anchor: 'security-implications', party: 'client', level: 'must_not', status: 'n-a',
+		id: 'SEP-2640#origin-scoped-reads', extension: 'SEP-2640', anchor: 'security-implications', party: 'client', level: 'must_not', status: 'tested',
 		text: 'Hosts MUST bind model-callable resource reads to the skill\'s originating server: a skill served by server A MUST NOT cause a `resources/read` against server B.',
-		reason: NO_MODEL_CONTEXT, tests: [], checks: [],
+		tests: [
+			{ file: CHAT_SKILLS_TESTS, test: 'supporting files are read only from the server that serves the skill, verified against the held entry' },
+			{ file: CHAT_SKILLS_TESTS, test: 'an unlisted skill URI is fetched with skills/get and approved on the same terms; an unknown one fails without a read' },
+		],
+		checks: [],
 	},
 ];
 

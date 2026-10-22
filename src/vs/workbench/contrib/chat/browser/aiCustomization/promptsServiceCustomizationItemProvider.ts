@@ -122,6 +122,10 @@ export class PromptsServiceCustomizationItemProvider implements ICustomizationIt
 			}
 			const seenUris = new ResourceSet();
 			for (const skill of skills || []) {
+				if (skill.mcp) {
+					// MCP-served skills (SEP-2640) are no files this view can open or toggle
+					continue;
+				}
 				const skillName = skill.name || basename(dirname(skill.uri)) || basename(skill.uri);
 				seenUris.add(skill.uri);
 				items.push({

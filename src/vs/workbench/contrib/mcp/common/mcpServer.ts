@@ -46,7 +46,7 @@ import { IMcpRegistry } from './mcpRegistryTypes.js';
 import { IMcpSandboxService } from './mcpSandboxService.js';
 import { checkServerToolSchemas, checkStructuredContent, describeCompileErrors, MAX_CACHED_LIST_TTL_MS, McpProtocolEvent, readsSchemasLeniently, TOOL_LIST_CHANGE_GRACE_MS } from './mcpProtocolMeta.js';
 import { IMcpCacheHint, IMcpListResult, McpProtocolFailure, McpServerRequestHandler } from './mcpServerRequestHandler.js';
-import { McpLoadedSkill, skillDisplayNames } from './mcpSkills.js';
+import { McpLoadedSkill, McpSkillVerificationError, skillDisplayNames } from './mcpSkills.js';
 import { McpTaskManager } from './mcpTaskManager.js';
 import { ElicitationKind, extensionMcpCollectionPrefix, IMcpElicitationService, IMcpIcons, IMcpNegotiationHints, IMcpPotentialSandboxBlock, IMcpPrompt, IMcpPromptMessage, IMcpResource, IMcpResourceTemplate, IMcpSamplingService, IMcpServer, IMcpServerConnection, IMcpServerStartOpts, IMcpSkill, IMcpTool, IMcpToolCallContext, McpCapability, McpCollectionDefinition, McpCollectionReference, McpConnectionFailedError, McpConnectionState, McpDefinitionReference, mcpPromptReplaceSpecialChars, McpResourceURI, McpServerCacheState, McpServerDefinition, McpServerLaunch, McpServerStaticToolAvailability, McpServerTransportType, McpToolName, McpToolVisibility, MpcResponseError, UserInteractionRequiredError } from './mcpTypes.js';
 import { ContributionEnablementState, IEnablementModel } from '../../chat/common/enablement.js';
@@ -820,6 +820,16 @@ export class McpServer extends Disposable implements IMcpServer {
 			}
 			const displayNames = skillDisplayNames(entries);
 			return entries.map(entry => new McpSkill(this, entry, displayNames.get(entry.uri) ?? String(entry.frontmatter.name)));
+		}, token);
+	}
+
+	public getSkill(uri: string, token?: CancellationToken): Promise<IMcpSkill> {
+		return McpServer.callOn(this, async (handler) => {
+			const validation = McpSkills.validateEntry(await handler.getSkill({ uri }, token));
+			if (!validation.ok) {
+				throw new McpSkillVerificationError(validation.problem, validation.detail, localize('mcp.skills.invalidEntry', 'The skill cannot be loaded because its entry is invalid: {0}', validation.detail));
+			}
+			return new McpSkill(this, validation.entry, String(validation.entry.frontmatter.name));
 		}, token);
 	}
 
