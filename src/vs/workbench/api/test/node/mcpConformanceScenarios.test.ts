@@ -7,7 +7,10 @@ import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { MCPLegacy } from '../../../../platform/mcp/common/modelContextProtocolLegacy.js';
 import { IConformanceContext } from '../../node/mcpConformanceProxy.js';
-import { argumentsForSchema, drivenScenarios, IScenarioClient, MCP_REVISION_2025_11_25, MCP_REVISION_2026_07_28, resolveScenario, schemaDefaults, SCORED_CLIENT_SCENARIOS, UNSCORED_CLIENT_SCENARIOS } from '../../node/mcpConformanceScenarios.js';
+import { argumentsForSchema, drivenScenarios, EXTENSION_CLIENT_SCENARIOS, IScenarioClient, MCP_REVISION_2025_11_25, MCP_REVISION_2026_07_28, resolveScenario, schemaDefaults, SCORED_CLIENT_SCENARIOS, UNSCORED_CLIENT_SCENARIOS } from '../../node/mcpConformanceScenarios.js';
+import { McpSkills } from '../../../../platform/mcp/common/modelContextProtocolSkills.js';
+import { McpLoadedSkill, McpSkillVerificationError } from '../../../contrib/mcp/common/mcpSkills.js';
+import { VSBuffer } from '../../../../base/common/buffer.js';
 
 /** The SEP-1034 elicitation schema of the suite's elicitation-sep1034-client-defaults scenario. */
 const SEP_1034_SCHEMA = {
@@ -32,7 +35,7 @@ function tool(name: string, inputSchema: MCPLegacy.Tool['inputSchema'] = { type:
 	return { name, inputSchema };
 }
 
-function fakeClient(options: { tools?: MCPLegacy.Tool[]; resources?: MCPLegacy.Resource[]; prompts?: MCPLegacy.Prompt[]; context?: Partial<IConformanceContext> } = {}) {
+function fakeClient(options: { tools?: MCPLegacy.Tool[]; resources?: MCPLegacy.Resource[]; prompts?: MCPLegacy.Prompt[]; context?: Partial<IConformanceContext>; skills?: McpSkills.Skill[]; files?: Record<string, string> } = {}) {
 	const calls: ICall[] = [];
 	const client: IScenarioClient = {
 		context: { raw: {}, ...options.context },
@@ -59,6 +62,20 @@ function fakeClient(options: { tools?: MCPLegacy.Tool[]; resources?: MCPLegacy.R
 		async getPrompt(name, args) {
 			calls.push({ method: 'prompts/get', name, args });
 			return { messages: [] };
+		},
+		async listSkills() {
+			calls.push({ method: 'skills/list' });
+			return options.skills ?? [];
+		},
+		loadSkill(entry) {
+			// The real loading path, over the fake server's files.
+			return McpLoadedSkill.load({
+				async readResource({ uri }) {
+					calls.push({ method: 'resources/read', name: uri });
+					const text = options.files?.[uri];
+					return { contents: text === undefined ? [] : [{ uri, text }] };
+				},
+			}, entry);
 		},
 	};
 	return { client, calls };
@@ -134,7 +151,13 @@ suite('MCP conformance - scenarios', () => {
 			for (const name of [...SCORED_CLIENT_SCENARIOS.keys(), ...UNSCORED_CLIENT_SCENARIOS]) {
 				assert.ok(resolveScenario(name), `no driver for ${name}`);
 			}
-			assert.deepStrictEqual(drivenScenarios().filter(name => !SCORED_CLIENT_SCENARIOS.has(name) && !UNSCORED_CLIENT_SCENARIOS.includes(name)), []);
+			assert.deepStrictEqual(drivenScenarios().filter(name => !SCORED_CLIENT_SCENARIOS.has(name) && !UNSCORED_CLIENT_SCENARIOS.includes(name) && !EXTENSION_CLIENT_SCENARIOS.includes(name)), []);
+		});
+
+		test('every extension scenario has its own driver', () => {
+			for (const name of EXTENSION_CLIENT_SCENARIOS) {
+				assert.strictEqual(resolveScenario(name)?.name, name);
+			}
 		});
 
 		test('unknown scenarios have no driver and every auth scenario shares one', () => {
@@ -230,6 +253,39 @@ suite('MCP conformance - scenarios', () => {
 			const retry = fakeClient({ tools: [tool('test_reconnection')] });
 			await resolveScenario('sse-retry')!.run(retry.client);
 			assert.deepStrictEqual(retry.calls[1], { method: 'tools/call', name: 'test_reconnection', args: {} });
+		});
+
+		suite('Skills extension (SEP-2640)', () => {
+			const SKILL_URI = 'skill://pdf-processing/SKILL.md';
+			const FORMS_URI = 'skill://pdf-processing/references/FORMS.md';
+			const SKILL_MD = ['---', 'name: pdf-processing', 'description: PDFs', '---', 'Body', ''].join('\n');
+			const FORMS = 'Forms\n';
+
+			async function entry(): Promise<McpSkills.Skill> {
+				const file = async (uri: string, text: string) => ({ uri, digest: await McpSkills.digest(VSBuffer.fromString(text).buffer), size: VSBuffer.fromString(text).byteLength });
+				return { uri: SKILL_URI, frontmatter: { name: 'pdf-processing', description: 'PDFs' }, resources: [await file(SKILL_URI, SKILL_MD), await file(FORMS_URI, FORMS)] };
+			}
+
+			test('no-prefetch lists the skills and reads no file', async () => {
+				const { client, calls } = fakeClient({ skills: [await entry()], files: { [SKILL_URI]: SKILL_MD, [FORMS_URI]: FORMS } });
+				await resolveScenario('sep-2640-client-no-prefetch')!.run(client);
+				assert.deepStrictEqual(calls, [{ method: 'skills/list' }]);
+				await assert.rejects(resolveScenario('sep-2640-client-no-prefetch')!.run(fakeClient().client), /no valid skill/);
+			});
+
+			test('the verify scenarios load the skill and read its supporting files when everything verifies', async () => {
+				const { client, calls } = fakeClient({ skills: [await entry()], files: { [SKILL_URI]: SKILL_MD, [FORMS_URI]: FORMS } });
+				await resolveScenario('sep-2640-client-verify-digest')!.run(client);
+				assert.deepStrictEqual(calls.map(call => call.name ?? call.method), ['skills/list', SKILL_URI, FORMS_URI]);
+			});
+
+			test('a SKILL.md that fails verification ends the scenario before any supporting file is read', async () => {
+				for (const [name, served] of [['digest', SKILL_MD.replace('Body', 'Evil')], ['size', SKILL_MD + 'more'], ['frontmatter', SKILL_MD.replace('PDFs', 'Evil')]]) {
+					const { client, calls } = fakeClient({ skills: [await entry()], files: { [SKILL_URI]: served, [FORMS_URI]: FORMS } });
+					await assert.rejects(resolveScenario(`sep-2640-client-verify-${name}`)!.run(client), McpSkillVerificationError);
+					assert.deepStrictEqual(calls.map(call => call.name ?? call.method), ['skills/list', SKILL_URI], name);
+				}
+			});
 		});
 	});
 });

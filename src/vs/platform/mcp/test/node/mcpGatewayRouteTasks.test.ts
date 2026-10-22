@@ -38,7 +38,7 @@ suite('MCP - GatewayRoute (HTTP) - Tasks extension', () => {
 	test('a task tool answers a CreateTaskResult, and tasks/get and tasks/cancel go through the Mcp-Name check', async () => {
 		const url = await createGateway();
 		const discover = await post(url, modernRequest('server/discover'));
-		assert.deepStrictEqual((discover.body.result?.capabilities as MCP.ServerCapabilities).extensions, { [McpTasks.EXTENSION_ID]: {} });
+		assert.deepStrictEqual((discover.body.result?.capabilities as MCP.ServerCapabilities).extensions, { [McpTasks.EXTENSION_ID]: {}, 'io.modelcontextprotocol/skills': { directoryRead: true } });
 
 		const created = await post(url, modernRequest('tools/call', { name: 'slow_compute', arguments: { seconds: 60, label: 'http' } }, 1, TASKS));
 		assert.strictEqual(created.status, 200);
@@ -91,7 +91,8 @@ suite('MCP - GatewayRoute (HTTP) - Tasks extension', () => {
 		const init = await httpRequest(url, { headers: LEGACY_HEADERS, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: { extensions: { [McpTasks.EXTENSION_ID]: {} } }, clientInfo: { name: 'legacy', version: '1.0.0' } } }) });
 		assert.strictEqual(init.status, 200, init.text);
 		const capabilities = (jsonOf(init) as IJsonRpcBody).result?.capabilities as Record<string, unknown>;
-		assert.strictEqual(capabilities.extensions, undefined);
+		// Only the fixture's Skills extension, which both eras serve; never Tasks.
+		assert.deepStrictEqual(capabilities.extensions, { 'io.modelcontextprotocol/skills': { directoryRead: true } });
 		assert.strictEqual(capabilities.tasks, undefined);
 		const sessionId = init.headers['mcp-session-id'] as string;
 		await httpRequest(url, { headers: legacyHeaders(sessionId), body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) });

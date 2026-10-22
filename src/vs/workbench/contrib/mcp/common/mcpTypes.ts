@@ -29,6 +29,7 @@ import { IMcpGalleryManifest, McpGalleryManifestStatus } from '../../../../platf
 import { IGalleryMcpServer, IGalleryMcpServerConfiguration, IInstallableMcpServer, IQueryOptions } from '../../../../platform/mcp/common/mcpManagement.js';
 import { IMcpDevModeConfig, IMcpGrpcServerTlsConfiguration, IMcpSandboxConfiguration, IMcpServerConfiguration, McpGrpcBinding, McpServerType } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
 import { McpResourceFormat } from '../../../../platform/mcp/common/mcpWorkspaceConfiguration.js';
+import { McpSkills } from '../../../../platform/mcp/common/modelContextProtocolSkills.js';
 import { StorageScope } from '../../../../platform/storage/common/storage.js';
 import { IWorkspaceFolder, IWorkspaceFolderData } from '../../../../platform/workspace/common/workspace.js';
 import { IWorkbenchLocalMcpServer, IWorkbencMcpServerInstallOptions, WORKSPACE_FOLDER_CONFIG_ID_PREFIX } from '../../../services/mcp/common/mcpWorkbenchManagementService.js';
@@ -36,6 +37,7 @@ import { ContributionEnablementState, IEnablementModel } from '../../chat/common
 import { ToolProgress } from '../../chat/common/tools/languageModelToolsService.js';
 import { ExternalDiscoverySource, IMcpServerSamplingConfiguration } from './mcpConfiguration.js';
 import { McpServerRequestHandler } from './mcpServerRequestHandler.js';
+import { McpLoadedSkill } from './mcpSkills.js';
 import { MCPLegacy } from './modelContextProtocolLegacy.js';
 import { UriTemplate } from '../../../../base/common/uriTemplate.js';
 
@@ -543,6 +545,34 @@ export interface IMcpServer extends IDisposable {
 	 * List resource templates on the server.
 	 */
 	resourceTemplates(token?: CancellationToken): Promise<IMcpResourceTemplate[]>;
+
+	/**
+	 * Lists the skills of a server that declares the Skills extension
+	 * (`skills/list`); empty for other servers. Entries that are invalid are
+	 * left out. No skill file is read: a skill is fetched when it is loaded.
+	 */
+	skills(token?: CancellationToken): Promise<IMcpSkill[]>;
+
+	/**
+	 * Loads a skill given only its `SKILL.md` URI, listed or not: fetches its
+	 * current entry (`skills/get`), then reads and verifies the `SKILL.md`.
+	 */
+	loadSkill(uri: string, token?: CancellationToken): Promise<McpLoadedSkill>;
+}
+
+/** A skill a server lists (Skills extension, SEP-2640). Its identity is the server and the `SKILL.md` URI, never the name. */
+export interface IMcpSkill {
+	readonly server: IMcpServer;
+	/** The validated entry the skill is loaded from. */
+	readonly entry: McpSkills.Skill;
+	/** The URI of the skill's `SKILL.md` on the server. */
+	readonly uri: string;
+	readonly name: string;
+	/** The name, qualified by the skill path when several entries of the listing share it. */
+	readonly displayName: string;
+	readonly description: string;
+	/** Reads and verifies the skill's `SKILL.md` against this entry. */
+	load(token?: CancellationToken): Promise<McpLoadedSkill>;
 }
 
 /**
@@ -1410,6 +1440,10 @@ export const enum McpCapability {
 	ToolsListChanged = 1 << 8,
 	/** The server speaks a stateless (2026-07-28 or later) revision. */
 	StatelessProtocol = 1 << 9,
+	/** The server declares the Skills extension (`io.modelcontextprotocol/skills`, SEP-2640). */
+	Skills = 1 << 10,
+	/** The server declares the Skills extension with `directoryRead: true` (`resources/directory/read`). */
+	SkillsDirectoryRead = 1 << 11,
 }
 
 export interface ISamplingOptions {

@@ -10,6 +10,7 @@ import { URI } from '../../../base/common/uri.js';
 import { createDecorator } from '../../instantiation/common/instantiation.js';
 import { MCP } from './modelContextProtocol.js';
 import { MCPLegacy } from './modelContextProtocolLegacy.js';
+import { McpSkills } from './modelContextProtocolSkills.js';
 
 export const IMcpGatewayService = createDecorator<IMcpGatewayService>('IMcpGatewayService');
 
@@ -70,6 +71,8 @@ export interface IMcpGatewayServerCapabilities {
 	readonly resources?: { readonly subscribe?: boolean; readonly listChanged?: boolean };
 	readonly completions?: boolean;
 	readonly logging?: boolean;
+	/** The Skills extension (`io.modelcontextprotocol/skills`, SEP-2640) and its `directoryRead` setting. */
+	readonly skills?: { readonly directoryRead?: boolean };
 }
 
 export interface IMcpGatewayCacheHints {
@@ -139,6 +142,12 @@ export interface IMcpGatewaySingleServerInvoker {
 	complete?(params: MCPLegacy.CompleteRequest['params'], context?: IMcpGatewayInvokeContext): Promise<MCPLegacy.CompleteResult>;
 	/** Starts forwarding `onDidUpdateResource` for a URI until the disposable is disposed. */
 	subscribeResource?(uri: string): Promise<IDisposable>;
+	/** Skills extension (SEP-2640): the entries of the server's skills (`skills/list`). With {@link getSkill}, the gateway serves the extension. */
+	listSkills?(): Promise<readonly McpSkills.Skill[]>;
+	/** Skills extension: the current entry of one skill by its `SKILL.md` URI; undefined when the server serves no such skill. */
+	getSkill?(uri: string): Promise<McpSkills.Skill | undefined>;
+	/** Skills extension, `directoryRead`: the direct children of a directory resource; undefined when the URI is not a directory. */
+	readDirectory?(uri: string): Promise<readonly MCPLegacy.Resource[] | undefined>;
 }
 
 export interface IMcpGatewayToolInvoker {
@@ -158,6 +167,9 @@ export interface IMcpGatewayToolInvoker {
 	getPromptForServer?(serverId: string, name: string, args: Record<string, string> | undefined, context?: IMcpGatewayInvokeContext): Promise<MCPLegacy.GetPromptResult | IMcpGatewayInputRequired>;
 	completeForServer?(serverId: string, params: MCPLegacy.CompleteRequest['params']): Promise<MCPLegacy.CompleteResult>;
 	subscribeResourceForServer?(serverId: string, uri: string): Promise<IDisposable>;
+	listSkillsForServer?(serverId: string): Promise<readonly McpSkills.Skill[]>;
+	getSkillForServer?(serverId: string, uri: string): Promise<McpSkills.Skill | undefined>;
+	readDirectoryForServer?(serverId: string, uri: string): Promise<readonly MCPLegacy.Resource[] | undefined>;
 }
 
 export interface IMcpGatewayDto {

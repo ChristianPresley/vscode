@@ -187,7 +187,7 @@ export function httpStatusForRpcError(era: McpProtocolEra, code: number): number
 }
 
 /** Methods whose results carry `ttlMs` / `cacheScope`. */
-const CACHEABLE_METHODS: ReadonlySet<string> = new Set(['server/discover', 'tools/list', 'prompts/list', 'resources/list', 'resources/templates/list', 'resources/read']);
+const CACHEABLE_METHODS: ReadonlySet<string> = new Set(['server/discover', 'tools/list', 'prompts/list', 'resources/list', 'resources/templates/list', 'resources/read', 'skills/list', 'skills/get']);
 
 export interface IMcpGatewayCacheHint {
 	readonly ttlMs: number;

@@ -19,6 +19,7 @@ import { canLog, ILogger, log, LogLevel } from '../../../../platform/log/common/
 import { collectHeaderAnnotations, McpHeaderAnnotation } from '../../../../platform/mcp/common/mcpHttpHeaders.js';
 import { eraForProtocolVersion, LATEST_MCP_PROTOCOL_VERSION, McpProtocolEra, META_SERVER_INFO, negotiateProtocolVersion, SUPPORTED_MCP_PROTOCOL_VERSIONS } from '../../../../platform/mcp/common/mcpProtocolVersions.js';
 import { MCP } from '../../../../platform/mcp/common/modelContextProtocol.js';
+import { McpSkills } from '../../../../platform/mcp/common/modelContextProtocolSkills.js';
 import { McpTasks } from '../../../../platform/mcp/common/modelContextProtocolTasks.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
 import { McpModernTask } from './mcpModernTask.js';
@@ -1498,6 +1499,47 @@ export class McpServerRequestHandler extends Disposable {
 	/** `tasks/cancel` of the Tasks extension: an empty acknowledgement, also for a task that already settled. */
 	cancelModernTask(params: { taskId: string }, token?: CancellationToken): Promise<McpTasks.CancelTaskResult> {
 		return this._request<McpTasks.CancelTaskResult>('tasks/cancel', params, token ?? CancellationToken.None, { tasks: true });
+	}
+
+	/** The settings of the Skills extension (`io.modelcontextprotocol/skills`) the server declared, in either era; undefined without it. */
+	get skillsSettings(): McpSkills.ServerSettings | undefined {
+		return this._negotiated ? McpSkills.settingsOf(this.capabilities) : undefined;
+	}
+
+	/**
+	 * `skills/list` of the Skills extension, every page. The entries are
+	 * returned as received; a caller validates each one
+	 * ({@link McpSkills.validateEntry}) before it loads the skill. Only the
+	 * listing is fetched: no skill file is read ahead of need.
+	 */
+	async listSkills(token?: CancellationToken): Promise<unknown[]> {
+		this._requireSkills(McpSkills.METHOD_LIST);
+		return Iterable.asyncToArrayFlat(this.sendRequestPaginated<{ skills?: unknown; nextCursor?: unknown }, unknown>(McpSkills.METHOD_LIST, result => Array.isArray(result.skills) ? result.skills : [], undefined, token));
+	}
+
+	/** `skills/get` of the Skills extension: the current entry of one skill, listed or not. The entry is returned as received. */
+	async getSkill(params: McpSkills.GetSkillRequestParams, token?: CancellationToken): Promise<unknown> {
+		this._requireSkills(McpSkills.METHOD_GET);
+		const result = await this._request<{ skill?: unknown }>(McpSkills.METHOD_GET, params, token ?? CancellationToken.None);
+		return result.skill;
+	}
+
+	/**
+	 * `resources/directory/read` of the Skills extension: the direct children
+	 * of a directory resource, every page. Refused locally unless the server
+	 * declared `directoryRead: true`, which a client MUST see first.
+	 */
+	async readDirectory(params: { uri: string }, token?: CancellationToken): Promise<MCPLegacy.Resource[]> {
+		if (!this.skillsSettings?.directoryRead) {
+			throw new McpError(MCP.METHOD_NOT_FOUND, localize('mcp.skills.noDirectoryRead', 'The server does not support reading directories'));
+		}
+		return Iterable.asyncToArrayFlat(this.sendRequestPaginated<{ resources?: unknown; nextCursor?: unknown }, MCPLegacy.Resource>(McpSkills.METHOD_DIRECTORY_READ, result => Array.isArray(result.resources) ? result.resources : [], params, token));
+	}
+
+	private _requireSkills(method: string): void {
+		if (!this.skillsSettings) {
+			throw new McpError(MCP.METHOD_NOT_FOUND, localize('mcp.skills.notDeclared', 'The server does not declare the Skills extension, so it does not serve {0}', method));
+		}
 	}
 
 	//#endregion

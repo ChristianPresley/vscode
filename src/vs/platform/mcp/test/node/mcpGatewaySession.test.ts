@@ -154,6 +154,7 @@ suite('MCP - GatewaySession', () => {
 				prompts: { listChanged: true },
 				logging: {},
 				completions: {},
+				extensions: { 'io.modelcontextprotocol/skills': { directoryRead: true } },
 			},
 			serverInfo: CONFORMANCE_SERVER_INFO,
 			instructions: CONFORMANCE_INSTRUCTIONS,

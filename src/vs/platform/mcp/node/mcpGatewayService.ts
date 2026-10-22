@@ -435,6 +435,9 @@ export class McpGatewayService extends Disposable implements IMcpGatewayService 
 		const getPromptForServer = toolInvoker.getPromptForServer;
 		const completeForServer = toolInvoker.completeForServer;
 		const subscribeResourceForServer = toolInvoker.subscribeResourceForServer;
+		const listSkillsForServer = toolInvoker.listSkillsForServer;
+		const getSkillForServer = toolInvoker.getSkillForServer;
+		const readDirectoryForServer = toolInvoker.readDirectoryForServer;
 
 		return {
 			onDidChangeTools: toolInvoker.onDidChangeTools,
@@ -453,6 +456,9 @@ export class McpGatewayService extends Disposable implements IMcpGatewayService 
 			getPrompt: getPromptForServer ? (name, args, context) => getPromptForServer.call(toolInvoker, serverId, name, args, context) : undefined,
 			complete: completeForServer ? params => completeForServer.call(toolInvoker, serverId, params) : undefined,
 			subscribeResource: subscribeResourceForServer ? uri => subscribeResourceForServer.call(toolInvoker, serverId, uri) : undefined,
+			listSkills: listSkillsForServer ? () => listSkillsForServer.call(toolInvoker, serverId) : undefined,
+			getSkill: getSkillForServer ? uri => getSkillForServer.call(toolInvoker, serverId, uri) : undefined,
+			readDirectory: readDirectoryForServer ? uri => readDirectoryForServer.call(toolInvoker, serverId, uri) : undefined,
 		};
 	}
 

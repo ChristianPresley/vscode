@@ -24,6 +24,7 @@ import {
 	INVOCATION_TIMEOUT_FACTOR, type IOptions, isExitCrashAfterPassingVerdict, type IPlanContext, type IRequirementSet, type ISuiteRun, killLeftovers, main, type Env, nodeProcessFlags, parseArgs,
 	parseBaselineFile, parseBaselineVerdict, parseClientExits, parseCounts, parseGatewayThreats, parseMatrix, parseReadyLine, parseRequirementSet, parseScenarioDrivers, parseSuiteInventory, PID_DIR_ENV, planLeg, planScenario, planScored,
 	planUnscored, readCheckMatrixInput, readResults, renderConformanceMatrix, resultScenario, ROOT, runInvocation, scanTestDeclarations, scoredBaseline, skippedChecks, SUITE_BIN, SUITE_DIR, suiteProcessArgs, UNSCORED_BASELINE, updatedEntries,
+	EXTENSION_SCENARIOS, type IExtensionRequirement, type IExtensionScenario,
 } from './run.ts';
 import { convertRequirements, formatRequirementsJson, parseZon, readZonAtCommit, requirementsRevision, ZonEnum, type ZonRead } from './tools/convert-requirements.ts';
 
@@ -262,6 +263,34 @@ suite('not-scored loop', () => {
 				'-o', path.join(DEFAULT_OUT, 'client', invocation.revision, 'unscored', invocation.scenario?.replace('/', '-') ?? ''),
 			]);
 		}
+	});
+
+	test('the extension scenarios of a leg run forced at every selected revision after its not-scored ones, unless a set lists them', () => {
+		const extensionScenarios: IExtensionScenario[] = [
+			{ leg: 'client', scenario: 'sep-2640-client-no-prefetch', extension: 'SEP-2640' },
+			{ leg: 'client', scenario: 'auth/dpop', extension: 'listed anyway' },
+			{ leg: 'server', scenario: 'sep-2640-skills-enumeration', extension: 'SEP-2640' },
+		];
+		const ctx = { ...context(['client', '--unscored']), extensionScenarios };
+		const invocations = planUnscored('client', ctx);
+		assert.deepStrictEqual(invocations.map(invocation => `${invocation.revision} ${invocation.scenario}`), [
+			'2026-07-28 auth/dpop',
+			'2026-07-28 json-schema-2020-12-preservation',
+			'2026-07-28 sep-2640-client-no-prefetch',
+			'2025-11-25 auth/dpop',
+			'2025-11-25 json-schema-2020-12-preservation',
+			'2025-11-25 sep-2640-client-no-prefetch',
+		]);
+		const extension = invocations[2];
+		assert.strictEqual(extension.kind, 'unscored');
+		assert.ok(extension.args.includes('--force'));
+		assert.strictEqual(flag(extension.args, '--spec-version'), '2026-07-28');
+		assert.strictEqual(flag(extension.args, '--expected-failures'), path.join(BASELINES, UNSCORED_BASELINE));
+		assert.deepStrictEqual(planUnscored('server', { ...context(['server', '--unscored', '--requirements', '2025-11-25']), extensionScenarios }).map(invocation => invocation.scenario), ['server-sse-polling', 'sep-2640-skills-enumeration']);
+		assert.deepStrictEqual(EXTENSION_SCENARIOS.map(row => `${row.leg} ${row.scenario}`), [
+			'client sep-2640-client-no-prefetch', 'client sep-2640-client-verify-digest', 'client sep-2640-client-verify-size', 'client sep-2640-client-verify-frontmatter',
+			'server sep-2640-skills-enumeration', 'server sep-2640-skills-manifest', 'server sep-2640-skills-directory',
+		]);
 	});
 
 	test('--unscored replaces the scored runs; all runs both; --requirements narrows the loop', () => {
@@ -1048,6 +1077,120 @@ suite('check-matrix', () => {
 		assert.deepStrictEqual([...inventory.scenarios], ['server-stateless', 'auth/dpop']);
 	});
 
+	test('the inventory also reads scenarios named through a table, with the table class\'s allowClientError, and checkId and SEP-numbered literals', () => {
+		const bundle = [
+			'const sn={digest:{scenario:`sep-2640-client-verify-digest`,checkId:`sep-2640-host-verify-digest`,description:`a {brace} and a quote \\` inside`},size:{scenario:`sep-2640-client-verify-size`,checkId:`size-check`}};',
+			'var cn=class extends Bt{constructor(e){super(),this.allowClientError=!0,this.mode=e,this.name=sn[e].scenario,this.description=sn[e].description}entry(){return 1}};',
+			'const tn={a:{scenario:`plain-one`}};var dn=class{constructor(e){this.name=tn[e].scenario}run(){return this.allowClientError=!0}};',
+			'const Jr=`sep-2640-capability-directory-read-flag`;',
+		].join('');
+		const inventory = parseSuiteInventory(bundle);
+		assert.deepStrictEqual([...inventory.scenarios].sort(), ['plain-one', 'sep-2640-client-verify-digest', 'sep-2640-client-verify-size']);
+		assert.deepStrictEqual([...inventory.clientErrorAllowed].sort(), ['sep-2640-client-verify-digest', 'sep-2640-client-verify-size']);
+		for (const id of ['sep-2640-host-verify-digest', 'size-check', 'sep-2640-capability-directory-read-flag']) {
+			assert.ok(inventory.checkIds.has(id), id);
+		}
+	});
+
+	suite('extension scenarios and requirements', () => {
+		const EXTENSION: IExtensionScenario[] = [{ leg: 'server', scenario: 'sep-2640-skills-enumeration', extension: 'SEP-2640' }];
+		const ROWS = ['2026-07-28', '2025-11-25'].map(revision => `| server | ${revision} | \`sep-2640-skills-enumeration\` | extension | driven | the fixture |`).join('\n');
+
+		function extensionInput(overrides: Partial<ICheckMatrixInput> = {}, rows = ROWS): ICheckMatrixInput {
+			const base = input();
+			return input({
+				matrix: parseMatrix(`${MATRIX}\n${rows}`),
+				extensionScenarios: EXTENSION,
+				suite: { ...base.suite!, scenarios: new Set([...base.suite!.scenarios, 'sep-2640-skills-enumeration']), checkIds: new Set([...base.suite!.checkIds, 'sep-2640-skills-get-no-cursor']) },
+				...overrides,
+			});
+		}
+
+		const REQUIREMENT: IExtensionRequirement = {
+			id: 'SEP-2640#skills-get', extension: 'SEP-2640', anchor: 'retrieval', party: 'server', level: 'must', status: 'tested', text: 'Servers MUST answer -32602.',
+			tests: [{ file: 'src/a.test.ts', test: 'some test' }],
+			checks: [{ leg: 'server', scenario: 'sep-2640-skills-enumeration', check: 'sep-2640-skills-get-no-cursor' }],
+		};
+
+		test('an extension scenario needs a row per revision, scored extension, driven or baselined in the not-scored file', () => {
+			assert.deepStrictEqual(checkMatrix(extensionInput()), []);
+			assert.deepStrictEqual(checkMatrix(extensionInput({}, ROWS.split('\n')[0])), ['requirement-matrix.md has no row for server 2025-11-25 sep-2640-skills-enumeration']);
+			assert.match(checkMatrix(extensionInput({}, ROWS.replace('| extension |', '| not-scored |'))).join('\n'), /server 2026-07-28 sep-2640-skills-enumeration is extension, not not-scored/);
+			assert.match(checkMatrix(extensionInput({ extensionScenarios: undefined })).join('\n'), /requirements\/2026-07-28.yaml lists no server scenario sep-2640-skills-enumeration/);
+
+			const baselines = new Map(input().baselines);
+			baselines.set(UNSCORED_BASELINE, { client: ['auth/dpop'], server: ['sep-2640-skills-enumeration:some-check'] });
+			assert.deepStrictEqual(checkMatrix(extensionInput({ baselines }, ROWS.replace(/driven/g, 'gap'))), []);
+			assert.match(checkMatrix(extensionInput({ baselines })).join('\n'), /is driven \(every check passes\) but expected-failures-unscored.yml has server entries for it/);
+			assert.match(checkMatrix(extensionInput({ baselines: input().baselines }, ROWS.replace(/driven/g, 'gap'))).join('\n'), /the extension server 2026-07-28 sep-2640-skills-enumeration is neither driven nor baselined/);
+			assert.match(checkMatrix(extensionInput({ baselines, extensionScenarios: undefined, matrix: parseMatrix(MATRIX) })).join('\n'), /expected-failures-unscored.yml: sep-2640-skills-enumeration:some-check is not a not-scored server scenario/);
+		});
+
+		test('the suite must define every extension scenario', () => {
+			assert.deepStrictEqual(checkMatrix(extensionInput({ suite: input().suite })), ['the suite defines no server extension scenario sep-2640-skills-enumeration']);
+		});
+
+		test('extension requirement rows cite running tests and checks of driven extension scenarios the suite defines', () => {
+			assert.deepStrictEqual(checkMatrix(extensionInput({ extensionRequirements: [REQUIREMENT] })), []);
+			const problems = checkMatrix(extensionInput({
+				extensionRequirements: [
+					REQUIREMENT,
+					{ ...REQUIREMENT, tests: [], checks: [] },
+					{ ...REQUIREMENT, id: 'SEP-2640#gap', status: 'gap', reason: 'later', tests: [], checks: [] },
+					{ ...REQUIREMENT, id: 'SEP-2640#na', status: 'n-a' },
+					{ ...REQUIREMENT, id: 'SEP-2640#wrong', tests: [{ file: 'src/a.test.ts', test: 'gone' }], checks: [{ leg: 'client', scenario: 'tools_call', check: 'x' }, { leg: 'server', scenario: 'sep-2640-skills-enumeration', check: 'no-such-check' }] },
+				],
+			}));
+			assert.deepStrictEqual(problems, [
+				'the extension requirement SEP-2640#skills-get is listed twice',
+				'the extension requirement SEP-2640#skills-get is tested but cites no test or check',
+				'the extension requirement SEP-2640#gap is a MUST requirement and cannot be a gap',
+				'the extension requirement SEP-2640#na is n-a without a reason',
+				'the extension requirement SEP-2640#na is n-a but cites tests or checks',
+				'the extension requirement SEP-2640#wrong cites the test "gone", which src/a.test.ts does not declare',
+				'the extension requirement SEP-2640#wrong cites client tools_call, which is not an extension scenario of the harness',
+				'the extension requirement SEP-2640#wrong cites the check no-such-check, which the suite does not define',
+			]);
+			assert.deepStrictEqual(checkMatrix(extensionInput({ extensionRequirements: [REQUIREMENT] }, ROWS.replace('driven', 'n-a'))), [
+				'requirement-matrix.md:19: the extension server 2026-07-28 sep-2640-skills-enumeration is neither driven nor baselined in expected-failures-unscored.yml',
+				'the extension requirement SEP-2640#skills-get cites server 2026-07-28 sep-2640-skills-enumeration, whose requirement-matrix.md row is n-a, not driven',
+			]);
+		});
+
+		test('the rendering has a section per extension with its scenario rows and requirement rows', () => {
+			const rendered = renderConformanceMatrix(extensionInput({ extensionRequirements: [REQUIREMENT] }));
+			assert.ok(rendered.includes('### Extension scenarios: SEP-2640'));
+			assert.ok(rendered.includes('| server | 2025-11-25 | `sep-2640-skills-enumeration` | driven | the fixture |'));
+			assert.ok(rendered.includes('| [`SEP-2640#skills-get`](https://modelcontextprotocol.io/seps/2640-skills-extension#retrieval) | server | MUST | tested | Servers MUST answer -32602. | `a.test.ts` some test<br>conformance server `sep-2640-skills-enumeration` (`sep-2640-skills-get-no-cursor`) |'));
+			assert.ok(!renderConformanceMatrix(input()).includes('### Extension scenarios'));
+		});
+
+		test('the client driver table of extension scenarios must match the harness', () => {
+			const drivers = (extension: string | undefined) => [
+				'export const MCP_REVISION_2026_07_28 = \'2026-07-28\';',
+				'export const MCP_REVISION_2025_11_25 = \'2025-11-25\';',
+				'const BOTH: readonly string[] = [MCP_REVISION_2026_07_28, MCP_REVISION_2025_11_25];',
+				'const ONLY_2026: readonly string[] = [MCP_REVISION_2026_07_28];',
+				'const ONLY_2025: readonly string[] = [MCP_REVISION_2025_11_25];',
+				'export const SCORED_CLIENT_SCENARIOS: ReadonlyMap<string, readonly string[]> = new Map<string, readonly string[]>([[\'tools_call\', BOTH], [\'request-metadata\', ONLY_2026], [\'auth/metadata-default\', BOTH], [\'initialize\', ONLY_2025], [\'sse-retry\', ONLY_2025]]);',
+				'export const UNSCORED_CLIENT_SCENARIOS: readonly string[] = [\'auth/dpop\', \'json-schema-2020-12-preservation\'];',
+				...(extension === undefined ? [] : [`export const EXTENSION_CLIENT_SCENARIOS: readonly string[] = [${extension}];`]),
+			].join('\n');
+			const extensionScenarios: IExtensionScenario[] = [{ leg: 'client', scenario: 'sep-2640-client-no-prefetch', extension: 'SEP-2640' }];
+			assert.deepStrictEqual(parseScenarioDrivers(drivers('\'a\', \'b\''))?.extension, ['a', 'b']);
+			assert.strictEqual(parseScenarioDrivers(drivers(undefined))?.extension, undefined);
+			const matrix = parseMatrix(`${MATRIX}\n${['2026-07-28', '2025-11-25'].map(revision => `| client | ${revision} | \`sep-2640-client-no-prefetch\` | extension | driven | |`).join('\n')}`);
+			const suite = { ...input().suite!, scenarios: new Set([...input().suite!.scenarios, 'sep-2640-client-no-prefetch']) };
+			assert.deepStrictEqual(checkMatrix(input({ matrix, suite, extensionScenarios, scenarioDrivers: drivers('\'sep-2640-client-no-prefetch\'') })), []);
+			assert.deepStrictEqual(checkMatrix(input({ matrix, suite, extensionScenarios, scenarioDrivers: drivers(undefined) })), [
+				'src/vs/workbench/api/node/mcpConformanceScenarios.ts: EXTENSION_CLIENT_SCENARIOS does not list sep-2640-client-no-prefetch, which the harness runs as an extension scenario',
+			]);
+			assert.deepStrictEqual(checkMatrix(input({ scenarioDrivers: drivers('\'sep-2640-gone\'') })), [
+				'src/vs/workbench/api/node/mcpConformanceScenarios.ts: EXTENSION_CLIENT_SCENARIOS lists sep-2640-gone, which is not an extension scenario of the harness (EXTENSION_SCENARIOS)',
+			]);
+		});
+	});
+
 	test('the requirement sets parse the way the suite writes them', () => {
 		const set = parseRequirementSet('2026-07-28', 'server:\n  - tools-list\nclient:\n  - tools_call\nnot_scored:\n  - scenario: auth/dpop\n    leg: client\n    reason: extension\n  - scenario: bogus\n');
 		assert.deepStrictEqual(set, { revision: '2026-07-28', server: ['tools-list'], client: ['tools_call'], notScored: [{ scenario: 'auth/dpop', leg: 'client', reason: 'extension' }] });
@@ -1158,7 +1301,11 @@ suite('main', () => {
 		assert.deepStrictEqual([...inventory.clientErrorAllowed].sort(), [
 			'auth/iss-normalized', 'auth/iss-supported-missing', 'auth/iss-unexpected', 'auth/iss-wrong-issuer',
 			'auth/metadata-issuer-mismatch', 'auth/resource-mismatch', 'auth/scope-retry-limit', 'http-invalid-tool-headers',
+			'sep-2640-client-verify-digest', 'sep-2640-client-verify-frontmatter', 'sep-2640-client-verify-size',
 		]);
+		for (const { scenario } of EXTENSION_SCENARIOS) {
+			assert.ok(inventory.scenarios.has(scenario), scenario);
+		}
 	});
 });
 

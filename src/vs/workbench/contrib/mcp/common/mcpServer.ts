@@ -30,6 +30,7 @@ import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { McpProtocolEra } from '../../../../platform/mcp/common/mcpProtocolVersions.js';
 import { MCP } from '../../../../platform/mcp/common/modelContextProtocol.js';
+import { McpSkills } from '../../../../platform/mcp/common/modelContextProtocolSkills.js';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IEditorService } from '../../../services/editor/common/editorService.js';
@@ -45,8 +46,9 @@ import { IMcpRegistry } from './mcpRegistryTypes.js';
 import { IMcpSandboxService } from './mcpSandboxService.js';
 import { checkServerToolSchemas, checkStructuredContent, describeCompileErrors, MAX_CACHED_LIST_TTL_MS, McpProtocolEvent, readsSchemasLeniently, TOOL_LIST_CHANGE_GRACE_MS } from './mcpProtocolMeta.js';
 import { IMcpCacheHint, IMcpListResult, McpProtocolFailure, McpServerRequestHandler } from './mcpServerRequestHandler.js';
+import { McpLoadedSkill, skillDisplayNames } from './mcpSkills.js';
 import { McpTaskManager } from './mcpTaskManager.js';
-import { ElicitationKind, extensionMcpCollectionPrefix, IMcpElicitationService, IMcpIcons, IMcpNegotiationHints, IMcpPotentialSandboxBlock, IMcpPrompt, IMcpPromptMessage, IMcpResource, IMcpResourceTemplate, IMcpSamplingService, IMcpServer, IMcpServerConnection, IMcpServerStartOpts, IMcpTool, IMcpToolCallContext, McpCapability, McpCollectionDefinition, McpCollectionReference, McpConnectionFailedError, McpConnectionState, McpDefinitionReference, mcpPromptReplaceSpecialChars, McpResourceURI, McpServerCacheState, McpServerDefinition, McpServerLaunch, McpServerStaticToolAvailability, McpServerTransportType, McpToolName, McpToolVisibility, MpcResponseError, UserInteractionRequiredError } from './mcpTypes.js';
+import { ElicitationKind, extensionMcpCollectionPrefix, IMcpElicitationService, IMcpIcons, IMcpNegotiationHints, IMcpPotentialSandboxBlock, IMcpPrompt, IMcpPromptMessage, IMcpResource, IMcpResourceTemplate, IMcpSamplingService, IMcpServer, IMcpServerConnection, IMcpServerStartOpts, IMcpSkill, IMcpTool, IMcpToolCallContext, McpCapability, McpCollectionDefinition, McpCollectionReference, McpConnectionFailedError, McpConnectionState, McpDefinitionReference, mcpPromptReplaceSpecialChars, McpResourceURI, McpServerCacheState, McpServerDefinition, McpServerLaunch, McpServerStaticToolAvailability, McpServerTransportType, McpToolName, McpToolVisibility, MpcResponseError, UserInteractionRequiredError } from './mcpTypes.js';
 import { ContributionEnablementState, IEnablementModel } from '../../chat/common/enablement.js';
 import { MCPLegacy } from './modelContextProtocolLegacy.js';
 import { McpApps } from './modelContextProtocolApps.js';
@@ -799,6 +801,32 @@ export class McpServer extends Disposable implements IMcpServer {
 		return McpServer.callOn(this, async (handler) => {
 			const templates = await handler.listResourceTemplates({}, token);
 			return templates.map(t => new McpResourceTemplate(this, t, McpIcons.fromParsed(this._parseIcons(t))));
+		}, token);
+	}
+
+	public skills(token?: CancellationToken): Promise<IMcpSkill[]> {
+		return McpServer.callOn(this, async (handler) => {
+			if (!handler.skillsSettings) {
+				return [];
+			}
+			const entries: McpSkills.Skill[] = [];
+			for (const value of await handler.listSkills(token)) {
+				const validation = McpSkills.validateEntry(value);
+				if (validation.ok) {
+					entries.push(validation.entry);
+				} else {
+					this._logger.warn(`Ignoring a skill entry: ${validation.detail}`);
+				}
+			}
+			const displayNames = skillDisplayNames(entries);
+			return entries.map(entry => new McpSkill(this, entry, displayNames.get(entry.uri) ?? String(entry.frontmatter.name)));
+		}, token);
+	}
+
+	public loadSkill(uri: string, token?: CancellationToken): Promise<McpLoadedSkill> {
+		return McpServer.callOn(this, async (handler) => {
+			const entry = await handler.getSkill({ uri }, token);
+			return McpLoadedSkill.load(handler, entry, token);
 		}, token);
 	}
 
@@ -1627,6 +1655,7 @@ function serverMayComplete(server: McpServer): boolean {
 }
 
 type EncodableCapabilities = {
+	readonly extensions?: object;
 	readonly logging?: object;
 	readonly completions?: object;
 	readonly prompts?: { readonly listChanged?: boolean };
@@ -1660,7 +1689,35 @@ function encodeCapabilities(cap: EncodableCapabilities, era?: McpProtocolEra): M
 			out |= McpCapability.ToolsListChanged;
 		}
 	}
+	const skills = McpSkills.settingsOf(cap);
+	if (skills) {
+		out |= McpCapability.Skills;
+		if (skills.directoryRead) {
+			out |= McpCapability.SkillsDirectoryRead;
+		}
+	}
 	return out;
+}
+
+/** A listed skill of a server (Skills extension, SEP-2640). */
+class McpSkill implements IMcpSkill {
+	public readonly uri: string;
+	public readonly name: string;
+	public readonly description: string;
+
+	constructor(
+		public readonly server: McpServer,
+		public readonly entry: McpSkills.Skill,
+		public readonly displayName: string,
+	) {
+		this.uri = entry.uri;
+		this.name = String(entry.frontmatter.name);
+		this.description = String(entry.frontmatter.description);
+	}
+
+	public load(token?: CancellationToken): Promise<McpLoadedSkill> {
+		return McpServer.callOn(this.server, handler => McpLoadedSkill.load(handler, this.entry, token), token);
+	}
 }
 
 export class McpTool implements IMcpTool {

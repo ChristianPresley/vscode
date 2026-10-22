@@ -14,10 +14,11 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { IMcpGatewayServerCapabilities, IMcpGatewayServerDescriptor } from '../../../../platform/mcp/common/mcpGateway.js';
 import { MCP } from '../../../../platform/mcp/common/modelContextProtocol.js';
 import { MCPLegacy } from '../../../../platform/mcp/common/modelContextProtocolLegacy.js';
+import { McpSkills } from '../../../../platform/mcp/common/modelContextProtocolSkills.js';
 import { ToolProgress } from '../../chat/common/tools/languageModelToolsService.js';
 import { McpServer } from './mcpServer.js';
 import { McpServerRequestHandler } from './mcpServerRequestHandler.js';
-import { IMcpServer, IMcpService, IMcpToolCallContext, McpCapability, McpServerCacheState, McpToolVisibility } from './mcpTypes.js';
+import { IMcpServer, IMcpService, IMcpToolCallContext, McpCapability, McpServerCacheState, McpToolVisibility, MpcResponseError } from './mcpTypes.js';
 import { startServerAndWaitForLiveTools } from './mcpTypesUtils.js';
 
 interface ICallToolForServerArgs {
@@ -322,6 +323,18 @@ export class McpGatewayToolBrokerChannel extends Disposable implements IServerCh
 				this._unsubscribeResourceForServer(subscriptionId);
 				return undefined as T;
 			}
+			case 'listSkillsForServer': {
+				const { serverId } = arg as IServerIdArg;
+				return await this._listSkillsForServer(serverId) as T;
+			}
+			case 'getSkillForServer': {
+				const { serverId, uri } = arg as IReadResourceForServerArgs;
+				return await this._getSkillForServer(serverId, uri, cancellationToken) as T;
+			}
+			case 'readDirectoryForServer': {
+				const { serverId, uri } = arg as IReadResourceForServerArgs;
+				return await this._readDirectoryForServer(serverId, uri, cancellationToken) as T;
+			}
 		}
 
 		throw new Error(`Invalid call: ${command}`);
@@ -496,6 +509,64 @@ export class McpGatewayToolBrokerChannel extends Disposable implements IServerCh
 		const result = await McpServer.callOn(server, h => h.readResource({ uri }, token), token);
 		this._logService.debug(`[McpGateway][ToolBroker] readResourceForServer returned ${result.contents.length} content(s)`);
 		return result;
+	}
+
+	/** The validated entries of the server's skills (Skills extension); invalid entries are not passed on. */
+	private async _listSkillsForServer(serverId: string): Promise<readonly McpSkills.Skill[]> {
+		const server = this._getServerById(serverId);
+		if (!server) {
+			this._logService.warn(`[McpGateway][ToolBroker] listSkillsForServer: unknown server '${serverId}'`);
+			return [];
+		}
+		const capabilities = server.capabilities.get();
+		if (!capabilities || !(capabilities & McpCapability.Skills)) {
+			return [];
+		}
+		try {
+			const skills = await server.skills();
+			this._logService.debug(`[McpGateway][ToolBroker] Server '${serverId}' listed ${skills.length} skill(s)`);
+			return skills.map(skill => skill.entry);
+		} catch (error) {
+			this._logService.warn(`[McpGateway][ToolBroker] Server '${serverId}' failed to list skills`, error);
+			return [];
+		}
+	}
+
+	/** The server's current entry of one skill; undefined when the server serves no such skill or its entry is invalid. */
+	private async _getSkillForServer(serverId: string, uri: string, token: CancellationToken): Promise<McpSkills.Skill | undefined> {
+		const server = this._getServerById(serverId);
+		if (!server) {
+			throw new Error(`Unknown server: ${serverId}`);
+		}
+		try {
+			const validation = McpSkills.validateEntry(await McpServer.callOn(server, h => h.getSkill({ uri }, token), token));
+			if (!validation.ok) {
+				this._logService.warn(`[McpGateway][ToolBroker] Server '${serverId}' returned an invalid skill entry: ${validation.detail}`);
+				return undefined;
+			}
+			return validation.entry;
+		} catch (error) {
+			if (error instanceof MpcResponseError && error.code === MCP.INVALID_PARAMS) {
+				return undefined;
+			}
+			throw error;
+		}
+	}
+
+	/** The direct children of a directory resource; undefined when the server answers that the URI is no directory. */
+	private async _readDirectoryForServer(serverId: string, uri: string, token: CancellationToken): Promise<readonly MCPLegacy.Resource[] | undefined> {
+		const server = this._getServerById(serverId);
+		if (!server) {
+			throw new Error(`Unknown server: ${serverId}`);
+		}
+		try {
+			return await McpServer.callOn(server, h => h.readDirectory({ uri }, token), token);
+		} catch (error) {
+			if (error instanceof MpcResponseError && error.code === MCP.INVALID_PARAMS) {
+				return undefined;
+			}
+			throw error;
+		}
 	}
 
 	private async _listResourceTemplatesForServer(serverId: string): Promise<readonly MCPLegacy.ResourceTemplate[]> {
@@ -696,6 +767,9 @@ export function toGatewayCapabilities(capabilities: McpCapability): IMcpGatewayS
 			subscribe: !!(capabilities & McpCapability.ResourcesSubscribe),
 			listChanged: !!(capabilities & McpCapability.ResourcesListChanged),
 		};
+	}
+	if (capabilities & McpCapability.Skills) {
+		result.skills = { directoryRead: !!(capabilities & McpCapability.SkillsDirectoryRead) };
 	}
 	return result;
 }
