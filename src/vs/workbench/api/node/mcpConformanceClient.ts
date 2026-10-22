@@ -18,6 +18,8 @@ import product from '../../../platform/product/common/product.js';
 import { IProductService } from '../../../platform/product/common/productService.js';
 import { validateElicitFormContent } from '../../contrib/mcp/common/mcpProtocolMeta.js';
 import { McpServerRequestHandler } from '../../contrib/mcp/common/mcpServerRequestHandler.js';
+import { McpLoadedSkill } from '../../contrib/mcp/common/mcpSkills.js';
+import { McpSkills } from '../../../platform/mcp/common/modelContextProtocolSkills.js';
 import { McpTaskManager } from '../../contrib/mcp/common/mcpTaskManager.js';
 import { IMcpClientMethods, McpServerTransportHTTP, McpServerTransportType } from '../../contrib/mcp/common/mcpTypes.js';
 import { McpHTTPHandle } from '../common/extHostMcp.js';
@@ -221,6 +223,19 @@ function createScenarioClient(handler: McpServerRequestHandler, context: IConfor
 		readResource: uri => withRequestTimeout(`resources/read ${uri}`, token => handler.readResource({ uri }, token)),
 		listPrompts: () => withRequestTimeout('prompts/list', token => handler.listPrompts(undefined, token)),
 		getPrompt: (name, args) => withRequestTimeout(`prompts/get ${name}`, token => handler.getPrompt({ name, arguments: args }, token)),
+		listSkills: () => withRequestTimeout('skills/list', async token => {
+			const entries: McpSkills.Skill[] = [];
+			for (const value of await handler.listSkills(token)) {
+				const validation = McpSkills.validateEntry(value);
+				if (validation.ok) {
+					entries.push(validation.entry);
+				} else {
+					handler.logger.warn(`Ignoring a skill entry: ${validation.detail}`);
+				}
+			}
+			return entries;
+		}),
+		loadSkill: entry => withRequestTimeout(`loading the skill ${entry.uri}`, token => McpLoadedSkill.load(handler, entry, token)),
 	};
 }
 

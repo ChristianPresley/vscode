@@ -1,8 +1,8 @@
 # MCP conformance requirement matrix
 
-One row per scenario that the requirement sets of `@modelcontextprotocol/conformance@0.2.0-alpha.12` name (`requirements/2026-07-28.yaml` and `requirements/2025-11-25.yaml`), for both legs and both revisions: the scored scenarios and the `not_scored` ones. A scenario that belongs to both revisions has a row for each, because it runs once at each revision's wire.
+One row per scenario that the requirement sets of `@modelcontextprotocol/conformance@0.2.0-alpha.12` name (`requirements/2026-07-28.yaml` and `requirements/2025-11-25.yaml`), for both legs and both revisions: the scored scenarios and the `not_scored` ones. A scenario that belongs to both revisions has a row for each, because it runs once at each revision's wire. The extension scenarios the harness runs although no requirement set lists them (`EXTENSION_SCENARIOS` in `run.ts`) have a row per revision too, with the scoring `extension`; they run forced in the not-scored loop and are judged against `expected-failures-unscored.yml`.
 
-`node test/mcp-conformance/run.ts check-matrix` checks this file: every scenario of both requirement sets has exactly one row, the scoring column matches the set, every `gap` row has an entry in its expected-failures file and no `driven` row has one, and every not-scored row is driven or baselined. It also checks `requirement-tests.json`.
+`node test/mcp-conformance/run.ts check-matrix` checks this file: every scenario of both requirement sets has exactly one row, the scoring column matches the set, every `gap` row has an entry in its expected-failures file and no `driven` row has one, and every not-scored or extension row is driven or baselined. It also checks `requirement-tests.json`.
 
 | Status | Meaning |
 | --- | --- |
@@ -180,3 +180,31 @@ One row per scenario that the requirement sets of `@modelcontextprotocol/conform
 | server | 2025-11-25 | `server-session-lifecycle` | not-scored | driven | added-after-release: gateway fixture (M6) |
 | server | 2025-11-25 | `json-schema-2020-12` | not-scored | driven | pending: gateway fixture (M6) |
 | server | 2025-11-25 | `server-sse-polling` | not-scored | driven | gateway fixture: `test_reconnection` closes the stream with a retry hint; Last-Event-ID resumes it (SEP-1699) |
+
+## Extension scenarios
+
+The Skills extension (SEP-2640): `[extension]` scenarios of the suite that no requirement set lists.
+
+### Client leg
+
+| Leg | Revision | Scenario | Scoring | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| client | 2026-07-28 | `sep-2640-client-no-prefetch` | extension | driven | `skills/list` only: listing reads no skill file (`IMcpServer.skills()` and the conformance driver load nothing) |
+| client | 2026-07-28 | `sep-2640-client-verify-digest` | extension | driven | the driver loads the listed skill through `McpLoadedSkill`; the tampered `SKILL.md` fails the digest check, the load throws and `references/FORMS.md` is never read (the suite allows the non-zero exit) |
+| client | 2026-07-28 | `sep-2640-client-verify-size` | extension | driven | as `sep-2640-client-verify-digest`: a `SKILL.md` longer than the entry's `size` is a verification failure before any digest |
+| client | 2026-07-28 | `sep-2640-client-verify-frontmatter` | extension | driven | as `sep-2640-client-verify-digest`: the digest and size match, but the parsed frontmatter differs from the entry's, so the skill is not loaded |
+| client | 2025-11-25 | `sep-2640-client-no-prefetch` | extension | driven | `skills/list` only: listing reads no skill file (`IMcpServer.skills()` and the conformance driver load nothing) |
+| client | 2025-11-25 | `sep-2640-client-verify-digest` | extension | driven | the driver loads the listed skill through `McpLoadedSkill`; the tampered `SKILL.md` fails the digest check, the load throws and `references/FORMS.md` is never read (the suite allows the non-zero exit) |
+| client | 2025-11-25 | `sep-2640-client-verify-size` | extension | driven | as `sep-2640-client-verify-digest`: a `SKILL.md` longer than the entry's `size` is a verification failure before any digest |
+| client | 2025-11-25 | `sep-2640-client-verify-frontmatter` | extension | driven | as `sep-2640-client-verify-digest`: the digest and size match, but the parsed frontmatter differs from the entry's, so the skill is not loaded |
+
+### Server leg
+
+| Leg | Revision | Scenario | Scoring | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| server | 2026-07-28 | `sep-2640-skills-enumeration` | extension | driven | gateway fixture: two skills (`McpSkillCatalog`), `skills/list` and `skills/get` with `ttlMs`/`cacheScope` on 2026-07-28 (the cache checks skip at 2025-11-25), -32602 for an unknown skill |
+| server | 2026-07-28 | `sep-2640-skills-manifest` | extension | driven | gateway fixture: each `SKILL.md` is listed by `resources/list` with the frontmatter name and description and read as `text/markdown` |
+| server | 2026-07-28 | `sep-2640-skills-directory` | extension | driven | gateway fixture: `directoryRead: true`; every directory level of a skill is an `inode/directory` resource; a file URI gets -32602 |
+| server | 2025-11-25 | `sep-2640-skills-enumeration` | extension | driven | gateway fixture: two skills (`McpSkillCatalog`), `skills/list` and `skills/get` with `ttlMs`/`cacheScope` on 2026-07-28 (the cache checks skip at 2025-11-25), -32602 for an unknown skill |
+| server | 2025-11-25 | `sep-2640-skills-manifest` | extension | driven | gateway fixture: each `SKILL.md` is listed by `resources/list` with the frontmatter name and description and read as `text/markdown` |
+| server | 2025-11-25 | `sep-2640-skills-directory` | extension | driven | gateway fixture: `directoryRead: true`; every directory level of a skill is an `inode/directory` resource; a file URI gets -32602 |

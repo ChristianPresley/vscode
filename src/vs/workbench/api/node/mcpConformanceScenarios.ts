@@ -4,6 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { MCPLegacy } from '../../../platform/mcp/common/modelContextProtocolLegacy.js';
+import { McpSkills } from '../../../platform/mcp/common/modelContextProtocolSkills.js';
+import { McpLoadedSkill } from '../../contrib/mcp/common/mcpSkills.js';
 import { IConformanceContext } from './mcpConformanceProxy.js';
 
 /**
@@ -25,6 +27,10 @@ export interface IScenarioClient {
 	readResource(uri: string): Promise<MCPLegacy.ReadResourceResult>;
 	listPrompts(): Promise<MCPLegacy.Prompt[]>;
 	getPrompt(name: string, args?: Record<string, string>): Promise<MCPLegacy.GetPromptResult>;
+	/** `skills/list` (Skills extension): the valid entries; reads no skill file. */
+	listSkills(): Promise<McpSkills.Skill[]>;
+	/** Loads a skill through the host's verified loading path (reads and verifies its `SKILL.md`). */
+	loadSkill(entry: McpSkills.Skill): Promise<McpLoadedSkill>;
 }
 
 export interface IScenarioDriver {
@@ -78,6 +84,18 @@ export const SCORED_CLIENT_SCENARIOS: ReadonlyMap<string, readonly string[]> = n
 	['auth/iss-normalized', ONLY_2026],
 	['auth/metadata-issuer-mismatch', ONLY_2026],
 ]);
+
+/**
+ * The client scenarios of the Skills extension (SEP-2640). No requirement set
+ * lists them (they are `[extension]` scenarios of the suite); the harness runs
+ * them forced at both revisions.
+ */
+export const EXTENSION_CLIENT_SCENARIOS: readonly string[] = [
+	'sep-2640-client-no-prefetch',
+	'sep-2640-client-verify-digest',
+	'sep-2640-client-verify-size',
+	'sep-2640-client-verify-frontmatter',
+];
 
 /** The client scenarios both requirement sets run without scoring (extensions and later additions). */
 export const UNSCORED_CLIENT_SCENARIOS: readonly string[] = [
@@ -332,6 +350,41 @@ const sseRetry: IScenarioDriver = {
 	},
 };
 
+const skillsNoPrefetch: IScenarioDriver = {
+	name: 'sep-2640-client-no-prefetch',
+	description: 'Lists the skills (as on connection) and loads none, so no skill file is read ahead of need',
+	async run(client) {
+		if ((await client.listSkills()).length === 0) {
+			throw new Error('The server lists no valid skill');
+		}
+	},
+};
+
+/**
+ * Lists the skills, loads the first one through the verified loading path and
+ * then reads each of its supporting files, as a model following the skill
+ * would. A `SKILL.md` that fails verification ends the scenario before any
+ * supporting file is read.
+ */
+function skillsVerify(name: string, check: string): IScenarioDriver {
+	return {
+		name,
+		description: `Loads a skill and reads its files; the served SKILL.md fails ${check} verification, so the load fails and nothing else is read`,
+		async run(client) {
+			const [entry] = await client.listSkills();
+			if (!entry) {
+				throw new Error('The server lists no valid skill');
+			}
+			const skill = await client.loadSkill(entry);
+			for (const file of entry.resources === McpSkills.DYNAMIC ? [] : entry.resources) {
+				if (file.uri !== entry.uri) {
+					await skill.readFile(file.uri);
+				}
+			}
+		},
+	};
+}
+
 const DRIVERS: ReadonlyMap<string, IScenarioDriver> = new Map<string, IScenarioDriver>([
 	[initialize.name, initialize],
 	[toolsCall.name, toolsCall],
@@ -344,6 +397,8 @@ const DRIVERS: ReadonlyMap<string, IScenarioDriver> = new Map<string, IScenarioD
 	[invalidToolHeaders.name, invalidToolHeaders],
 	[refNoDeref.name, refNoDeref],
 	[schemaPreservation.name, schemaPreservation],
+	[skillsNoPrefetch.name, skillsNoPrefetch],
+	...['digest', 'size', 'frontmatter'].map((check): [string, IScenarioDriver] => [`sep-2640-client-verify-${check}`, skillsVerify(`sep-2640-client-verify-${check}`, check)]),
 ]);
 
 /** The driver for a scenario name; every `auth/*` scenario shares the authorized driver. */

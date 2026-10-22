@@ -51,6 +51,25 @@ export const REQUIREMENT_TESTS_FILE = 'requirement-tests.json';
 /** The rendered conformance matrix, relative to this folder. */
 export const RENDERED_MATRIX_FILE = 'docs/mcp-conformance-matrix.md';
 
+/** A scenario of the suite that no requirement set lists (`[extension]` in the suite's `list`). */
+export interface IExtensionScenario {
+	readonly leg: Leg;
+	readonly scenario: string;
+	/** The extension the scenario tests, as the matrix names it. */
+	readonly extension: string;
+}
+
+/**
+ * The extension scenarios VS Code implements. No requirement set lists them, so
+ * the suite would skip them at a revision; the harness runs each one forced at
+ * every revision, in the not-scored loop and against the not-scored baseline,
+ * and requirement-matrix.md has an `extension` row for each.
+ */
+export const EXTENSION_SCENARIOS: readonly IExtensionScenario[] = [
+	...['sep-2640-client-no-prefetch', 'sep-2640-client-verify-digest', 'sep-2640-client-verify-size', 'sep-2640-client-verify-frontmatter'].map((scenario): IExtensionScenario => ({ leg: 'client', scenario, extension: 'SEP-2640' })),
+	...['sep-2640-skills-enumeration', 'sep-2640-skills-manifest', 'sep-2640-skills-directory'].map((scenario): IExtensionScenario => ({ leg: 'server', scenario, extension: 'SEP-2640' })),
+];
+
 export function scoredBaseline(leg: Leg, revision: Revision): string {
 	return `expected-failures-${leg}-${revision}.yml`;
 }
@@ -358,6 +377,8 @@ export interface IPlanContext {
 	readonly serverUrl: string | undefined;
 	/** The client scenarios of the suite that set `allowClientError` (from its bundle). */
 	readonly clientErrorAllowed?: ReadonlySet<string>;
+	/** The extension scenarios the not-scored loop also runs, at every selected revision ({@link EXTENSION_SCENARIOS}). */
+	readonly extensionScenarios?: readonly IExtensionScenario[];
 }
 
 /**
@@ -487,12 +508,23 @@ export function planScored(leg: Leg, context: IPlanContext): IInvocation[] {
 	return invocations;
 }
 
-/** One invocation per not-scored scenario of every selected revision, forced, against the not-scored baseline. */
+/**
+ * One invocation per not-scored scenario of every selected revision, forced,
+ * against the not-scored baseline; then the leg's extension scenarios the
+ * revision's set does not list, the same way.
+ */
 export function planUnscored(leg: Leg, context: IPlanContext): IInvocation[] {
 	const invocations: IInvocation[] = [];
 	for (const revision of context.options.revisions) {
-		for (const scenario of notScoredScenarios(setFor(context, revision), leg)) {
+		const set = setFor(context, revision);
+		const notScored = notScoredScenarios(set, leg);
+		for (const scenario of notScored) {
 			invocations.push(scenarioInvocation(leg, 'unscored', scenario, revision, context));
+		}
+		for (const { scenario } of (context.extensionScenarios ?? []).filter(extension => extension.leg === leg)) {
+			if (!notScored.includes(scenario) && !scoredScenarios(set, leg).includes(scenario)) {
+				invocations.push(scenarioInvocation(leg, 'unscored', scenario, revision, context));
+			}
 		}
 	}
 	return invocations;
@@ -1139,6 +1171,10 @@ export interface ICheckMatrixInput {
 	readonly grpcServerParity?: readonly IGrpcServerParityStep[];
 	/** The source of mcpConformanceScenarios.ts (null when it is missing); undefined skips the comparison of its driver tables with the suite. */
 	readonly scenarioDrivers?: string | null;
+	/** The extension scenarios that need matrix rows ({@link EXTENSION_SCENARIOS}); undefined: none. */
+	readonly extensionScenarios?: readonly IExtensionScenario[];
+	/** The requirement rows of the extensions ({@link EXTENSION_REQUIREMENTS}), checked and rendered; undefined: none. */
+	readonly extensionRequirements?: readonly IExtensionRequirement[];
 }
 
 export interface ISuiteInventory {
@@ -1148,14 +1184,47 @@ export interface ISuiteInventory {
 	readonly clientErrorAllowed: ReadonlySet<string>;
 }
 
+const ALLOW_CLIENT_ERROR = /\bthis\.allowClientError\s*=\s*(?:!0|true)\b/;
+const CONSTRUCTOR_END = /\}\s*(?:async\s+)?[A-Za-z_$][\w$]*\s*\(/;
+
 /**
- * The literal check ids (`id: '<check>'`) and scenario names
- * (`this.name = '<scenario>'`) of the suite's bundle, and the scenarios whose
- * constructor sets `this.allowClientError = true` (`!0` once minified).
+ * The text of the object literal that starts at `open` (a `{`), strings
+ * skipped so that their braces do not count; undefined when it never closes.
+ */
+function objectLiteralAt(bundle: string, open: number): string | undefined {
+	let depth = 0;
+	for (let index = open; index < bundle.length; index++) {
+		const char = bundle[index];
+		if (char === '`' || char === '\'' || char === '"') {
+			for (index++; index < bundle.length && bundle[index] !== char; index++) {
+				if (bundle[index] === '\\') {
+					index++;
+				}
+			}
+		} else if (char === '{') {
+			depth++;
+		} else if (char === '}' && --depth === 0) {
+			return bundle.slice(open, index + 1);
+		}
+	}
+	return undefined;
+}
+
+/**
+ * The literal check ids (`id: '<check>'`, `checkId: '<check>'`, and the
+ * SEP-numbered ids the extension scenarios keep in constants) and scenario
+ * names of the suite's bundle, and the scenarios whose constructor sets
+ * `this.allowClientError = true` (`!0` once minified). A scenario name is a
+ * literal (`this.name = '<scenario>'`), or comes from a table of the bundle
+ * (`this.name = table[mode].scenario`, one class for several scenarios):
+ * then every `scenario: '<name>'` of the table counts.
  */
 export function parseSuiteInventory(bundle: string): ISuiteInventory {
 	const checkIds = new Set<string>();
-	for (const match of bundle.matchAll(/\bid:\s*[`'"]([a-z0-9][a-z0-9_./-]*)[`'"]/g)) {
+	for (const match of bundle.matchAll(/\b(?:id|checkId):\s*[`'"]([a-z0-9][a-z0-9_./-]*)[`'"]/g)) {
+		checkIds.add(match[1]);
+	}
+	for (const match of bundle.matchAll(/[`'"](sep-\d+-[a-z0-9-]+)[`'"]/g)) {
 		checkIds.add(match[1]);
 	}
 	const scenarios = new Set<string>();
@@ -1166,12 +1235,42 @@ export function parseSuiteInventory(bundle: string): ISuiteInventory {
 		// the rest of the constructor: up to the next scenario name or the first method after the constructor's closing brace
 		const end = names[index + 1]?.index ?? bundle.length;
 		const rest = bundle.slice(match.index, Math.min(end, match.index + 8192));
-		const constructorEnd = /\}\s*(?:async\s+)?[A-Za-z_$][\w$]*\s*\(/.exec(rest);
-		if (/\bthis\.allowClientError\s*=\s*(?:!0|true)\b/.test(constructorEnd ? rest.slice(0, constructorEnd.index) : rest)) {
+		const constructorEnd = CONSTRUCTOR_END.exec(rest);
+		if (ALLOW_CLIENT_ERROR.test(constructorEnd ? rest.slice(0, constructorEnd.index) : rest)) {
 			clientErrorAllowed.add(match[1]);
 		}
 	});
+	for (const match of bundle.matchAll(/\bthis\.name\s*=\s*([A-Za-z_$][\w$]*)\[[A-Za-z_$][\w$]*\]\.scenario\b/g)) {
+		const definition = new RegExp(`(?:^|[^\\w$.])${match[1].replace(/\$/g, '\\$')}\\s*=\\s*\\{`, 'g');
+		let table: string | undefined;
+		for (const candidate of bundle.matchAll(definition)) {
+			const literal = objectLiteralAt(bundle, candidate.index + candidate[0].length - 1);
+			if (literal && /\bscenario:/.test(literal)) {
+				table = literal;
+				break;
+			}
+		}
+		if (!table) {
+			continue;
+		}
+		// the constructor around the assignment: from `constructor(` to its closing brace
+		const start = bundle.lastIndexOf('constructor(', match.index);
+		const rest = bundle.slice(match.index, match.index + 8192);
+		const constructorEnd = CONSTRUCTOR_END.exec(rest);
+		const constructor = bundle.slice(start < 0 ? match.index : start, match.index + (constructorEnd?.index ?? rest.length));
+		const allowed = ALLOW_CLIENT_ERROR.test(constructor);
+		for (const entry of table.matchAll(/\bscenario:\s*[`'"]([a-z0-9][a-z0-9_./-]*)[`'"]/g)) {
+			scenarios.add(entry[1]);
+			if (allowed) {
+				clientErrorAllowed.add(entry[1]);
+			}
+		}
+	}
 	return { checkIds, scenarios, clientErrorAllowed };
+}
+
+function isExtensionScenario(input: Pick<ICheckMatrixInput, 'extensionScenarios'>, leg: Leg, scenario: string): boolean {
+	return (input.extensionScenarios ?? []).some(candidate => candidate.leg === leg && candidate.scenario === scenario);
 }
 
 function baselineFor(input: ICheckMatrixInput, file: string, leg: Leg): readonly string[] {
@@ -1210,11 +1309,12 @@ export function checkMatrix(input: ICheckMatrixInput): string[] {
 		const leg = row.leg as Leg;
 		const scored = set ? scoredScenarios(set, leg).includes(row.scenario) : false;
 		const notScored = set ? notScoredScenarios(set, leg).includes(row.scenario) : false;
-		if (!scored && !notScored) {
+		const extension = !scored && !notScored && isExtensionScenario(input, leg, row.scenario);
+		if (!scored && !notScored && !extension) {
 			problems.push(`${where}: requirements/${row.revision}.yaml lists no ${row.leg} scenario ${row.scenario}`);
 			continue;
 		}
-		const scoring = scored ? 'scored' : 'not-scored';
+		const scoring = scored ? 'scored' : notScored ? 'not-scored' : 'extension';
 		if (row.scoring !== scoring) {
 			problems.push(`${where}: ${key} is ${scoring}, not ${row.scoring}`);
 		}
@@ -1226,14 +1326,16 @@ export function checkMatrix(input: ICheckMatrixInput): string[] {
 		if (row.status === 'driven' && baselined) {
 			problems.push(`${where}: ${key} is driven (every check passes) but ${baselineFile} has ${row.leg} entries for it: make the row a gap or remove the entries`);
 		}
-		if (notScored && row.status !== 'driven' && !baselined) {
-			problems.push(`${where}: the not-scored ${key} is neither driven nor baselined in ${UNSCORED_BASELINE}`);
+		if ((notScored || extension) && row.status !== 'driven' && !baselined) {
+			problems.push(`${where}: the ${notScored ? 'not-scored' : 'extension'} ${key} is neither driven nor baselined in ${UNSCORED_BASELINE}`);
 		}
 	}
 
 	for (const set of input.sets) {
 		for (const leg of legs) {
-			for (const scenario of [...scoredScenarios(set, leg), ...notScoredScenarios(set, leg)]) {
+			const listed = [...scoredScenarios(set, leg), ...notScoredScenarios(set, leg)];
+			const extensions = (input.extensionScenarios ?? []).filter(candidate => candidate.leg === leg && !listed.includes(candidate.scenario)).map(candidate => candidate.scenario);
+			for (const scenario of [...listed, ...extensions]) {
 				if (!rows.has(`${leg} ${set.revision} ${scenario}`)) {
 					problems.push(`${MATRIX_FILE} has no row for ${leg} ${set.revision} ${scenario}`);
 				}
@@ -1252,7 +1354,7 @@ export function checkMatrix(input: ICheckMatrixInput): string[] {
 			}
 		}
 		for (const entry of baselineFor(input, UNSCORED_BASELINE, leg)) {
-			if (!input.sets.some(set => notScoredScenarios(set, leg).includes(entryScenario(entry)))) {
+			if (!input.sets.some(set => notScoredScenarios(set, leg).includes(entryScenario(entry))) && !isExtensionScenario(input, leg, entryScenario(entry))) {
 				problems.push(`${UNSCORED_BASELINE}: ${entry} is not a not-scored ${leg} scenario`);
 			}
 		}
@@ -1264,6 +1366,11 @@ export function checkMatrix(input: ICheckMatrixInput): string[] {
 				problems.push(`the suite defines no authorization-server scenario ${scenario}`);
 			}
 		}
+		for (const { leg, scenario } of input.extensionScenarios ?? []) {
+			if (!input.suite.scenarios.has(scenario)) {
+				problems.push(`the suite defines no ${leg} extension scenario ${scenario}`);
+			}
+		}
 	}
 
 	const model = loadRequirementModel(input, problems);
@@ -1271,6 +1378,7 @@ export function checkMatrix(input: ICheckMatrixInput): string[] {
 	problems.push(...checkRequirementSources(input));
 	problems.push(...checkRequirementTests(input, rows, model, checkTest));
 	problems.push(...checkRenderedTestCitations(input.grpcServerParity ?? [], checkTest));
+	problems.push(...checkExtensionRequirements(input, rows, checkTest));
 	problems.push(...checkGatewayThreats(input, rows, checkTest));
 	problems.push(...checkScenarioDrivers(input));
 	if (input.renderedMatrix !== undefined) {
@@ -1732,6 +1840,8 @@ export interface IScenarioDrivers {
 	readonly scored: ReadonlyMap<string, readonly string[]>;
 	/** `UNSCORED_CLIENT_SCENARIOS`. */
 	readonly unscored: readonly string[];
+	/** `EXTENSION_CLIENT_SCENARIOS`, or undefined when the file has no such table. */
+	readonly extension: readonly string[] | undefined;
 }
 
 /**
@@ -1764,7 +1874,9 @@ export function parseScenarioDrivers(source: string): IScenarioDrivers | undefin
 		scored.set(entry[1], revisions);
 	}
 	const unscored = [...unscoredTable[1].matchAll(/'([^']+)'/g)].map(match => match[1]);
-	return { scored, unscored };
+	const extensionTable = /\bEXTENSION_CLIENT_SCENARIOS\b[^=]*=\s*\[([\s\S]*?)\];/.exec(source);
+	const extension = extensionTable ? [...extensionTable[1].matchAll(/'([^']+)'/g)].map(match => match[1]) : undefined;
+	return { scored, unscored, extension };
 }
 
 /** The driver tables of the conformance client must list exactly the client scenarios of the suite's requirement sets. */
@@ -1800,6 +1912,19 @@ function checkScenarioDrivers(input: ICheckMatrixInput): string[] {
 	for (const scenario of drivers.unscored) {
 		if (!input.sets.some(set => notScoredScenarios(set, 'client').includes(scenario))) {
 			problems.push(`${SCENARIO_DRIVERS_FILE}: UNSCORED_CLIENT_SCENARIOS lists ${scenario}, which no requirement set runs without scoring`);
+		}
+	}
+	const extensions = (input.extensionScenarios ?? []).filter(candidate => candidate.leg === 'client').map(candidate => candidate.scenario);
+	if (extensions.length > 0 || drivers.extension) {
+		for (const scenario of extensions) {
+			if (!drivers.extension?.includes(scenario)) {
+				problems.push(`${SCENARIO_DRIVERS_FILE}: EXTENSION_CLIENT_SCENARIOS does not list ${scenario}, which the harness runs as an extension scenario`);
+			}
+		}
+		for (const scenario of drivers.extension ?? []) {
+			if (!extensions.includes(scenario)) {
+				problems.push(`${SCENARIO_DRIVERS_FILE}: EXTENSION_CLIENT_SCENARIOS lists ${scenario}, which is not an extension scenario of the harness (EXTENSION_SCENARIOS)`);
+			}
 		}
 	}
 	return problems;
@@ -1869,6 +1994,82 @@ function checkGatewayThreats(input: ICheckMatrixInput, rows: ReadonlyMap<string,
 			const row = rows.get(`${citation.leg} ${citation.revision} ${citation.scenario}`);
 			if (row?.status !== 'driven') {
 				problems.push(`${where} cites ${describeScenario(citation)}, whose ${MATRIX_FILE} row is ${row?.status ?? 'missing'}, not driven`);
+			}
+		}
+	}
+	return problems;
+}
+
+/** A check of an extension scenario of the suite. */
+export interface IExtensionCheckCitation {
+	readonly leg: Leg;
+	readonly scenario: string;
+	readonly check: string;
+}
+
+/**
+ * A normative sentence of an extension that the requirements file (the core
+ * specification) does not contain, with the tests and the checks of the
+ * suite's extension scenarios that cover it. The statuses mean what they mean
+ * for a requirement row.
+ */
+export interface IExtensionRequirement {
+	/** `<extension>#<short name>`. */
+	readonly id: string;
+	readonly extension: string;
+	/** The anchor of the section of the extension's specification. */
+	readonly anchor: string;
+	readonly party: 'client' | 'server';
+	readonly level: RequirementLevel;
+	readonly text: string;
+	readonly status: MappingStatus;
+	readonly reason?: string;
+	readonly tests: readonly ITestCitation[];
+	readonly checks: readonly IExtensionCheckCitation[];
+}
+
+/** The extension requirement rows: valid statuses, test citations that run, and checks of driven extension scenarios the suite defines. */
+function checkExtensionRequirements(input: ICheckMatrixInput, rows: ReadonlyMap<string, IMatrixRow>, checkTest: (where: string, citation: ITestCitation) => string | undefined): string[] {
+	const problems: string[] = [];
+	const ids = new Set<string>();
+	for (const requirement of input.extensionRequirements ?? []) {
+		const where = `the extension requirement ${requirement.id}`;
+		if (ids.has(requirement.id)) {
+			problems.push(`${where} is listed twice`);
+		}
+		ids.add(requirement.id);
+		const cited = requirement.tests.length + requirement.checks.length;
+		if ((requirement.status === 'tested' || requirement.status === 'partial') && cited === 0) {
+			problems.push(`${where} is ${requirement.status} but cites no test or check`);
+		}
+		if (requirement.status !== 'tested' && !requirement.reason) {
+			problems.push(`${where} is ${requirement.status} without a reason`);
+		}
+		if (requirement.status === 'gap' && isMustLevel(requirement.level)) {
+			problems.push(`${where} is a ${levelName(requirement.level)} requirement and cannot be a gap`);
+		}
+		if (requirement.status === 'n-a' && cited > 0) {
+			problems.push(`${where} is n-a but cites tests or checks`);
+		}
+		for (const test of requirement.tests) {
+			const problem = checkTest(where, test);
+			if (problem) {
+				problems.push(problem);
+			}
+		}
+		for (const citation of requirement.checks) {
+			if (!isExtensionScenario(input, citation.leg, citation.scenario)) {
+				problems.push(`${where} cites ${citation.leg} ${citation.scenario}, which is not an extension scenario of the harness`);
+				continue;
+			}
+			if (input.suite && !input.suite.checkIds.has(citation.check)) {
+				problems.push(`${where} cites the check ${citation.check}, which the suite does not define`);
+			}
+			for (const revision of REVISIONS) {
+				const row = rows.get(`${citation.leg} ${revision} ${citation.scenario}`);
+				if (row?.status !== 'driven') {
+					problems.push(`${where} cites ${citation.leg} ${revision} ${citation.scenario}, whose ${MATRIX_FILE} row is ${row?.status ?? 'missing'}, not driven`);
+				}
 			}
 		}
 	}
@@ -2030,13 +2231,166 @@ export const FEATURE_ROWS: readonly { readonly feature: string; readonly status:
 	{ feature: 'Sampling with tools (`sampling.tools`, `tools` and `toolChoice` in `sampling/createMessage`)', status: 'in', notes: 'The client declares `sampling.tools` when a language model with tool calling is offered and maps `tool_use` / `tool_result` blocks to the language model API (`mcpSamplingService.test.ts`).' },
 	{ feature: 'Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663)', status: 'in', notes: 'Client: opt-in polling of `tasks/get` (`mcpModernTask.test.ts`). Gateway: `tasks/get`, `tasks/update`, `tasks/cancel` (M9); the suite\'s `tasks-*` server scenarios run not scored.' },
 	{ feature: 'MCP Apps (`io.modelcontextprotocol/ui`)', status: 'in', notes: 'The client declares the extension on the 2026-07-28 wire and renders app-only tools in the chat, not for the language model.' },
-	{ feature: 'Skills extension (`io.modelcontextprotocol/skills`, SEP-2640)', status: 'deferred', notes: 'Not implemented; deferred to a later milestone. The suite (since 0.2.0-alpha.12) has extension scenarios for it, `sep-2640-skills-directory`, `sep-2640-skills-enumeration`, `sep-2640-skills-manifest` (server) and `sep-2640-client-no-prefetch`, `sep-2640-client-verify-digest`, `sep-2640-client-verify-size`, `sep-2640-client-verify-frontmatter` (client), which no requirement set lists, so the harness does not run them.' },
+	{ feature: 'Skills extension (`io.modelcontextprotocol/skills`, SEP-2640)', status: 'in', notes: 'Client: `skills/list`, `skills/get` and `resources/directory/read` (only with `directoryRead: true`) in the protocol engine; a skill is loaded through `McpLoadedSkill` (`mcpSkills.ts`), which validates the entry and verifies every file it reads (listed, size, SHA-256 digest, and the `SKILL.md` frontmatter field by field); `IMcpServer.skills()` lists without reading any file. VS Code does not yet put MCP-served skills into a chat model\'s context (see the n/a rows below). Gateway: passes the skills of the server behind a route through (`skills/list`, `skills/get`, `resources/directory/read`) and advertises the extension exactly when the server does. The suite\'s seven `sep-2640-*` extension scenarios run forced at both revisions, not scored (see Extension scenarios: SEP-2640).' },
 	{ feature: 'OAuth client credentials (`auth/client-credentials-jwt`, `auth/client-credentials-basic`)', status: 'excluded', notes: 'An authorization extension for machine clients; VS Code signs in users. The scenarios run not scored and are baselined whole.' },
 	{ feature: 'Enterprise-managed authorization (`auth/enterprise-managed-authorization`)', status: 'excluded', notes: 'The product has a preview of ID-JAG sign-in for enterprise-managed servers (`oauth.enterpriseManaged`), which the conformance client does not drive; the scenario is baselined whole in `expected-failures-unscored.yml`.' },
 	{ feature: 'DPoP (`auth/dpop`, `auth/dpop-nonce`)', status: 'excluded', notes: 'Baselined whole in `expected-failures-unscored.yml`.' },
 	{ feature: 'Workload identity federation (`auth/wif-jwt-bearer`)', status: 'excluded', notes: 'Baselined whole in `expected-failures-unscored.yml`.' },
 	{ feature: 'gRPC transport (`grpc://`, `grpcs://`)', status: 'in', notes: 'Client: `McpGrpcHandle` with the tunnel and typed bindings (M8). Gateway: a gRPC listener for the routes of the gateways that ask for it (`startMcpGateway(resource, { grpc: true })`), open only while one of them has a server (M10).' },
 	{ feature: '`grpc_server.zig` parity (the gateway gRPC listener)', status: 'in', notes: 'The listener checks a call in the order of zig-sdk\'s `src/grpc/transport/grpc_server.zig` (`handleStreamInner`): see the validation order below. The gateway has no authorization, so the loopback `:authority` check and the route lookup take the place of the authorization step.' },
+];
+
+const SKILLS_PROTOCOL_TESTS = 'src/vs/platform/mcp/test/common/modelContextProtocolSkills.test.ts';
+const SKILL_CATALOG_TESTS = 'src/vs/platform/mcp/test/common/mcpSkillCatalog.test.ts';
+const GATEWAY_SKILLS_TESTS = 'src/vs/platform/mcp/test/node/mcpGatewaySkills.test.ts';
+const SKILL_LOADER_TESTS = 'src/vs/workbench/contrib/mcp/test/common/mcpSkills.test.ts';
+const HANDLER_TESTS = 'src/vs/workbench/contrib/mcp/test/common/mcpServerRequestHandler.test.ts';
+const SCENARIO_DRIVER_TESTS = 'src/vs/workbench/api/test/node/mcpConformanceScenarios.test.ts';
+
+function skillsCheck(leg: Leg, scenario: string, ...checks: string[]): IExtensionCheckCitation[] {
+	return checks.map(check => ({ leg, scenario, check: `sep-2640-${check}` }));
+}
+
+/** Not applicable to VS Code for now: the reason of the rows about a skill in a model's context. */
+const NO_MODEL_CONTEXT = 'VS Code does not put MCP-served skills into a language model\'s context yet: chat has no registry entry and no loading tool for them. The skill API (`IMcpServer.skills()`, `IMcpServer.loadSkill()`, `McpLoadedSkill`) serves the gateway and the conformance client; a chat integration has to meet this row.';
+
+/** The sentences of the Skills extension (SEP-2640), which the requirements file of the core specification does not contain. */
+export const EXTENSION_REQUIREMENTS: readonly IExtensionRequirement[] = [
+	{
+		id: 'SEP-2640#capability', extension: 'SEP-2640', anchor: 'capability-declaration', party: 'server', level: 'must', status: 'tested',
+		text: 'Servers declare support for this extension in the `extensions` field of their capabilities; an empty object indicates support with no optional features. A server declaring this extension MUST also declare the `resources` capability.',
+		tests: [
+			{ file: GATEWAY_SKILLS_TESTS, test: 'an invoker that lists and gets skills makes the route declare the extension in both eras, inline and with resources' },
+			{ file: GATEWAY_SKILLS_TESTS, test: 'the extension is not declared without both methods, or when the declared capabilities leave it out' },
+			{ file: GATEWAY_SKILLS_TESTS, test: 'a route passes the skills of its server through, and declares the extension only for a server that does' },
+		],
+		checks: skillsCheck('server', 'sep-2640-skills-enumeration', 'capability-declaration-inline', 'capability-empty-object', 'capability-requires-resources'),
+	},
+	{
+		id: 'SEP-2640#skills-list', extension: 'SEP-2640', anchor: 'enumeration-via-skillslist', party: 'server', level: 'must', status: 'tested',
+		text: 'A server declaring the `io.modelcontextprotocol/skills` extension MUST implement the `skills/list` method, which returns the skills it serves. In protocol versions 2026-07-28 and later, the result also carries `ttlMs` and `cacheScope`.',
+		tests: [{ file: GATEWAY_SKILLS_TESTS, test: 'skills/list: the entries, with the envelope and cache hints on the 2026-07-28 wire; a cursor is unknown' }],
+		checks: skillsCheck('server', 'sep-2640-skills-enumeration', 'skills-list-implemented', 'capability-commits-to-methods', 'skills-list-pagination', 'skills-list-entry-atomic', 'skills-list-cache-attributes'),
+	},
+	{
+		id: 'SEP-2640#resources-complete', extension: 'SEP-2640', anchor: 'resources', party: 'server', level: 'must', status: 'tested',
+		text: 'When present, `resources` MUST be complete: it lists every file of the skill, each exactly once, including an entry matching the skill\'s top-level `uri`. Each entry MUST carry `size`, the length in bytes of the raw content the `digest` covers.',
+		tests: [{ file: SKILL_CATALOG_TESTS, test: 'entries carry the verbatim frontmatter and a complete manifest whose digests and sizes match the served bytes' }, { file: SKILL_CATALOG_TESTS, test: 'sizes count UTF-8 bytes, not characters' }],
+		checks: skillsCheck('server', 'sep-2640-skills-enumeration', 'entry-resources-required', 'resources-complete', 'resources-uri-within-skill', 'resources-digest-format', 'resources-size-required'),
+	},
+	{
+		id: 'SEP-2640#frontmatter', extension: 'SEP-2640', anchor: 'frontmatter', party: 'server', level: 'must', status: 'tested',
+		text: 'The `frontmatter` object MUST be identical in content to the frontmatter of the `SKILL.md` it describes. The final `<skill-path>` segment of the entry\'s `uri` MUST equal `frontmatter.name`.',
+		tests: [
+			{ file: SKILL_CATALOG_TESTS, test: 'entries carry the verbatim frontmatter and a complete manifest whose digests and sizes match the served bytes' },
+			{ file: SKILL_CATALOG_TESTS, test: 'a definition with an invalid name, a missing description, a bad file path or a duplicate skill is refused' },
+		],
+		checks: [
+			...skillsCheck('server', 'sep-2640-skills-enumeration', 'entry-frontmatter-identical', 'entry-uri-matches-frontmatter-name', 'name-naming-rules', 'skillmd-required', 'skillmd-frontmatter'),
+			...skillsCheck('server', 'sep-2640-skills-manifest', 'final-segment-equals-name'),
+		],
+	},
+	{
+		id: 'SEP-2640#skills-get', extension: 'SEP-2640', anchor: 'retrieval-via-skillsget', party: 'server', level: 'must', status: 'tested',
+		text: 'A server declaring the extension MUST also implement the `skills/get` method. If the URI does not identify a skill the server serves, the server MUST return error `-32602` (Invalid params). The result carries no pagination cursor.',
+		tests: [{ file: GATEWAY_SKILLS_TESTS, test: 'skills/get: one entry without a cursor; an unknown or missing URI is -32602 in both eras' }],
+		checks: skillsCheck('server', 'sep-2640-skills-enumeration', 'skills-get-implemented', 'skills-get-entry-shape', 'skills-get-no-cursor', 'skills-get-cache-attributes', 'skills-get-unknown-uri-invalid-params'),
+	},
+	{
+		id: 'SEP-2640#resource-metadata', extension: 'SEP-2640', anchor: 'resource-metadata', party: 'server', level: 'should', status: 'tested',
+		text: 'For each `SKILL.md` resource, `mimeType` SHOULD be `text/markdown`, `name` SHOULD be set from the frontmatter `name` and `description` from the frontmatter `description`.',
+		tests: [{ file: SKILL_CATALOG_TESTS, test: 'every file is a resource; SKILL.md carries the frontmatter name and description and is text/markdown' }],
+		checks: skillsCheck('server', 'sep-2640-skills-manifest', 'skillmd-mimetype', 'skillmd-metadata-name', 'skillmd-metadata-description', 'meta-prefix'),
+	},
+	{
+		id: 'SEP-2640#directory-read', extension: 'SEP-2640', anchor: 'resourcesdirectoryread', party: 'server', level: 'must', status: 'tested',
+		text: 'A server that declares `directoryRead` MUST support `resources/directory/read` for every directory within the skill namespaces it serves as individual files; subdirectories are listed as `inode/directory` resources. If the URI does not exist, or is not a directory resource, the server MUST return error `-32602`.',
+		tests: [
+			{ file: GATEWAY_SKILLS_TESTS, test: 'resources/directory/read: the children of a directory; anything else is -32602' },
+			{ file: SKILL_CATALOG_TESTS, test: 'every directory level of a skill is a directory resource listing its direct children' },
+		],
+		checks: skillsCheck('server', 'sep-2640-skills-directory', 'capability-directory-read-flag', 'directory-read-method-registered', 'directory-read-result-resources-shape', 'directory-read-subdir-mimetype', 'directory-read-invalid-params', 'directory-read-pagination'),
+	},
+	{
+		id: 'SEP-2640#no-prefetch', extension: 'SEP-2640', anchor: 'integrity-and-verification', party: 'client', level: 'must_not', status: 'tested',
+		text: 'Hosts MUST NOT retrieve a skill\'s files ahead of need, whether on connection, on listing, or at approval. A `SKILL.md` is fetched when the skill is loaded, and a supporting file when it is read.',
+		tests: [
+			{ file: HANDLER_TESTS, test: 'skills/list follows nextCursor across pages and returns the entries as received' },
+			{ file: SKILL_LOADER_TESTS, test: 'loading a skill reads and verifies only its SKILL.md' },
+			{ file: SCENARIO_DRIVER_TESTS, test: 'no-prefetch lists the skills and reads no file' },
+		],
+		checks: skillsCheck('client', 'sep-2640-client-no-prefetch', 'host-no-prefetch'),
+	},
+	{
+		id: 'SEP-2640#verify-digest', extension: 'SEP-2640', anchor: 'integrity-and-verification', party: 'client', level: 'must', status: 'tested',
+		text: 'When a host retrieves a file listed in a skill\'s `resources`, it MUST verify the content against that entry\'s digest; hosts MUST NOT use the unverified content.',
+		tests: [
+			{ file: SKILLS_PROTOCOL_TESTS, test: 'a file verifies against the held entry: listed, same size, same digest' },
+			{ file: SKILL_LOADER_TESTS, test: 'a SKILL.md that fails its digest, its size or its frontmatter is not loaded' },
+			{ file: SKILL_LOADER_TESTS, test: 'a supporting file that changed after the listing is not used' },
+		],
+		checks: skillsCheck('client', 'sep-2640-client-verify-digest', 'host-verify-digest'),
+	},
+	{
+		id: 'SEP-2640#verify-size', extension: 'SEP-2640', anchor: 'resources', party: 'client', level: 'must', status: 'tested',
+		text: 'A read whose byte length differs from the entry\'s `size` is a verification failure equivalent to a digest mismatch, whether or not the host goes on to compute the digest.',
+		tests: [{ file: SKILLS_PROTOCOL_TESTS, test: 'a file verifies against the held entry: listed, same size, same digest' }, { file: SCENARIO_DRIVER_TESTS, test: 'a SKILL.md that fails verification ends the scenario before any supporting file is read' }],
+		checks: skillsCheck('client', 'sep-2640-client-verify-size', 'host-size-mismatch-failure'),
+	},
+	{
+		id: 'SEP-2640#verify-frontmatter', extension: 'SEP-2640', anchor: 'integrity-and-verification', party: 'client', level: 'must', status: 'tested',
+		text: 'After fetching a `SKILL.md` for which the host holds an entry, hosts MUST parse its YAML frontmatter and compare it field-by-field against the entry\'s `frontmatter`; any discrepancy is a verification failure and the skill MUST NOT be loaded.',
+		tests: [
+			{ file: SKILLS_PROTOCOL_TESTS, test: 'a SKILL.md whose frontmatter differs from the entry fails even when its digest and size match' },
+			{ file: SKILLS_PROTOCOL_TESTS, test: 'the frontmatter parses into JSON with the YAML 1.2 core schema' },
+		],
+		checks: skillsCheck('client', 'sep-2640-client-verify-frontmatter', 'host-frontmatter-comparison'),
+	},
+	{
+		id: 'SEP-2640#unlisted-file', extension: 'SEP-2640', anchor: 'integrity-and-verification', party: 'client', level: 'must', status: 'tested',
+		text: 'While acting on a skill, a host MUST resolve reads of the skill\'s files only to URIs listed in that entry\'s `resources`, and MUST treat a read of an unlisted file within the skill as a verification failure equivalent to a digest mismatch.',
+		tests: [{ file: SKILL_LOADER_TESTS, test: 'while acting on a skill, an unlisted file or one outside the skill is refused without a read' }],
+		checks: [],
+	},
+	{
+		id: 'SEP-2640#invalid-entry', extension: 'SEP-2640', anchor: 'resources', party: 'client', level: 'must_not', status: 'tested',
+		text: 'An entry with no `resources` at all, or with any value other than an array or `"dynamic"`, is invalid, and hosts MUST NOT load it.',
+		tests: [{ file: SKILLS_PROTOCOL_TESTS, test: 'an invalid entry is refused with the problem it has' }, { file: SKILL_LOADER_TESTS, test: 'an invalid entry is refused before anything is read' }],
+		checks: [],
+	},
+	{
+		id: 'SEP-2640#limits', extension: 'SEP-2640', anchor: 'limits', party: 'client', level: 'must', status: 'tested',
+		text: 'Hosts MUST support skills up to and including 512 resource entries and 16 MiB of total file size.',
+		tests: [{ file: SKILLS_PROTOCOL_TESTS, test: 'the extension limits are 512 files and 16 MiB, both inclusive' }, { file: SKILL_LOADER_TESTS, test: 'a dynamic skill reads any file inside it, up to the total-size limit' }],
+		checks: [],
+	},
+	{
+		id: 'SEP-2640#directory-read-gate', extension: 'SEP-2640', anchor: 'capability-declaration', party: 'client', level: 'must_not', status: 'tested',
+		text: 'Clients MUST NOT call `resources/directory/read` against a server that has not declared `directoryRead: true`.',
+		tests: [{ file: HANDLER_TESTS, test: 'resources/directory/read is sent only to a server that declared directoryRead: true' }],
+		checks: [],
+	},
+	{
+		id: 'SEP-2640#names', extension: 'SEP-2640', anchor: 'names', party: 'client', level: 'must', status: 'tested',
+		text: 'Hosts MUST NOT assume name uniqueness. When two entries in one listing collide on `name`, hosts MUST disambiguate them, for example by their distinguishing path segments, rather than silently discarding or preferring one.',
+		tests: [{ file: SKILL_LOADER_TESTS, test: 'colliding names are qualified by their skill path, never dropped' }],
+		checks: [],
+	},
+	{
+		id: 'SEP-2640#origin-visible', extension: 'SEP-2640', anchor: 'security-implications', party: 'client', level: 'must', status: 'n-a',
+		text: 'Hosts MUST tag MCP-served skill content with its originating server identity at the point it enters model context and MUST NOT present an MCP-served skill to the model as indistinguishable from a local filesystem skill.',
+		reason: NO_MODEL_CONTEXT, tests: [], checks: [],
+	},
+	{
+		id: 'SEP-2640#approval', extension: 'SEP-2640', anchor: 'security-implications', party: 'client', level: 'must_not', status: 'n-a',
+		text: 'Hosts MUST NOT allow MCP-served skill content to cause host-side code execution without explicit per-skill user approval, and MUST ignore `allowed-tools` for MCP-origin skills unless the user has explicitly approved that grant.',
+		reason: NO_MODEL_CONTEXT, tests: [], checks: [],
+	},
+	{
+		id: 'SEP-2640#origin-scoped-reads', extension: 'SEP-2640', anchor: 'security-implications', party: 'client', level: 'must_not', status: 'n-a',
+		text: 'Hosts MUST bind model-callable resource reads to the skill\'s originating server: a skill served by server A MUST NOT cause a `resources/read` against server B.',
+		reason: NO_MODEL_CONTEXT, tests: [], checks: [],
+	},
 ];
 
 /**
@@ -2137,6 +2491,53 @@ function normalizeNewlines(text: string): string {
 
 function scenarioKey(leg: Leg, revision: string, scenario: string): string {
 	return `${leg} ${revision} ${scenario}`;
+}
+
+/** Where each extension's specification lives, for the links of its requirement rows. */
+const EXTENSION_SITES: Readonly<Record<string, string>> = {
+	'SEP-2640': 'https://modelcontextprotocol.io/seps/2640-skills-extension',
+};
+
+/** The extension scenarios and requirement rows, one section per extension (nothing when there are none). */
+function renderExtensions(input: ICheckMatrixInput, push: (...lines: string[]) => void): void {
+	const extensions: string[] = [];
+	for (const name of [...(input.extensionScenarios ?? []).map(row => row.extension), ...(input.extensionRequirements ?? []).map(row => row.extension)]) {
+		if (!extensions.includes(name)) {
+			extensions.push(name);
+		}
+	}
+	for (const extension of extensions) {
+		const scenarios = (input.extensionScenarios ?? []).filter(row => row.extension === extension);
+		const site = EXTENSION_SITES[extension];
+		push(
+			'',
+			`### Extension scenarios: ${extension}`,
+			'',
+			`No requirement set lists these scenarios (the suite marks them \`[extension]\`), and the requirements file of this matrix is the core specification only. The harness runs each scenario forced at both revisions in the not-scored loop, against ${code(UNSCORED_BASELINE)}; the requirement rows below are the extension's own sentences${site ? ` ([${extension}](${site}))` : ''}.`,
+			'',
+			'| Leg | Revision | Scenario | Status | Notes |',
+			'| --- | --- | --- | --- | --- |',
+		);
+		for (const { leg, scenario } of scenarios) {
+			for (const revision of REVISIONS) {
+				const row = input.matrix.find(candidate => candidate.leg === leg && candidate.revision === revision && candidate.scenario === scenario);
+				push(`| ${leg} | ${revision} | ${code(scenario)} | ${row?.status ?? 'missing'} | ${cell(row?.notes ?? '')} |`);
+			}
+		}
+		const requirements = (input.extensionRequirements ?? []).filter(row => row.extension === extension);
+		if (requirements.length > 0) {
+			push('', '| ID | Party | Level | Status | Requirement | Coverage |', '| --- | --- | --- | --- | --- | --- |');
+			for (const requirement of requirements) {
+				const coverage = [
+					...requirement.tests.map(test => `${code(test.file.replace(/^.*\//, ''))} ${cell(test.test)}`),
+					...requirement.checks.map(citation => `conformance ${citation.leg} ${code(citation.scenario)} (${code(citation.check)})`),
+					...(requirement.reason ? [`*${requirement.status === 'n-a' ? 'Not applicable' : 'Reason'}:* ${cell(requirement.reason)}`] : []),
+				];
+				const id = site ? `[${code(requirement.id)}](${site}#${requirement.anchor})` : code(requirement.id);
+				push(`| ${id} | ${requirement.party} | ${LEVEL_NAMES[requirement.level]} | ${STATUS_NAMES[requirement.status]} | ${cell(requirement.text)} | ${coverage.join('<br>')} |`);
+			}
+		}
+	}
 }
 
 /** Renders docs/mcp-conformance-matrix.md. */
@@ -2263,6 +2664,7 @@ export function renderConformanceMatrix(input: ICheckMatrixInput, model: IRequir
 	for (const row of AUTHORIZATION_SERVER_SCENARIOS) {
 		push(`| ${code(row.scenario)} | n/a | ${cell(row.reason)} |`);
 	}
+	renderExtensions(input, push);
 	push('', '## Requirements', '', 'One table per page of the specification. Test citations name the file under `src/` or `test/` and the test; scenario citations name the leg, the revision and the scenario (and a check of it).', '');
 
 	const pages: string[] = [];
@@ -2351,6 +2753,8 @@ export function readCheckMatrixInput(dir: string = HERE, root: string = ROOT, su
 		gatewayThreats: readOptional(path.join(dir, GATEWAY_THREATS_FILE)) ?? null,
 		grpcServerParity: GRPC_SERVER_PARITY,
 		scenarioDrivers: readOptional(path.join(root, SCENARIO_DRIVERS_FILE)) ?? null,
+		extensionScenarios: EXTENSION_SCENARIOS,
+		extensionRequirements: EXTENSION_REQUIREMENTS,
 	};
 }
 
@@ -2563,7 +2967,7 @@ export async function main(argv: readonly string[], env: Env, deps: IHarnessDeps
 				serverUrl = server.url;
 				deps.log(`[mcp-conformance] the gateway fixture listens at ${serverUrl}`);
 			}
-			const context: IPlanContext = { options, sets, baselineDir: HERE, clientCommand: clientCommand(ROOT), serverUrl, clientErrorAllowed: suite.clientErrorAllowed };
+			const context: IPlanContext = { options, sets, baselineDir: HERE, clientCommand: clientCommand(ROOT), serverUrl, clientErrorAllowed: suite.clientErrorAllowed, extensionScenarios: EXTENSION_SCENARIOS };
 			for (const invocation of planLeg(leg, context)) {
 				if (!existsSync(invocation.baseline)) {
 					if (!updater) {
