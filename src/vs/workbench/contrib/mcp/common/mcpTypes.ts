@@ -554,6 +554,12 @@ export interface IMcpServer extends IDisposable {
 	skills(token?: CancellationToken): Promise<IMcpSkill[]>;
 
 	/**
+	 * Fetches the current entry of a skill given only its `SKILL.md` URI,
+	 * listed or not (`skills/get`). No skill file is read.
+	 */
+	getSkill(uri: string, token?: CancellationToken): Promise<IMcpSkill>;
+
+	/**
 	 * Loads a skill given only its `SKILL.md` URI, listed or not: fetches its
 	 * current entry (`skills/get`), then reads and verifies the `SKILL.md`.
 	 */

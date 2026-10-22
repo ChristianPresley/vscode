@@ -30,6 +30,7 @@ import { IMcpCopilotGlobalConfigurationService, McpCopilotGlobalConfigurationSer
 import { McpContextKeysController } from '../common/mcpContextKeys.js';
 import { IMcpDevModeDebugging, McpDevModeDebugging } from '../common/mcpDevMode.js';
 import { McpLanguageModelToolContribution } from '../common/mcpLanguageModelToolContribution.js';
+import { McpChatSkillsContribution } from '../common/mcpSkillsChat.js';
 import { McpRegistry } from '../common/mcpRegistry.js';
 import { IMcpRegistry } from '../common/mcpRegistryTypes.js';
 import { IMcpSandboxService, McpSandboxService } from '../common/mcpSandboxService.js';
@@ -77,6 +78,7 @@ registerWorkbenchContribution2('mcpContextKeys', McpContextKeysController, Workb
 registerWorkbenchContribution2('mcpLanguageFeatures', McpLanguageFeatures, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2('mcpResourceFilesystem', McpResourceFilesystem, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(McpLanguageModelToolContribution.ID, McpLanguageModelToolContribution, WorkbenchPhase.AfterRestored);
+registerWorkbenchContribution2(McpChatSkillsContribution.ID, McpChatSkillsContribution, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2('mcpGatewayToolBrokerRemote', McpGatewayToolBrokerContribution, WorkbenchPhase.AfterRestored);
 
 registerAction2(ListMcpServerCommand);
