@@ -5,6 +5,7 @@
 
 import assert from 'assert';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
+import { validateJsonSchemaDocument } from '../../../../base/common/jsonSchemaValidator/index.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { IMcpGatewayInputRequired, IMcpGatewayInvokeContext } from '../../common/mcpGateway.js';
 import { McpGatewayRpcError } from '../../common/mcpGatewayProtocol.js';
@@ -127,6 +128,28 @@ suite('MCP - GatewayConformanceInvoker', () => {
 		assert.deepStrictEqual(annotations.kind === 'valid' ? annotations.annotations.map(a => a.header).sort() : [], ['Priority', 'Region', 'Verbose']);
 		const annotated = tools.filter(t => Object.values(t.inputSchema.properties ?? {}).some(p => (p as Record<string, unknown>)['x-mcp-header'] !== undefined));
 		assert.deepStrictEqual(annotated.map(t => t.name), ['test_x_mcp_header'], 'the suite picks the first annotated tool');
+	});
+
+	test('the JSON Schema metaschema accepts every tool schema of the suite and rejects { type: \'array\', items: 5 }', async () => {
+		const invoker = store.add(new McpGatewayConformanceInvoker());
+		invoker.setToolHidden(CONFORMANCE_HIDDEN_TOOL, false);
+		const tools = await invoker.listTools();
+		assert.deepStrictEqual(tools.map(t => t.name).sort(), [...CONFORMANCE_TOOL_NAMES].sort());
+		for (const tool of tools) {
+			assert.deepStrictEqual(validateJsonSchemaDocument(tool.inputSchema), [], `${tool.name}: inputSchema`);
+			if (tool.outputSchema !== undefined) {
+				assert.deepStrictEqual(validateJsonSchemaDocument(tool.outputSchema), [], `${tool.name}: outputSchema`);
+			}
+		}
+
+		for (const [schema, path] of [
+			[{ type: 'array', items: 5 }, '/items'],
+			[{ ...JSON_SCHEMA_2020_12_TOOL_SCHEMA, properties: { ...JSON_SCHEMA_2020_12_TOOL_SCHEMA.properties, tags: { type: 'array', items: 5 } } }, '/properties/tags/items'],
+		] as const) {
+			const errors = validateJsonSchemaDocument(schema);
+			assert.ok(errors.length > 0 && errors.every(error => error.code === 'invalid-schema'), JSON.stringify(errors));
+			assert.ok(errors.some(error => error.path === path), JSON.stringify(errors));
+		}
 	});
 
 	test('elicitation fixtures carry the SEP-1034 defaults and the five SEP-1330 enum shapes', async () => {

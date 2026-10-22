@@ -6,11 +6,13 @@
 import assert from 'assert';
 import { DeferredPromise, timeout } from '../../../../base/common/async.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
+import { DisposableStore } from '../../../../base/common/lifecycle.js';
+import { runWithFakedTimers } from '../../../../base/test/common/timeTravelScheduler.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { SyncDescriptor } from '../../../instantiation/common/descriptors.js';
 import { InstantiationService } from '../../../instantiation/common/instantiationService.js';
 import { ServiceCollection } from '../../../instantiation/common/serviceCollection.js';
-import { ILoggerService, NullLoggerService } from '../../../log/common/log.js';
+import { ILoggerService, NullLogger, NullLoggerService } from '../../../log/common/log.js';
 import { IMcpGatewayInvokeContext, IMcpGatewayServerDescriptor, IMcpGatewayService, IMcpGatewaySingleServerInvoker, IMcpGatewayToolInvoker } from '../../common/mcpGateway.js';
 import { LEGACY_TRANSPORT_ERROR, MAX_LISTEN_RESOURCE_SUBSCRIPTIONS } from '../../common/mcpGatewayProtocol.js';
 import { MCP_PROTOCOL_VERSION_HEADER } from '../../common/mcpHttpHeaders.js';
@@ -18,9 +20,11 @@ import { LATEST_MCP_PROTOCOL_VERSION, META_CLIENT_INFO, META_SERVER_INFO, META_S
 import { MCP } from '../../common/modelContextProtocol.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { CONFORMANCE_HIDDEN_TOOL, CONFORMANCE_SERVER_INFO, McpGatewayConformanceInvoker } from '../../node/mcpGatewayConformanceInvoker.js';
+import { McpGatewayEventLog, McpGatewayStreamKind } from '../../node/mcpGatewayEventLog.js';
 import { ROUTE_RATE_MULTIPLIER } from '../../node/mcpGatewayRateLimit.js';
-import { LEGACY_NOT_INITIALIZED, LEGACY_SESSION_NOT_FOUND, LEGACY_SSE_RETRY_MS, MAX_BODY_BYTES, McpGatewayRoute } from '../../node/mcpGatewayRoute.js';
+import { LEGACY_NOT_INITIALIZED, LEGACY_SESSION_NOT_FOUND, LEGACY_SSE_RETRY_MS, MAX_BODY_BYTES, McpGatewayHttpResponse, McpGatewayResponseWriter, McpGatewayRoute, SSE_KEEPALIVE_MS } from '../../node/mcpGatewayRoute.js';
 import { IMcpGatewayServiceOptions, McpGatewayService, mcpGatewayServiceDescriptor } from '../../node/mcpGatewayService.js';
+import { IMcpGatewayLegacyStreamOptions } from '../../node/mcpGatewaySession.js';
 import { httpRequest, jsonOf, LEGACY_HEADERS, legacyHeaders, modernRequest, openHttp, rawHttp, sendHttp, TEST_CLIENT_INFO } from './mcpGatewayTestUtils.js';
 
 interface IJsonRpcBody {
@@ -1021,4 +1025,169 @@ suite('MCP - GatewayRoute (HTTP)', () => {
 		await listenB.ended;
 		assert.strictEqual(service.port, undefined, 'the last gateway stops the server');
 	});
+});
+
+const KEEPALIVE = ': keepalive\n\n';
+
+/** The part of an HTTP response the writer uses ({@link McpGatewayHttpResponse}), recording what is written on it. */
+class FakeSseResponse {
+	readonly chunks: string[] = [];
+	headersSent = false;
+	destroyed = false;
+	writableEnded = false;
+	readonly writableLength = 0;
+	private readonly _closeListeners: Array<() => void> = [];
+
+	get response(): McpGatewayHttpResponse {
+		return this as unknown as McpGatewayHttpResponse;
+	}
+
+	get keepalives(): number {
+		return this.chunks.filter(chunk => chunk === KEEPALIVE).length;
+	}
+
+	writeHead(): this {
+		this.headersSent = true;
+		return this;
+	}
+
+	flushHeaders(): void { }
+
+	write(chunk: string): boolean {
+		this.chunks.push(chunk);
+		return true;
+	}
+
+	end(chunk?: string): this {
+		if (chunk !== undefined) {
+			this.chunks.push(chunk);
+		}
+		this.writableEnded = true;
+		return this;
+	}
+
+	destroy(): this {
+		this.destroyed = true;
+		return this;
+	}
+
+	on(event: string, listener: () => void): this {
+		if (event === 'close') {
+			this._closeListeners.push(listener);
+		}
+		return this;
+	}
+
+	off(event: string, listener: () => void): this {
+		const index = this._closeListeners.indexOf(listener);
+		if (index !== -1) {
+			this._closeListeners.splice(index, 1);
+		}
+		return this;
+	}
+
+	/** The client goes away: the response's `close` event. */
+	close(): void {
+		this.destroyed = true;
+		for (const listener of [...this._closeListeners]) {
+			listener();
+		}
+	}
+}
+
+suite('MCP - GatewayResponseWriter (SSE keep-alive)', () => {
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	function legacyOptions(kind: McpGatewayStreamKind, log: McpGatewayEventLog): IMcpGatewayLegacyStreamOptions {
+		return {
+			broker: { createRequest: () => { throw new Error('the test sends no server requests'); } },
+			log,
+			kind,
+			priming: () => true,
+		};
+	}
+
+	/**
+	 * Runs `fn` on a virtual clock with the writers it creates, all disposed
+	 * before the clock stops (a running keep-alive timer would never let it).
+	 * Offsets of half an interval keep the checks clear of the ticks.
+	 */
+	function withWriters(fn: (writers: DisposableStore) => Promise<void>): Promise<void> {
+		return runWithFakedTimers({ useFakeTimers: true }, async () => {
+			const writers = new DisposableStore();
+			try {
+				await fn(writers);
+			} finally {
+				writers.dispose();
+			}
+		});
+	}
+
+	test('a response gets no keep-alive while it is JSON; once it streams, one comment per SSE_KEEPALIVE_MS until respond()', () => withWriters(async writers => {
+		const json = new FakeSseResponse();
+		const jsonWriter = writers.add(new McpGatewayResponseWriter(json.response, new NullLogger()));
+		await timeout(SSE_KEEPALIVE_MS * 2.5);
+		jsonWriter.respond({ jsonrpc: '2.0', id: 1, result: {} });
+		assert.deepStrictEqual(json.chunks, ['{"jsonrpc":"2.0","id":1,"result":{}}']);
+
+		const res = new FakeSseResponse();
+		const writer = writers.add(new McpGatewayResponseWriter(res.response, new NullLogger()));
+		await timeout(SSE_KEEPALIVE_MS * 1.5);
+		assert.strictEqual(res.chunks.length, 0, 'nothing streams before a notification');
+		// The lazy upgrade: the first notification starts the stream and its keep-alive clock.
+		writer.notify({ method: 'notifications/progress', params: { progressToken: 'p', progress: 1 } });
+		await timeout(SSE_KEEPALIVE_MS * 0.5);
+		assert.strictEqual(res.keepalives, 0);
+		await timeout(SSE_KEEPALIVE_MS);
+		assert.strictEqual(res.keepalives, 1);
+		await timeout(SSE_KEEPALIVE_MS * 2);
+		assert.strictEqual(res.keepalives, 3);
+		writer.respond({ jsonrpc: '2.0', id: 2, result: {} });
+		assert.ok(res.writableEnded);
+		await timeout(SSE_KEEPALIVE_MS * 3);
+		assert.strictEqual(res.keepalives, 3, 'none after respond()');
+		assert.deepStrictEqual(res.chunks.filter(chunk => chunk !== KEEPALIVE).map(chunk => chunk.split('\n')[0]), ['event: message', 'event: message']);
+	}));
+
+	test('the keep-alive stops at end() and when the client goes away', () => withWriters(async writers => {
+		const ended = new FakeSseResponse();
+		const endedWriter = writers.add(new McpGatewayResponseWriter(ended.response, new NullLogger()));
+		endedWriter.startStream();
+		await timeout(SSE_KEEPALIVE_MS * 1.5);
+		assert.strictEqual(ended.keepalives, 1);
+		endedWriter.end();
+		await timeout(SSE_KEEPALIVE_MS * 3);
+		assert.strictEqual(ended.keepalives, 1, 'none after end()');
+
+		const left = new FakeSseResponse();
+		const leftWriter = writers.add(new McpGatewayResponseWriter(left.response, new NullLogger()));
+		let aborted = false;
+		writers.add(leftWriter.onDidAbort(() => { aborted = true; }));
+		leftWriter.startStream();
+		await timeout(SSE_KEEPALIVE_MS * 1.5);
+		assert.strictEqual(left.keepalives, 1);
+		left.close();
+		assert.ok(aborted);
+		await timeout(SSE_KEEPALIVE_MS * 3);
+		assert.strictEqual(left.keepalives, 1, 'none after the client left');
+	}));
+
+	test('a legacy stream starts with a priming event (id and retry); closeForPolling() ends the response with a retry and stops the keep-alive', () => withWriters(async writers => {
+		const log = new McpGatewayEventLog();
+		const res = new FakeSseResponse();
+		const writer = writers.add(new McpGatewayResponseWriter(res.response, new NullLogger(), { legacy: legacyOptions('request', log) }));
+		writer.startStream();
+		const priming = /^id: (\S+)\nretry: (\d+)\ndata: \n\n$/.exec(res.chunks[0]);
+		assert.ok(priming, JSON.stringify(res.chunks[0]));
+		assert.strictEqual(Number(priming[2]), LEGACY_SSE_RETRY_MS);
+		assert.strictEqual(log.find(priming[1])?.id, writer.streamId, 'the priming id resumes this stream');
+		await timeout(SSE_KEEPALIVE_MS * 1.5);
+		assert.strictEqual(res.keepalives, 1);
+
+		assert.ok(writer.closeForPolling());
+		assert.strictEqual(res.chunks[res.chunks.length - 1], `retry: ${LEGACY_SSE_RETRY_MS}\n\n`);
+		assert.ok(res.writableEnded);
+		await timeout(SSE_KEEPALIVE_MS * 3);
+		assert.strictEqual(res.keepalives, 1, 'none after closeForPolling()');
+	}));
 });

@@ -12,6 +12,7 @@ import { observableValue } from '../../../../base/common/observable.js';
 import { JsonRpcId } from '../../../../base/common/jsonRpcProtocol.js';
 import { URI } from '../../../../base/common/uri.js';
 import { mock } from '../../../../base/test/common/mock.js';
+import { createAuthorizationServerFixture, createOAuthFixture, IOAuthFixture, IOAuthFixtureOptions } from '../../../../base/test/common/oauthClientFixture.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { ConfigurationTarget, IConfigurationOverrides, IConfigurationService, IConfigurationValue } from '../../../../platform/configuration/common/configuration.js';
 import { TestConfigurationService } from '../../../../platform/configuration/test/common/testConfigurationService.js';
@@ -43,7 +44,7 @@ import { TestExtensionService } from '../../../test/common/workbenchTestServices
 import { IMcpServerAuthContext, MainThreadMcp, McpServerAuthTracker } from '../../browser/mainThreadMcp.js';
 import { ExtHostContext, ExtHostMcpShape, IMcpAuthenticationDetails, IMcpGatewayServerDto, IMcpGatewayStartOptionsDto, MainContext } from '../../common/extHost.protocol.js';
 import { IExtHostInitDataService } from '../../common/extHostInitDataService.js';
-import { CommonRequestInit, CommonResponse, ExtHostMcpService, McpHTTPHandle } from '../../common/extHostMcp.js';
+import { CommonRequestInit, CommonResponse, createAuthMetadata, ExtHostMcpService, McpHTTPHandle } from '../../common/extHostMcp.js';
 import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION, MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION } from '../../common/mcpOAuthClientFactory.js';
 import { IExtHostVariableResolverProvider } from '../../common/extHostVariableResolverService.js';
 import { IExtHostWorkspace } from '../../common/extHostWorkspace.js';
@@ -861,6 +862,128 @@ suite('MainThreadMcp - authorization rules', () => {
 			strict: { created: [{ requireAdvertisedPkce: true }], resource: [serverUrl] },
 		});
 	});
+
+	//#region Driven by the shared OAuth fixture (oauthClientFixture.ts), as the OAuthClient and DynamicAuthProvider suites are
+
+	/** A fixture whose protected resource is this suite's server, behind AS-A unless `options.as` names another issuer. */
+	function fixtureFor(options: IOAuthFixtureOptions = {}): IOAuthFixture {
+		return createOAuthFixture({ as: { issuer: asA, ...options.as }, rs: { resource: serverUrl, ...options.rs } });
+	}
+
+	/**
+	 * The authentication details the transport sends for the fixture's server: a request without a token (or with
+	 * `accessToken`) is challenged, and the transport's discovery reads the protected resource and authorization
+	 * server metadata through `fixture.fetch`.
+	 */
+	async function discover(fixture: IOAuthFixture, accessToken?: string): Promise<IMcpAuthenticationDetails> {
+		const challenged = await fixture.fetch(fixture.resource, { method: 'POST', headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {} });
+		assert.strictEqual(challenged.status, 401);
+		const challengeHeaders = new Headers();
+		const wwwAuthenticate = challenged.headers.get('www-authenticate');
+		if (wwwAuthenticate !== null) {
+			challengeHeaders.set('WWW-Authenticate', wwwAuthenticate);
+		}
+		const metadata = await createAuthMetadata(fixture.resource, challengeHeaders, {
+			fetch: async (url, init) => {
+				const response = await fixture.fetch(url, { method: init.method, headers: init.headers, signal: init.signal });
+				const headers = new Headers();
+				const contentType = response.headers.get('content-type');
+				if (contentType !== null) {
+					headers.set('Content-Type', contentType);
+				}
+				return { status: response.status, statusText: response.statusText ?? '', headers, url, json: () => response.json(), text: () => response.text() };
+			},
+			log: () => { },
+		});
+		// What the transport's _requestToken sends, less the launch's oauth settings.
+		return {
+			authorizationServer: metadata.authorizationServer.toJSON(),
+			authorizationServerMetadata: metadata.serverMetadata,
+			resourceMetadata: metadata.resourceMetadata,
+			scopes: metadata.scopes,
+			resource: metadata.resource,
+		};
+	}
+
+	/** The paths of the metadata documents the fixture served, in order. */
+	function servedMetadata(fixture: IOAuthFixture): string[] {
+		return fixture.requests.filter(r => r.status === 200 && r.method === 'GET').map(r => new URL(r.url).pathname);
+	}
+
+	test('with the shared OAuth fixture: the challenge\'s scopes are requested, else the resource\'s, and the authorization server\'s only without protected resource metadata', async () => {
+		const run = async (fixture: IOAuthFixture) => {
+			const harness = createHarness({ providerId: 'p' });
+			await harness.mainThreadMcp.$getTokenFromServerMetadata(1, await discover(fixture), {});
+			return { lookups: harness.getSessionsCalls.map(call => call.scopes), served: servedMetadata(fixture) };
+		};
+		const as = { scopesSupported: ['as.scope'] };
+		const resourceScopes = ['mcp.read', 'mcp.write'];
+		assert.deepStrictEqual({
+			resourceScopes: await run(fixtureFor({ as, rs: { scopesSupported: resourceScopes } })),
+			challenged: await run(fixtureFor({ as, rs: { scopesSupported: resourceScopes, requiredScopes: ['mcp.write'], scopeInWwwAuthenticate: true } })),
+			noResourceScopes: await run(fixtureFor({ as })),
+			// A 2025-03-26 server: no protected resource metadata, its authorization server at its origin.
+			noResourceMetadata: await run(fixtureFor({ as: { ...as, issuer: 'https://myserver.example' }, rs: { prmLocation: 'none' } })),
+		}, {
+			resourceScopes: { lookups: [resourceScopes], served: ['/.well-known/oauth-protected-resource/mcp', '/.well-known/oauth-authorization-server'] },
+			challenged: { lookups: [['mcp.write']], served: ['/.well-known/oauth-protected-resource/mcp', '/.well-known/oauth-authorization-server'] },
+			noResourceScopes: { lookups: [[]], served: ['/.well-known/oauth-protected-resource/mcp', '/.well-known/oauth-authorization-server'] },
+			noResourceMetadata: { lookups: [['as.scope']], served: ['/.well-known/oauth-authorization-server'] },
+		});
+	});
+
+	test('with the shared OAuth fixture: the token the resource rejected removes its session, looked up without a scope filter, and another session\'s token is returned', async () => {
+		const fixture = fixtureFor({ rs: { scopesSupported: ['mcp.read'] } });
+		const sessions: AuthenticationSession[] = [
+			{ id: 'old', accessToken: 'rejected-token', account: { id: 'a', label: 'user' }, scopes: ['mcp.read'] },
+			{ id: 'other', accessToken: 'other-token', account: { id: 'a', label: 'user' }, scopes: ['mcp.read'] },
+		];
+		// The provider forgets a removed session.
+		const harness: IAuthHarness = createHarness({ providerId: 'dynamic-provider', sessionsFor: () => sessions.filter(s => !harness.removed.some(([, id]) => id === s.id)) });
+		const details = await discover(fixture, 'rejected-token');
+		const token = await harness.mainThreadMcp.$getTokenFromServerMetadata(1, details, { rejectedToken: 'rejected-token' });
+		assert.deepStrictEqual({ accesses: fixture.rs.accesses, lookups: harness.getSessionsCalls, removed: harness.removed, token }, {
+			accesses: [{ accessToken: 'rejected-token', status: 401 }],
+			lookups: [{ id: 'dynamic-provider', scopes: undefined }, { id: 'dynamic-provider', scopes: ['mcp.read'] }],
+			removed: [['dynamic-provider', 'old']],
+			token: 'other-token',
+		});
+	});
+
+	test('with the shared OAuth fixture: pre-registered credentials stay bound to the authorization server of their first use when the resource moves to another', async () => {
+		let authorizationServers = [asA];
+		const fixture = fixtureFor({ rs: { authorizationServers: () => authorizationServers } });
+		const otherServer = createAuthorizationServerFixture(fixture.router, { issuer: asB });
+		const harness = createHarness({ providerId: 'p' });
+		const key = mcpOAuthClientSecretStorageKey(serverUrl, 'static-client');
+		harness.secrets.set(key, 'static-secret');
+		// The extension host adds the configured oauth.clientId to what discovery found.
+		const signIn = async () => harness.mainThreadMcp.$getTokenFromServerMetadata(1, { ...await discover(fixture), clientId: 'static-client' }, {});
+
+		const token = await signIn();
+		const bound = JSON.parse(harness.secrets.get(key)!);
+		const lookups = harness.getSessionsCalls.length;
+		authorizationServers = [asB];
+		await assert.rejects(signIn(), (error: unknown) => {
+			assert.ok(error instanceof OAuthClientError && error.code === 'issuer_not_registered', String(error));
+			assert.ok(error.message.includes(asA) && error.message.includes(asB), error.message);
+			return true;
+		});
+		assert.deepStrictEqual({
+			token,
+			bound,
+			lookupsAfterMove: harness.getSessionsCalls.length - lookups,
+			// Each issuer came from its own authorization server's metadata document.
+			metadataRequests: [fixture.as.metadataRequests, otherServer.metadataRequests],
+		}, {
+			token: 'access-token',
+			bound: { clientSecret: 'static-secret', issuer: asA },
+			lookupsAfterMove: 0,
+			metadataRequests: [['/.well-known/oauth-authorization-server'], ['/.well-known/oauth-authorization-server']],
+		});
+	});
+
+	//#endregion
 });
 
 suite('MainThreadMcp - request policy', () => {
@@ -1053,6 +1176,7 @@ suite('MainThreadMcp - gRPC', () => {
 		disposables.add(configuration.onDidChangeConfigurationEmitter);
 		const policy = disposables.add(new AllowedMcpServersService(configuration));
 		const started: Parameters<ExtHostMcpShape['$startMcp']>[] = [];
+		const stopped: number[] = [];
 		let delegate: IMcpHostDelegate | undefined;
 		const registry = new class extends mock<IMcpRegistry>() {
 			override readonly collections = observableValue<readonly McpCollectionDefinition[]>('collections', []);
@@ -1063,7 +1187,7 @@ suite('MainThreadMcp - gRPC', () => {
 		};
 		const mainThread = createMainThreadMcp(disposables, {
 			$startMcp(...args) { started.push(args); },
-			$stopMcp() { },
+			$stopMcp(id) { stopped.push(id); },
 			$sendMessage() { },
 			$onDidChangeMcpServerDefinitions() { },
 		}, registry, services => {
@@ -1071,7 +1195,19 @@ suite('MainThreadMcp - gRPC', () => {
 			services.stub(IAllowedMcpServersService, policy);
 		}, options.extensionHostKind);
 		assert.ok(delegate);
-		return { mainThread, delegate, started };
+		return {
+			mainThread, delegate, started, stopped, policy,
+			/** Denies `serverUrl` in the user's `chat.mcp.deniedServers`, as an administrator or the user would. */
+			async denyUrl(serverUrl: string) {
+				await configuration.setUserConfiguration(mcpDeniedServersConfig, [{ serverUrl }]);
+				configuration.onDidChangeConfigurationEmitter.fire({
+					source: ConfigurationTarget.USER,
+					affectedKeys: new Set([mcpDeniedServersConfig]),
+					change: { keys: [mcpDeniedServersConfig], overrides: [] },
+					affectsConfiguration: section => section === mcpDeniedServersConfig,
+				});
+			},
+		};
 	}
 
 	test('gRPC servers start on Node.js extension hosts only', () => {
@@ -1096,6 +1232,38 @@ suite('MainThreadMcp - gRPC', () => {
 		assert.strictEqual(await mainThread.$checkMcpServerAllowed(1, 'grpc://allowed.example:50051'), undefined);
 		assert.match(await mainThread.$checkMcpServerAllowed(2, 'grpc://other.example:50051') ?? '', /not in the list of servers allowed/);
 		assert.deepStrictEqual(started.map(([id, opts]) => [id, opts.launch.type]), [[1, McpServerTransportType.Grpc], [2, McpServerTransportType.Grpc]]);
+	});
+
+	test('a policy change that denies the URL of a running gRPC server stops it with the policy message, and only that server', async () => {
+		const { mainThread, delegate, stopped, policy, denyUrl } = create();
+		const denied: McpServerDefinition = { id: 'a', label: 'Denied', cacheNonce: 'n', launch: grpcLaunch('grpc://allowed.example:50051') };
+		const other: McpServerDefinition = { id: 'b', label: 'Other', cacheNonce: 'n', launch: grpcLaunch('grpcs://other.example:50051') };
+		const deniedTransport = disposables.add(delegate.start(collectionOf([denied, other]), denied, denied.launch));
+		const otherTransport = disposables.add(delegate.start(collectionOf([denied, other]), other, other.launch));
+		mainThread.$onDidChangeState(1, { state: McpConnectionState.Kind.Running });
+		mainThread.$onDidChangeState(2, { state: McpConnectionState.Kind.Running });
+		const before = await mainThread.$checkMcpServerAllowed(1, 'grpc://allowed.example:50051');
+
+		await denyUrl('grpc://allowed.example:50051');
+
+		const denial = policy.isServerAllowed({ name: denied.label, url: 'grpc://allowed.example:50051' });
+		assert.ok(denial !== true, 'the URL is denied now');
+		assert.deepStrictEqual({
+			before,
+			stopped,
+			denied: deniedTransport.state.get(),
+			other: otherTransport.state.get(),
+			// The extension host's next check (its per-call check) of the stopped server is cancelled: the main thread forgot it.
+			nextCheck: await mainThread.$checkMcpServerAllowed(1, 'grpc://allowed.example:50051').then(() => 'allowed', (e: unknown) => isCancellationError(e) ? 'cancelled' : String(e)),
+			otherCheck: await mainThread.$checkMcpServerAllowed(2, 'grpcs://other.example:50051'),
+		}, {
+			before: undefined,
+			stopped: [1],
+			denied: { state: McpConnectionState.Kind.Error, message: denial.value },
+			other: { state: McpConnectionState.Kind.Running },
+			nextCheck: 'cancelled',
+			otherCheck: undefined,
+		});
 	});
 
 	test('tls.insecure is denied under an allow list defined by policy', async () => {

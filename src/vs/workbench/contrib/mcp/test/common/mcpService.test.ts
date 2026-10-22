@@ -34,7 +34,7 @@ import { TestContextService, TestLoggerService, TestProductService, TestStorageS
 import { IMcpRegistry } from '../../common/mcpRegistryTypes.js';
 import { McpServerConnection } from '../../common/mcpServerConnection.js';
 import { McpService } from '../../common/mcpService.js';
-import { IMcpServer, IMcpTool, IMcpToolCallContext, McpCapability, McpClientError, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, MpcResponseError } from '../../common/mcpTypes.js';
+import { ElicitationKind, ElicitResult, IMcpElicitationService, IMcpServer, IMcpTool, IMcpToolCallContext, McpCapability, McpClientError, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, MpcResponseError } from '../../common/mcpTypes.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { ITestMcpTransportOptions, TestMcpMessageTransport, TestMcpRegistry } from './mcpRegistryTypes.js';
 import { McpServerRequestHandler } from '../../common/mcpServerRequestHandler.js';
@@ -71,7 +71,7 @@ suite('Workbench - MCP - McpService', () => {
 
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
-	const createMcpService = (allowedMcpServersService?: IAllowedMcpServersService, overrides: { readonly notificationService?: INotificationService; readonly telemetryService?: ITelemetryService } = {}) => {
+	const createMcpService = (allowedMcpServersService?: IAllowedMcpServersService, overrides: { readonly notificationService?: INotificationService; readonly telemetryService?: ITelemetryService; readonly elicitationService?: IMcpElicitationService } = {}) => {
 		const storageService = store.add(new TestStorageService());
 		const services = new ServiceCollection(
 			[IFileService, { registerProvider: () => { } }],
@@ -84,6 +84,9 @@ suite('Workbench - MCP - McpService', () => {
 			[IAllowedMcpServersService, allowedMcpServersService ?? { _serviceBrand: undefined, onDidChangeAllowedMcpServers: Event.None, isAllowed: () => true, isServerAllowedBeforeResolution: () => true, isServerAllowed: () => true }],
 			[INotificationService, overrides.notificationService ?? new TestNotificationService()],
 		);
+		if (overrides.elicitationService) {
+			services.set(IMcpElicitationService, overrides.elicitationService);
+		}
 
 		const parentInstantiationService = store.add(new TestInstantiationService(services));
 		const registry = new TestMcpRegistry(parentInstantiationService);
@@ -1113,7 +1116,7 @@ suite('Workbench - MCP - McpService', () => {
 		const error = (request: IJsonRpcRequest, code: number, message: string, data?: unknown): JsonRpcMessage => ({ jsonrpc: MCP.JSONRPC_VERSION, id: request.id, error: { code, message, data } });
 
 		/** Starts the test server speaking `era`; `configure` adds responders to each new transport. */
-		const startServer = async (era: Era, configure: (transport: TestMcpMessageTransport) => void, overrides: { readonly notificationService?: INotificationService; readonly telemetryService?: ITelemetryService; readonly beforeStart?: (server: IMcpServer) => void } = {}) => {
+		const startServer = async (era: Era, configure: (transport: TestMcpMessageTransport) => void, overrides: { readonly notificationService?: INotificationService; readonly telemetryService?: ITelemetryService; readonly elicitationService?: IMcpElicitationService; readonly beforeStart?: (server: IMcpServer) => void } = {}) => {
 			const { mcpService, registry } = createMcpService(undefined, overrides);
 			const transports: TestMcpMessageTransport[] = [];
 			registry.makeTestTransport = () => {
@@ -1369,6 +1372,74 @@ suite('Workbench - MCP - McpService', () => {
 						break;
 				}
 			}
+		});
+
+		/** Accepts every elicitation; a URL elicitation completes when {@link completed} does. */
+		class RecordingElicitationService implements IMcpElicitationService {
+			declare readonly _serviceBrand: undefined;
+			readonly requests: MCPLegacy.ElicitRequest['params'][] = [];
+			readonly requested = new DeferredPromise<void>();
+			readonly completed = new DeferredPromise<void>();
+			async elicit(_server: IMcpServer, _context: IMcpToolCallContext | undefined, elicitation: MCPLegacy.ElicitRequest['params']): Promise<ElicitResult> {
+				this.requests.push(elicitation);
+				void this.requested.complete();
+				return { kind: ElicitationKind.URL, value: { action: 'accept' }, wait: this.completed.p, dispose: () => { } };
+			}
+		}
+
+		const signIn: MCPLegacy.ElicitRequestURLParams = { mode: 'url', message: 'Sign in to deploy', elicitationId: 'sign-in-1', url: 'https://auth.example.com/sign-in' };
+		const urlElicitationRequired = (req: IJsonRpcRequest) => error(req, MCPLegacy.URL_ELICITATION_REQUIRED, 'Sign-in required', { elicitations: [signIn] });
+		const isUrlElicitationRequired = (e: unknown) => e instanceof MpcResponseError && e.code === MCPLegacy.URL_ELICITATION_REQUIRED;
+
+		test('-32042 from a 2025-11-25 server runs its URL elicitations, then retries the tool call exactly once', async () => {
+			// The retry follows the completed elicitation and succeeds.
+			const elicitationService = new RecordingElicitationService();
+			let calls = 0;
+			const { server, transports } = await startServer('legacy', transport => {
+				transport.setResponder('tools/list', req => result('legacy', req, { tools: [plainTool('deploy')] }));
+				transport.setResponder('tools/call', req => ++calls === 1 ? urlElicitationRequired(req) : result('legacy', req, { content: [{ type: 'text', text: 'deployed' }] }));
+			}, { elicitationService });
+			const [tool] = await waitForState(server.tools, t => t.length === 1);
+			const call = tool.call({});
+			await elicitationService.requested.p;
+			await timeout(10);
+			const callsBeforeCompletion = transports[0].getSentRequests('tools/call').length;
+			elicitationService.completed.complete();
+			const callResult = await call;
+			assert.deepStrictEqual({
+				elicitations: elicitationService.requests,
+				callsBeforeCompletion,
+				calls: transports[0].getSentRequests('tools/call').length,
+				content: callResult.content,
+			}, {
+				elicitations: [signIn],
+				callsBeforeCompletion: 1,
+				calls: 2,
+				content: [{ type: 'text', text: 'deployed' }],
+			});
+
+			// A retry that is answered with -32042 again is not retried: the call rejects.
+			const repeated = new RecordingElicitationService();
+			repeated.completed.complete();
+			const again = await startServer('legacy', transport => {
+				transport.setResponder('tools/list', req => result('legacy', req, { tools: [plainTool('deploy')] }));
+				transport.setResponder('tools/call', urlElicitationRequired);
+			}, { elicitationService: repeated });
+			const [repeatedTool] = await waitForState(again.server.tools, t => t.length === 1);
+			await assert.rejects(repeatedTool.call({}), isUrlElicitationRequired);
+			assert.deepStrictEqual({ elicitations: repeated.requests.length, calls: again.transports[0].getSentRequests('tools/call').length }, { elicitations: 1, calls: 2 });
+		});
+
+		test('-32042 from a 2026-07-28 server rejects the tool call without an elicitation or a retry', async () => {
+			const elicitationService = new RecordingElicitationService();
+			elicitationService.completed.complete();
+			const { server, transports } = await startServer('modern', transport => {
+				transport.setResponder('tools/list', req => result('modern', req, { tools: [plainTool('deploy')] }));
+				transport.setResponder('tools/call', urlElicitationRequired);
+			}, { elicitationService });
+			const [tool] = await waitForState(server.tools, t => t.length === 1);
+			await assert.rejects(tool.call({}), isUrlElicitationRequired);
+			assert.deepStrictEqual({ elicitations: elicitationService.requests.length, calls: transports[0].getSentRequests('tools/call').length }, { elicitations: 0, calls: 1 });
 		});
 
 		test('a renegotiation during the probe is published to telemetry with the negotiation', async () => {

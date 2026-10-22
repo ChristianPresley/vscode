@@ -4,9 +4,11 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as assert from 'assert';
+import * as sinon from 'sinon';
 import { raceTimeout, timeout } from '../../../../../base/common/async.js';
+import { CancellationError } from '../../../../../base/common/errors.js';
 import { Disposable } from '../../../../../base/common/lifecycle.js';
-import { autorun, observableValue } from '../../../../../base/common/observable.js';
+import { autorun, observableValue, waitForState } from '../../../../../base/common/observable.js';
 import { upcast } from '../../../../../base/common/types.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { ServiceCollection } from '../../../../../platform/instantiation/common/serviceCollection.js';
@@ -76,6 +78,10 @@ suite('Workbench - MCP - ServerConnection', () => {
 	let transport: TestMcpMessageTransport;
 	let collection: McpCollectionDefinition;
 	let serverDefinition: McpServerDefinition;
+
+	teardown(() => {
+		sinon.restore();
+	});
 
 	setup(() => {
 		delegate = store.add(new TestMcpHostDelegate());
@@ -195,6 +201,64 @@ suite('Workbench - MCP - ServerConnection', () => {
 
 		assert.strictEqual(handler.protocolVersion, '2025-11-25');
 		assert.deepStrictEqual(transport.getSentRequests('initialize').map(r => (r.params as { protocolVersion?: string } | undefined)?.protocolVersion), ['2025-11-25'], 'the caller hint, not the pin, is sent');
+	});
+
+	test('a handshake cancelled while the transport still runs ends in Error with the handshake message', async () => {
+		// Restored by the suite's teardown, also when the test times out.
+		const create = sinon.stub(McpServerRequestHandler, 'create').rejects(new CancellationError());
+		const logger = new NullLogger();
+		const errorLog = sinon.spy(logger, 'error');
+		const connection = store.add(instantiationService.createInstance(
+			McpServerConnection, collection, serverDefinition, delegate, serverDefinition.launch,
+			logger, false, store.add(new McpTaskManager()),
+		));
+		const started = connection.start({});
+		transport.setConnectionState({ state: McpConnectionState.Kind.Running });
+		assert.strictEqual((await started).state, McpConnectionState.Kind.Running);
+		const failed = await waitForState(connection.state, s => s.state === McpConnectionState.Kind.Error);
+
+		const message = 'Server exited before completing the protocol handshake (server/discover or initialize).';
+		assert.deepStrictEqual({
+			failed,
+			transport: transport.state.get().state,
+			handler: connection.handler.get(),
+			handshakes: create.callCount,
+			logged: errorLog.getCalls().map(call => call.args[0]),
+		}, {
+			failed: { state: McpConnectionState.Kind.Error, message },
+			transport: McpConnectionState.Kind.Running,
+			handler: undefined,
+			handshakes: 1,
+			logged: [message],
+		});
+	});
+
+	test('a handshake the transport aborts while it still runs ends in Error with the abort message', async () => {
+		const abortMessage = 'The response stream ended before the server/discover response';
+		transport.setResponder('server/discover', req => {
+			setTimeout(() => transport.simulateAbort({ requestId: req.id, reason: 'stream-closed', message: abortMessage }));
+			return undefined;
+		});
+		const connection = store.add(instantiationService.createInstance(
+			McpServerConnection, collection, serverDefinition, delegate, serverDefinition.launch,
+			new NullLogger(), false, store.add(new McpTaskManager()),
+		));
+		const started = connection.start({});
+		transport.setConnectionState({ state: McpConnectionState.Kind.Running });
+		assert.strictEqual((await started).state, McpConnectionState.Kind.Running);
+		const failed = await waitForState(connection.state, s => s.state === McpConnectionState.Kind.Error);
+
+		assert.deepStrictEqual({
+			failed,
+			transport: transport.state.get().state,
+			handler: connection.handler.get(),
+			initializeSent: transport.getSentRequests('initialize').length,
+		}, {
+			failed: { state: McpConnectionState.Kind.Error, message: abortMessage },
+			transport: McpConnectionState.Kind.Running,
+			handler: undefined,
+			initializeSent: 0,
+		});
 	});
 
 	test('should handle errors during start', async () => {

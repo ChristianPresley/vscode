@@ -328,6 +328,24 @@ suite('MCP - gRPC typed binding', () => {
 			assert.throws(() => decodeTypedRequest(rpcOf('tools/list'), Uint8Array.of(0x0a, 0x05)), function (err: unknown) { return err instanceof ProtoDecodeError && err.reason === 'truncated'; });
 		});
 
+		test('a negative or malformed ttl gives invalid', () => {
+			// google.protobuf.Duration allows negative values; an MCP ttlMs does not.
+			const listTools = rpcOf('tools/list');
+			const withTtl = (ttl: Record<string, unknown>) => encodeMessage(LIST_TOOLS_RESPONSE, { ttl });
+			assertUnexpressible(() => decodeTypedResponse(listTools, withTtl({ seconds: -1n })), 'invalid', 'a negative ttl');
+			assertUnexpressible(() => decodeTypedResponse(listTools, withTtl({ nanos: -1 })), 'invalid', 'a negative ttl');
+			// Seconds and nanos of different signs, and nanos of a second or more, are not a Duration.
+			assertUnexpressible(() => decodeTypedResponse(listTools, withTtl({ seconds: 1n, nanos: -1 })), 'invalid', 'a malformed ttl');
+			assertUnexpressible(() => decodeTypedResponse(listTools, withTtl({ seconds: -1n, nanos: 1 })), 'invalid', 'a malformed ttl');
+			assertUnexpressible(() => decodeTypedResponse(listTools, withTtl({ nanos: 1_000_000_000 })), 'invalid', 'a malformed ttl');
+			// Every response with a ttl checks it.
+			const readResource = rpcOf('resources/read');
+			assertUnexpressible(() => decodeTypedResponse(readResource, encodeMessage(readResource.response, { ttl: { seconds: -1n } })), 'invalid', 'a negative ttl');
+			// Zero and positive durations are accepted; sub-millisecond nanos are cut.
+			assert.deepStrictEqual(decodeTypedResponse(listTools, withTtl({})), { resultType: 'complete', tools: [], ttlMs: 0 });
+			assert.deepStrictEqual(decodeTypedResponse(listTools, withTtl({ seconds: 1n, nanos: 500_999 })), { resultType: 'complete', tools: [], ttlMs: 1000 });
+		});
+
 		test('a choice with two members gives invalid', () => {
 			const callTool = rpcOf('tools/call');
 			const listTools = rpcOf('tools/list');
