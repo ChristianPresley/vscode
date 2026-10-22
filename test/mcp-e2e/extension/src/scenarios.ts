@@ -17,7 +17,7 @@ import { chatTests } from './testsChat';
 import { gatewayRestartTests, gatewayTests } from './testsGateway';
 import { grpcTests } from './testsGrpc';
 import { rootsTest, samplingTest } from './testsMrtr';
-import { oauthScenarios } from './testsOauth';
+import { BROWSER_LOG, IOAuthBrowserEvent, oauthScenarios } from './testsOauth';
 import { protocolTests, restartTests } from './testsProtocol';
 import { appsTests, resourceTests } from './testsResources';
 
@@ -92,6 +92,64 @@ async function assertSubmitted(h: E2eHarness, ctx: ITestContext, label: string, 
 	});
 	ctx.details.submitted = submitted;
 	assert(canonicalJson(submitted) === canonicalJson(expected), `VS Code submitted inputResponses.${key} = ${JSON.stringify(submitted)}, expected ${JSON.stringify(expected)}`);
+}
+
+/** The URL-mode elicitation that runner/http-fault-proxy.ts asks for before every call of the tool (fault input-required-url). */
+const URL_ELICITATION_SERVER = 'zig-http-faults';
+const URL_ELICITATION_TOOL = 'test_tool_with_logging';
+const URL_ELICITATION_KEY = 'consent';
+const URL_ELICITATION_ORIGIN = 'https://url-elicitation.mcp-e2e.test';
+
+/**
+ * A URL-mode elicitation outside chat (UI suite): the tool's first `tools/call` is answered with
+ * `input_required` asking to open an https URL; the Playwright driver accepts it (Open URL in the
+ * notification, then Open in the link protection dialog, so VS Code hands the URL to the stand-in
+ * browser) or declines it (Cancel from the notification's More Actions...). Either way VS Code
+ * retries with `inputResponses.consent` and the round's `requestState`, which the proxy records.
+ */
+function urlElicitationScenario(h: E2eHarness, action: 'accept' | 'decline'): ITestCase {
+	const label = URL_ELICITATION_SERVER;
+	const tool = URL_ELICITATION_TOOL;
+	return {
+		name: action === 'accept'
+			? `elicitation url mode (${label}): ${tool} asks to open ${URL_ELICITATION_ORIGIN}/consent (input_required), the URL is accepted and handed to the stand-in browser, the retry carries inputResponses.${URL_ELICITATION_KEY} accept with the requestState verbatim, and the tool's result comes back`
+			: `elicitation url mode declined (${label}): ${tool} asks to open ${URL_ELICITATION_ORIGIN}/consent (input_required), the URL is declined (Cancel), nothing is opened, and the retry carries inputResponses.${URL_ELICITATION_KEY} decline with the requestState verbatim`,
+		group: 'elicitation',
+		timeoutMs: 240_000,
+		fn: async ctx => {
+			const httpFrom = h.httpLog(label).length;
+			const browserFrom = h.jsonLines<IOAuthBrowserEvent>(BROWSER_LOG).length;
+			// The tool's own result once the URL was accepted; declined, the proxy's answer naming the action.
+			await expectToolText(h, ctx, label, tool, {}, [action === 'accept' ? 'Logging complete' : `URL elicitation decline: ${tool} was not run`]);
+
+			// The proxy's record: the round and exactly one retry, under a new JSON-RPC id.
+			const toolCalls = () => h.httpLog(label).slice(httpFrom).filter(e => e.event === 'request' && e.messages?.length === 1 && e.messages[0].method === 'tools/call' && e.messages[0].name === tool);
+			const calls = await waitFor(`two tools/call of ${tool} in ${label}.http.jsonl`, 10_000, () => toolCalls().length >= 2 ? toolCalls() : undefined).catch(() => toolCalls());
+			ctx.details.proxy = calls.map(e => ({ n: e.n, id: e.messages?.[0].id, status: e.status, fault: e.fault, url: e.url, requestState: e.requestState, inputResponses: e.inputResponses }));
+			assert(calls.length === 2, `expected exactly two tools/call of ${tool} (the round, then the retry), the proxy saw ${calls.length}: ${JSON.stringify(ctx.details.proxy)}`);
+			const [round, retry] = calls;
+			assert(round.fault === `input-required-url:${tool}` && round.status === 200 && typeof round.requestState === 'string' && !!round.url?.startsWith(`${URL_ELICITATION_ORIGIN}/consent?id=`) && !round.messages?.[0].inputResponses,
+				`the first tools/call of ${tool} was not answered with the URL elicitation: ${JSON.stringify(ctx.details.proxy)}`);
+			assert(retry.messages?.[0].id !== round.messages?.[0].id, `the retry reused the JSON-RPC id ${JSON.stringify(round.messages?.[0].id)} of the round`);
+			assert(retry.inputResponses?.[URL_ELICITATION_KEY]?.action === action, `the retry sent inputResponses ${JSON.stringify(retry.inputResponses)}, expected ${URL_ELICITATION_KEY}.action ${action}`);
+			assert(retry.requestState === round.requestState, `the retry sent requestState ${JSON.stringify(retry.requestState)}, not the one of the round ${JSON.stringify(round.requestState)}`);
+			const taken = action === 'accept' ? `input-required-url:${tool} (retry accept: forwarded)` : `input-required-url:${tool} (retry decline: answered)`;
+			assert(retry.status === 200 && retry.fault === taken, `the proxy took the retry as ${JSON.stringify(retry.fault)} (HTTP ${retry.status}), expected ${taken}`);
+
+			// What VS Code opened: the stand-in browser (workbench.externalBrowser) records the URL and never fetches it.
+			const opened = () => h.jsonLines<IOAuthBrowserEvent>(BROWSER_LOG).slice(browserFrom).filter(e => e.event === 'open' && e.origin === URL_ELICITATION_ORIGIN);
+			if (action === 'accept') {
+				const events = await waitFor(`${round.url} in ${BROWSER_LOG}`, 15_000, () => opened().length ? opened() : undefined).catch(() => opened());
+				ctx.details.browser = events;
+				assert(events.length === 1 && `${events[0].origin}${events[0].pathname}${events[0].search}` === round.url && events[0].followed === false, `the stand-in browser was asked to open ${JSON.stringify(events)}, expected ${round.url} once`);
+			} else {
+				// An accepted URL reaches the browser within a second or two; a declined one never does.
+				await sleep(2000);
+				ctx.details.browser = opened();
+				assert(!opened().length, `the declined URL was opened: ${JSON.stringify(opened())}`);
+			}
+		},
+	};
 }
 
 function negotiationTest(h: E2eHarness, label: string): ITestCase {
@@ -846,6 +904,9 @@ export function uiScenarios(h: E2eHarness): Map<string, ITestCase> {
 		},
 	});
 	direct('trigger-elicitation-request', 'elicitation legacy elicitation/create (everything-legacy): trigger-elicitation-request returns the submitted values', 'everything-legacy', 'trigger-elicitation-request', ['Ada Lovelace']);
+	// A URL-mode elicitation (runner/http-fault-proxy.ts input-required-url on zig-http-faults), accepted and declined.
+	scenarios.set('url-elicitation-accept', urlElicitationScenario(h, 'accept'));
+	scenarios.set('url-elicitation-decline', urlElicitationScenario(h, 'decline'));
 	direct('test_input_required_result_request_state', 'mrtr request_state (zig-http): test_input_required_result_request_state echoes the state', 'zig-http', 'test_input_required_result_request_state', ['state-ok request-state-nonce']);
 	direct('test_input_required_result_request_state@zig-grpcs', 'mrtr request_state over gRPC with TLS (zig-grpcs): test_input_required_result_request_state echoes the state', 'zig-grpcs', 'test_input_required_result_request_state', ['state-ok request-state-nonce'], 'grpc');
 	direct('test_input_required_result_multi_round', 'mrtr multi_round (zig-http): test_input_required_result_multi_round combines three rounds', 'zig-http', 'test_input_required_result_multi_round', ['Ada Lovelace likes teal']);

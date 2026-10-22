@@ -321,6 +321,28 @@ function resourceReadAnswer(label: string, from: number, uri: string): ILoggedMe
 	return request && messages.find(m => !m.sent && m.line > request.line && m.message.id === request.message.id && !m.message.method);
 }
 
+/** The `url` of the last URL-mode `elicitation/create` that the server asked for in an `input_required` answer. */
+function lastElicitationUrl(label: string): string | undefined {
+	for (const m of loggedMessages(serverLog(label)).reverse()) {
+		const requests = m.sent ? undefined : m.message.result?.inputRequests;
+		for (const request of Object.values(typeof requests === 'object' && requests !== null ? requests as Record<string, { method?: string; params?: { mode?: string; url?: unknown } }> : {})) {
+			if (request?.method === 'elicitation/create' && request.params?.mode === 'url' && typeof request.params.url === 'string') {
+				return request.params.url;
+			}
+		}
+	}
+	return undefined;
+}
+
+/** The host of a URL, or '' when it does not parse. */
+function hostOf(url: string | undefined): string {
+	try {
+		return url ? new URL(url).host : '';
+	} catch {
+		return '';
+	}
+}
+
 // --- Chat: requests to the E2E extension's `@e2e` participant (extension/src/chatParticipant.ts) ----
 
 /** What the participant recorded for a request (IChatRequestRecord, one line of chat-requests.jsonl). */
@@ -401,6 +423,8 @@ const ANSWERS: Answers = title => {
 
 interface IElicitationTrace {
 	notifications: string[];
+	/** What the driver chose for each notification: its button, or `More Actions... > <item>`. */
+	notificationActions: string[];
 	dialogs: string[];
 	/** The dialogs a scenario's `dialogButton` answered (the OAuth consent). */
 	answeredDialogs: { text: string; button: string }[];
@@ -426,6 +450,11 @@ interface IScenarioHooks {
 	readonly answers?: Answers;
 	/** The button to click in a modal dialog of the scenario, by the dialog's text; other dialogs are dismissed. */
 	readonly dialogButton?: (text: string) => string | undefined;
+	/**
+	 * Instead of the notification's button, run this action of its "More Actions..." menu (where a
+	 * notification keeps its secondary actions, such as the Cancel of a URL elicitation).
+	 */
+	readonly notificationMenuItem?: string;
 	/** A check of the UI trace once the scenario passed: the reason it fails, or `undefined`. */
 	readonly checkTrace?: (trace: IElicitationTrace) => string | undefined;
 }
@@ -436,7 +465,7 @@ function escapeRegExp(text: string): string {
 
 async function answerUi(page: Page, label: string, done: () => boolean, hooks: IScenarioHooks): Promise<IElicitationTrace> {
 	const answers = hooks.answers ?? ANSWERS;
-	const trace: IElicitationTrace = { notifications: [], dialogs: [], answeredDialogs: [], steps: [], stalls: [] };
+	const trace: IElicitationTrace = { notifications: [], notificationActions: [], dialogs: [], answeredDialogs: [], steps: [], stalls: [] };
 	let lastAction = Date.now();
 	let stalls = 0;
 	let formShot = false;
@@ -470,7 +499,8 @@ async function answerUi(page: Page, label: string, done: () => boolean, hooks: I
 			await sleep(400);
 			continue;
 		}
-		const respond = page.locator('.notification-toast .monaco-button', { hasText: /^(Respond|Accept|Open URL|Continue)$/ });
+		const respondLabel = /^(Respond|Accept|Open URL|Continue)$/;
+		const respond = page.locator('.notification-toast .monaco-button', { hasText: respondLabel });
 		if (await respond.count() && await respond.first().isVisible()) {
 			const message = await visibleText(page, '.notification-toast .notification-list-item-message');
 			trace.notifications.push(message);
@@ -478,7 +508,23 @@ async function answerUi(page: Page, label: string, done: () => boolean, hooks: I
 				notificationShot = true;
 				await hooks.onNotification.take();
 			}
-			await respond.first().click();
+			const item = hooks.notificationMenuItem;
+			if (item !== undefined) {
+				// The toast's toolbar (with the gear of More Actions...) only shows while the pointer is on it.
+				const toast = page.locator('.notification-toast', { has: page.locator('.monaco-button', { hasText: respondLabel }) }).first();
+				try {
+					await toast.hover({ timeout: 5000 });
+					await toast.locator('.codicon-notifications-configure').first().click({ timeout: 5000 });
+					await page.locator('.context-view .monaco-menu .action-item', { hasText: new RegExp(`^\\s*${escapeRegExp(item)}\\s*$`) }).first().click({ timeout: 5000 });
+					trace.notificationActions.push(`More Actions... > ${item}`);
+				} catch (e) {
+					trace.stalls.push({ notificationMenuItem: item, error: String(e).slice(0, 300) });
+					await page.keyboard.press('Escape');
+				}
+			} else {
+				trace.notificationActions.push((await respond.first().innerText()).trim());
+				await respond.first().click();
+			}
 			await sleep(400);
 			lastAction = Date.now();
 			continue;
@@ -1451,6 +1497,63 @@ async function main(): Promise<number> {
 						{ 'enum step shown': /Titled Single Select Enum \(11\/\d+\)/.test(text), 'titles offered with their values': /hero-1\s*Superman/.test(text) && /hero-3\s*Wonder Woman/.test(text) }, text.slice(0, 300));
 				},
 			},
+		});
+		// A URL-mode elicitation outside chat (the fault proxy of zig-http-faults asks for one before every
+		// call of test_tool_with_logging): a notification "<message> This will open <url>" with Open URL.
+		// Open URL goes to the opener, whose link protection asks "Do you want Code - OSS to open the
+		// external website?" (the host is not a trusted domain); Open hands the URL to the stand-in browser
+		// (workbench.externalBrowser, runner/oauth-browser.ts), which records it and fetches nothing.
+		const urlServer = 'zig-http-faults';
+		const openWebsite = (text: string) => /open the external website/.test(text);
+		await runUiScenario(page, 'url-elicitation-accept', {
+			dialogButton: text => openWebsite(text) ? 'Open' : undefined,
+			checkTrace: trace => trace.notificationActions.join() === 'Open URL' && trace.answeredDialogs.length === 1 && openWebsite(trace.answeredDialogs[0].text) && trace.answeredDialogs[0].button === 'Open'
+				? undefined
+				: `expected Open URL in one notification, then Open in one link protection dialog: ${JSON.stringify({ notificationActions: trace.notificationActions, answeredDialogs: trace.answeredDialogs })}`,
+			onNotification: {
+				file: '26-elicitation-url-notification.png',
+				title: 'URL elicitation outside chat',
+				take: async () => {
+					// The URL the server asked for, from VS Code's MCP log (written shortly after the answer arrived).
+					const url = await waitUntil(5000, () => lastElicitationUrl(urlServer));
+					const toast = page.locator('.notification-toast', { hasText: 'MCP E2E URL elicitation' }).first();
+					const message = (await toast.locator('.notification-list-item-message').innerText().catch(() => '')).replace(/ /g, ' ');
+					const toastText = (await toast.innerText().catch(() => '')).replace(/ /g, ' ');
+					const buttons = (await toast.locator('.monaco-button').allInnerTexts().catch(() => [] as string[])).map(b => b.trim());
+					await shot(page, '26-elicitation-url-notification.png', 'URL elicitation outside chat',
+						'A notification from "MCP Server (zig-http-faults)": the server\'s message "MCP E2E URL elicitation: consent for test_tool_with_logging (round <n>)", then "This will open https://url-elicitation.mcp-e2e.test/consent?id=<n>" (the full URL, with its host), and an Open URL button.', {
+							'the server\'s message': message.includes('MCP E2E URL elicitation: consent for test_tool_with_logging'),
+							'the full URL the server sent': !!url && message.includes(`This will open ${url}`),
+							'the host of the URL': !!hostOf(url) && message.includes(hostOf(url)),
+							'source MCP Server (zig-http-faults)': toastText.includes(`MCP Server (${urlServer})`),
+							'Open URL button': buttons.includes('Open URL'),
+						}, `${url ?? '(no URL elicitation in the MCP log)'}\n${toastText}`.slice(0, 400));
+				},
+			},
+			onDialog: {
+				file: '26b-elicitation-url-open-website.png',
+				title: 'URL elicitation: the link protection prompt',
+				take: async () => {
+					const url = lastElicitationUrl(urlServer);
+					const text = (await visibleText(page, '.monaco-dialog-box')).replace(/\s+/g, ' ');
+					const buttons = (await page.locator('.monaco-dialog-box .monaco-button').allInnerTexts().catch(() => [] as string[])).map(b => b.trim());
+					await shot(page, '26b-elicitation-url-open-website.png', 'URL elicitation: the link protection prompt',
+						'After Open URL: the modal dialog "Do you want Code - OSS to open the external website?" with the full URL (url-elicitation.mcp-e2e.test is not a trusted domain) and the buttons Open, Copy, Configure Trusted Domains and Cancel.', {
+							'asks to open the external website': openWebsite(text),
+							'the full URL': !!url && text.includes(url),
+							'Open button': buttons.includes('Open'),
+							'Cancel button': buttons.includes('Cancel'),
+						}, `${url ?? '(no URL elicitation in the MCP log)'}\n${text}`.slice(0, 400));
+				},
+			},
+		});
+		// Declined: Cancel, a secondary action of the notification (its More Actions... menu), answers
+		// decline; nothing is opened, so there is no link protection dialog either.
+		await runUiScenario(page, 'url-elicitation-decline', {
+			notificationMenuItem: 'Cancel',
+			checkTrace: trace => trace.notificationActions.join() === 'More Actions... > Cancel' && !trace.dialogs.length
+				? undefined
+				: `expected Cancel from the More Actions... menu of one notification and no dialog: ${JSON.stringify({ notificationActions: trace.notificationActions, dialogs: trace.dialogs, stalls: trace.stalls })}`,
 		});
 		await runUiScenario(page, 'test_input_required_result_request_state');
 		// The same over the gRPC tunnel with TLS (zig-grpcs).

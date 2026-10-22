@@ -185,7 +185,7 @@
 				"url": "http://127.0.0.1:3111/mcp"
 			},
 			"process": {
-				"$comment": "runner/http-fault-proxy.ts on 3111 in front of the zig-http server (3010) injects the 2026-07-28 error paths for named tools: -32021 (test_audio_content), an unknown resultType (test_embedded_resource), an outputSchema mismatch (test_simple_text) and match (greet), -32022 naming the revision in use (test_image_content), and tools/list split by an empty-string nextCursor.",
+				"$comment": "runner/http-fault-proxy.ts on 3111 in front of the zig-http server (3010) injects the 2026-07-28 error paths for named tools: -32021 (test_audio_content), an unknown resultType (test_embedded_resource), an outputSchema mismatch (test_simple_text) and match (greet), -32022 naming the revision in use (test_image_content), and tools/list split by an empty-string nextCursor; and a URL-mode elicitation (input_required) before every call of test_tool_with_logging (the UI scenarios url-elicitation-accept and url-elicitation-decline).",
 				"upstreamPort": 3010,
 				"httpProxy": {
 					"port": 3111,
@@ -195,7 +195,8 @@
 						"output-schema-mismatch:test_simple_text",
 						"output-schema-match:greet",
 						"version-same:test_image_content",
-						"empty-cursor"
+						"empty-cursor",
+						"input-required-url:test_tool_with_logging"
 					]
 				}
 			}

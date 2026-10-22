@@ -303,4 +303,12 @@ export interface IHttpProxyEvent {
 	readonly mutation?: string;
 	readonly bridged?: string;
 	readonly faults?: readonly string[];
+	/** input-required-url: the URL the round asked for. */
+	readonly url?: string;
+	/** input-required-url: the round a retry answered (from its verified requestState). */
+	readonly round?: number;
+	/** input-required-url: the requestState the round issued, or the one its retry sent back (`null`: none). */
+	readonly requestState?: string | null;
+	/** input-required-url: the `inputResponses` of the retry (`null`: none). */
+	readonly inputResponses?: Record<string, { readonly action?: string }> | null;
 }

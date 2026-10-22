@@ -7,8 +7,9 @@
 // `workbench.externalBrowser` (runner/prepare-profile.ts points it at a wrapper of this script).
 // For an OAuth authorization URL it does what a user who approves does: it requests the URL (the
 // fixture's /authorize approves at once and redirects), then follows the redirect to VS Code's
-// loopback redirect URI, which takes the code. Every step is one JSON line in the log; codes are
-// logged as their first 8 characters.
+// loopback redirect URI, which takes the code. Any other URL (the URL-mode elicitation of the UI
+// suite, https://url-elicitation.mcp-e2e.test/consent?id=<n>) is recorded with its query and never
+// fetched. Every step is one JSON line in the log; codes are logged as their first 8 characters.
 //
 // Usage: node runner/oauth-browser.ts --log <file.jsonl> <url>
 
@@ -66,8 +67,8 @@ async function main(args: readonly string[]): Promise<number> {
 		return 0;
 	}
 	if (!isLoopback(url)) {
-		// Nothing of the run opens other sites; never fetch anything beyond loopback.
-		record({ event: 'open', origin: url.origin, pathname: url.pathname, followed: false, reason: 'not a loopback URL' });
+		// Never fetch anything beyond loopback. What was opened is all a test needs (the URL elicitation).
+		record({ event: 'open', origin: url.origin, pathname: url.pathname, search: url.search, followed: false, reason: 'not a loopback URL' });
 		return 0;
 	}
 	// Mutation oauth-no-resource (runner/mutations.ts): the authorization request loses its RFC 8707 resource.

@@ -157,7 +157,10 @@ async function start(logDir: string, args: readonly string[]): Promise<number> {
 			// The record of the HTTP requests, the injected faults and the HTTP mutations.
 			const proxyArgs = [path.join(import.meta.dirname, 'http-fault-proxy.ts'), '--listen', String(p.httpProxy.port), '--upstream', String(upstream), '--log', path.join(logDir, `${server.label}.http.jsonl`)];
 			for (const spec of mutations.has('no-faults') ? [] : p.httpProxy.faults ?? []) {
-				proxyArgs.push('--fault', spec);
+				// Mutation no-url-elicitation: the proxies ask for no URL-mode elicitation.
+				if (!(mutations.has('no-url-elicitation') && spec.startsWith('input-required-url:'))) {
+					proxyArgs.push('--fault', spec);
+				}
 			}
 			for (const name of HTTP_PROXY_MUTATIONS.filter(m => mutations.has(m))) {
 				proxyArgs.push('--mutate', name);

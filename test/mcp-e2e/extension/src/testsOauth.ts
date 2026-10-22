@@ -41,15 +41,20 @@ interface IOAuthFixtureEvent {
 	readonly mcpName?: string;
 }
 
-/** One line of the log of runner/oauth-browser.ts. */
-interface IOAuthBrowserEvent {
+/** One line of the log of runner/oauth-browser.ts, the stand-in browser of the run (`workbench.externalBrowser`). */
+export interface IOAuthBrowserEvent {
 	readonly event: 'open' | 'mutation' | 'authorize-response' | 'redirect-response' | 'redirect' | 'error';
 	readonly status?: number;
 	readonly location?: string | null;
 	readonly redirect?: { readonly iss?: string; readonly state?: boolean; readonly code?: string; readonly error?: string; readonly errorDescription?: string };
+	/** `open`: what VS Code opened (`search` only for a URL the browser does not follow: not loopback). */
+	readonly origin?: string;
+	readonly pathname?: string;
+	readonly search?: string;
+	readonly followed?: boolean;
 }
 
-const BROWSER_LOG = 'oauth-browser.jsonl';
+export const BROWSER_LOG = 'oauth-browser.jsonl';
 
 interface ISignIn {
 	readonly fixture: () => IOAuthFixtureEvent[];
