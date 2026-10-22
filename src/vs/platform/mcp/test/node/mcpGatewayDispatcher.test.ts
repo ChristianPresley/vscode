@@ -131,8 +131,9 @@ suite('MCP - GatewayDispatcher', () => {
 			prompts: { listChanged: true },
 			completions: {},
 			logging: {},
-			// The fixture serves the Tasks extension (see mcpGatewayTasks.test.ts); the legacy initialize below does not announce it.
-			extensions: { 'io.modelcontextprotocol/tasks': {} },
+			// The fixture serves the Tasks extension (see mcpGatewayTasks.test.ts), which the legacy initialize below does not announce,
+			// and the Skills extension (see mcpGatewaySkills.test.ts), which it does.
+			extensions: { 'io.modelcontextprotocol/tasks': {}, 'io.modelcontextprotocol/skills': { directoryRead: true } },
 		});
 		assert.strictEqual(result.instructions, CONFORMANCE_INSTRUCTIONS);
 		assert.strictEqual(result.ttlMs, CONFORMANCE_CACHE_HINTS.ttlMs);
@@ -144,6 +145,7 @@ suite('MCP - GatewayDispatcher', () => {
 			prompts: { listChanged: true },
 			logging: {},
 			completions: {},
+			extensions: { 'io.modelcontextprotocol/skills': { directoryRead: true } },
 		});
 	});
 

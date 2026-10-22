@@ -36,7 +36,7 @@ suite('MCP - GatewayConformanceInvoker', () => {
 	test('identifies as the conformance test server', () => {
 		assert.deepStrictEqual(CONFORMANCE_SERVER_INFO, { name: 'mcp-conformance-test-server', version: '1.0.0' });
 		const invoker = store.add(new McpGatewayConformanceInvoker());
-		assert.deepStrictEqual(invoker.capabilities, { tools: { listChanged: true }, prompts: { listChanged: true }, resources: { subscribe: true, listChanged: true }, completions: true, logging: true });
+		assert.deepStrictEqual(invoker.capabilities, { tools: { listChanged: true }, prompts: { listChanged: true }, resources: { subscribe: true, listChanged: true }, completions: true, logging: true, skills: { directoryRead: true } });
 		assert.ok(invoker.instructions.length > 0);
 		assert.ok(invoker.cacheHints.ttlMs >= 0);
 	});
@@ -202,7 +202,10 @@ suite('MCP - GatewayConformanceInvoker', () => {
 
 	test('resources: the listed URIs, the template, not-found and updates', async () => {
 		const invoker = store.add(new McpGatewayConformanceInvoker());
-		assert.deepStrictEqual((await invoker.listResources()).map(r => r.uri), CONFORMANCE_RESOURCE_URIS);
+		// The fixture's own resources, then every file of its skills (mcpGatewaySkills.test.ts).
+		const listed = (await invoker.listResources()).map(r => r.uri);
+		assert.deepStrictEqual(listed.slice(0, CONFORMANCE_RESOURCE_URIS.length), CONFORMANCE_RESOURCE_URIS);
+		assert.ok(listed.slice(CONFORMANCE_RESOURCE_URIS.length).every(uri => uri.startsWith('skill://')));
 		assert.deepStrictEqual((await invoker.listResourceTemplates()).map(t => t.uriTemplate), [CONFORMANCE_RESOURCE_TEMPLATE]);
 		const text = (await invoker.readResource('test://static-text')).contents[0] as { text?: string; mimeType?: string };
 		assert.ok(text.text && text.mimeType === 'text/plain');

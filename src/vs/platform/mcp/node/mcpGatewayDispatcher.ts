@@ -15,6 +15,7 @@ import { LATEST_MCP_PROTOCOL_VERSION, McpProtocolEra } from '../common/mcpProtoc
 import { MCP_PROTOCOL_VERSION_HEADER, trimOws } from '../common/mcpHttpHeaders.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
+import { McpSkills } from '../common/modelContextProtocolSkills.js';
 import { McpTasks } from '../common/modelContextProtocolTasks.js';
 import { IMcpGatewayRateLimits, McpGatewayRateLimitedError, McpGatewayRateLimiter } from './mcpGatewayRateLimit.js';
 import { McpGatewaySealedState } from './mcpGatewaySealedState.js';
@@ -197,11 +198,35 @@ export class McpGatewayDispatcher extends Disposable {
 		if (declared?.logging ?? true) {
 			caps.logging = {};
 		}
+		const extensions: Record<string, MCP.JSONObject> = {};
 		if (this._tasks) {
 			// SEP-2663: under `extensions`, never the 2025-11-25 `capabilities.tasks` slot.
-			caps.extensions = { [McpTasks.EXTENSION_ID]: {} };
+			extensions[McpTasks.EXTENSION_ID] = {};
+		}
+		const skills = this._skillsSettings();
+		if (skills) {
+			// SEP-2640: the settings sit inline under the id; an empty object declares no optional feature.
+			extensions[McpSkills.EXTENSION_ID] = skills.directoryRead ? { directoryRead: true } : {};
+		}
+		if (Object.keys(extensions).length > 0) {
+			caps.extensions = extensions;
 		}
 		return caps;
+	}
+
+	/**
+	 * The Skills extension (SEP-2640) is served when the invoker can list and
+	 * get skills, and, if it reports capabilities, reports the extension
+	 * (the gateway passes the upstream server's skills through). Declaring it
+	 * commits the route to `skills/list` and `skills/get`; `directoryRead`
+	 * additionally needs `readDirectory`. `resources` is always advertised.
+	 */
+	private _skillsSettings(): McpSkills.ServerSettings | undefined {
+		const declared = this._options.capabilities ?? this._invoker.capabilities;
+		if (!this._invoker.listSkills || !this._invoker.getSkill || (declared && !declared.skills)) {
+			return undefined;
+		}
+		return { directoryRead: !!this._invoker.readDirectory && (declared ? !!declared.skills?.directoryRead : true) };
 	}
 
 	/**
@@ -281,6 +306,11 @@ export class McpGatewayDispatcher extends Disposable {
 			case 'tasks/cancel':
 				// `tasks/list` and `tasks/result` were removed by SEP-2663: -32601 like any unknown method.
 				return era === 'modern' && !!this._tasks;
+			case McpSkills.METHOD_LIST:
+			case McpSkills.METHOD_GET:
+				return !!this._skillsSettings();
+			case McpSkills.METHOD_DIRECTORY_READ:
+				return !!this._skillsSettings()?.directoryRead;
 			default:
 				return false;
 		}
@@ -439,6 +469,38 @@ export class McpGatewayDispatcher extends Disposable {
 				}
 				const uri = params.uri;
 				return this._withInputRounds(ctx, method, uri, params, invokeCtx => this._invoker.readResource(uri, invokeCtx));
+			}
+			case McpSkills.METHOD_LIST: {
+				this._checkCursor(params);
+				const listSkills = this._invoker.listSkills!;
+				const skills = await this._invoke(ctx, () => listSkills.call(this._invoker));
+				return { skills: [...skills] } satisfies Pick<McpSkills.ListSkillsResult, 'skills'>;
+			}
+			case McpSkills.METHOD_GET: {
+				if (typeof params.uri !== 'string') {
+					throw new McpGatewayRpcError(MCP.INVALID_PARAMS, 'Missing skill URI');
+				}
+				const uri = params.uri;
+				const getSkill = this._invoker.getSkill!;
+				const skill = await this._invoke(ctx, () => getSkill.call(this._invoker, uri));
+				if (!skill) {
+					// The code `resources/read` uses for an unknown resource, in both eras (SEP-2640).
+					throw new McpGatewayRpcError(MCP.INVALID_PARAMS, `Unknown skill: ${uri}`, { uri });
+				}
+				return { skill } satisfies Pick<McpSkills.GetSkillResult, 'skill'>;
+			}
+			case McpSkills.METHOD_DIRECTORY_READ: {
+				if (typeof params.uri !== 'string') {
+					throw new McpGatewayRpcError(MCP.INVALID_PARAMS, 'Missing directory URI');
+				}
+				this._checkCursor(params);
+				const uri = params.uri;
+				const readDirectory = this._invoker.readDirectory!;
+				const resources = await this._invoke(ctx, () => readDirectory.call(this._invoker, uri));
+				if (!resources) {
+					throw new McpGatewayRpcError(MCP.INVALID_PARAMS, `Not a directory resource: ${uri}`, { uri });
+				}
+				return { resources: [...resources] };
 			}
 			case 'completion/complete': {
 				if (!isObject(params.ref) || !isObject(params.argument)) {

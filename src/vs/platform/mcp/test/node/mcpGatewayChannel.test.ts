@@ -17,6 +17,7 @@ import { NullLoggerService } from '../../../log/common/log.js';
 import { IMcpGatewayCreateArgs, IMcpGatewayCreateOptions, IMcpGatewayDto, IMcpGatewayInfo, IMcpGatewayInvokeContext, IMcpGatewayProgress, IMcpGatewayServerCapabilities, IMcpGatewayServerDescriptor, IMcpGatewayServerInfo, IMcpGatewayService, IMcpGatewayToolInvoker, McpGatewayToolBrokerChannelName } from '../../common/mcpGateway.js';
 import { MCP } from '../../common/modelContextProtocol.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
+import { McpSkills } from '../../common/modelContextProtocolSkills.js';
 import { McpGatewayChannel } from '../../node/mcpGatewayChannel.js';
 
 suite('McpGatewayChannel', () => {
@@ -130,6 +131,26 @@ suite('McpGatewayChannel', () => {
 			['readResourceForServer', { serverId: 'serverA', uri: 'file:///a.txt' }],
 			// No call id: nobody asked for the call's notifications.
 			['callToolForServer', { serverId: 'serverA', name: 'echo', args: { text: 'hi' }, chatSessionResource: gatewaySession }],
+		]);
+	});
+
+	test('forwards the Skills extension commands; an unknown skill or directory stays undefined', async () => {
+		const fixture = createFixture();
+		const broker = connect(fixture, 'client1');
+		const invoker = await createGateway(fixture, 'client1');
+		const skill: McpSkills.Skill = { uri: 'skill://git/SKILL.md', frontmatter: { name: 'git', description: 'Git conventions' }, resources: McpSkills.DYNAMIC };
+		const children: MCPLegacy.Resource[] = [{ uri: 'skill://git/SKILL.md', name: 'git', mimeType: 'text/markdown' }];
+		broker.answer('listSkillsForServer', [skill]);
+		broker.answer('getSkillForServer', undefined);
+		broker.answer('readDirectoryForServer', children);
+
+		assert.deepStrictEqual(await invoker.listSkillsForServer!('serverA'), [skill]);
+		assert.strictEqual(await invoker.getSkillForServer!('serverA', 'skill://nope/SKILL.md'), undefined);
+		assert.deepStrictEqual(await invoker.readDirectoryForServer!('serverA', 'skill://git'), children);
+		assert.deepStrictEqual(broker.calls.slice(1).map(c => [c.command, c.arg]), [
+			['listSkillsForServer', { serverId: 'serverA' }],
+			['getSkillForServer', { serverId: 'serverA', uri: 'skill://nope/SKILL.md' }],
+			['readDirectoryForServer', { serverId: 'serverA', uri: 'skill://git' }],
 		]);
 	});
 

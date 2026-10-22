@@ -12,6 +12,7 @@ import { ILogger, ILoggerService } from '../../log/common/log.js';
 import { IMcpGatewayCreateArgs, IMcpGatewayInfo, IMcpGatewayInvokeContext, IMcpGatewayServerCapabilities, IMcpGatewayServerDescriptor, IMcpGatewayServerInfo, IMcpGatewayService, IMcpGatewayToolInvoker, McpGatewayToolBrokerChannelName } from '../common/mcpGateway.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
+import { McpSkills } from '../common/modelContextProtocolSkills.js';
 
 /** `onToolProgress` from the workbench's tool broker channel (see `McpGatewayToolBrokerChannel`). */
 interface IBrokerToolProgressEvent {
@@ -216,6 +217,9 @@ export class McpGatewayChannel<TContext> extends Disposable implements IServerCh
 					});
 				});
 			},
+			listSkillsForServer: serverId => brokerChannel.call<readonly McpSkills.Skill[]>('listSkillsForServer', { serverId }),
+			getSkillForServer: (serverId, uri) => brokerChannel.call<McpSkills.Skill | undefined>('getSkillForServer', { serverId, uri }),
+			readDirectoryForServer: (serverId, uri) => brokerChannel.call<readonly MCPLegacy.Resource[] | undefined>('readDirectoryForServer', { serverId, uri }),
 		};
 	}
 }

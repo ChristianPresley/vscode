@@ -11,6 +11,8 @@ import { IMcpGatewayCacheHints, IMcpGatewayInputRequired, IMcpGatewayInvokeConte
 import { McpGatewayRpcError } from '../common/mcpGatewayProtocol.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
+import { McpSkills } from '../common/modelContextProtocolSkills.js';
+import { IMcpSkillDefinition, McpSkillCatalog } from '../common/mcpSkillCatalog.js';
 import { McpGatewayResourceNotFoundError } from './mcpGatewayDispatcher.js';
 import { IMcpGatewayTaskCapableInvoker, IMcpGatewayTaskOptions, McpGatewayTaskSupport, startTaskResult, taskRunOf } from './mcpGatewayTasks.js';
 
@@ -33,6 +35,7 @@ export const CONFORMANCE_CAPABILITIES: IMcpGatewayServerCapabilities = {
 	resources: { subscribe: true, listChanged: true },
 	completions: true,
 	logging: true,
+	skills: { directoryRead: true },
 };
 
 export const CONFORMANCE_CACHE_HINTS: IMcpGatewayCacheHints = { ttlMs: 60_000, cacheScope: 'public' };
@@ -131,6 +134,41 @@ const RESOURCE = {
 } as const;
 
 export const CONFORMANCE_RESOURCE_TEMPLATE = 'test://template/{id}/data';
+
+/**
+ * The skills the fixture serves (Skills extension, SEP-2640): a skill with
+ * nested directories (so `resources/directory/read` has a subdirectory to
+ * list) and one under an organizational prefix.
+ */
+export const CONFORMANCE_SKILLS: readonly IMcpSkillDefinition[] = [
+	{
+		skillMd: [
+			'---',
+			'name: pdf-processing',
+			'description: Extract, fill, and assemble PDF documents',
+			'license: Apache-2.0',
+			'metadata:',
+			'  version: 2.1.0',
+			'---',
+			'',
+			'# PDF processing',
+			'',
+			'Fill forms with `references/FORMS.md` and pick a template from `templates/`.',
+			'',
+		].join('\n'),
+		files: [
+			{ path: 'references/FORMS.md', content: '# Forms\n\nHow to fill PDF forms.\n' },
+			{ path: 'scripts/extract.py', content: 'print("extract")\n' },
+			{ path: 'templates/invoice.md', content: '# Invoice\n' },
+			{ path: 'templates/regional/eu-invoice.md', content: '# EU invoice\n' },
+		],
+	},
+	{
+		prefix: 'acme/billing',
+		skillMd: '---\nname: refunds\ndescription: Process customer refund requests per company policy\n---\n\nFollow `examples/email.md`.\n',
+		files: [{ path: 'examples/email.md', content: 'Dear customer,\n' }],
+	},
+];
 
 /** Every tool the fixture registers (hidden ones included). */
 export const CONFORMANCE_TOOL_NAMES: readonly string[] = Object.values(TOOL);
@@ -260,6 +298,7 @@ export class McpGatewayConformanceInvoker extends Disposable implements IMcpGate
 	private readonly _hiddenTools = new Set<string>([TOOL.hiddenTool]);
 	private readonly _hiddenPrompts = new Set<string>([PROMPT.hidden]);
 	private readonly _subscriptions = new Map<string, number>();
+	private _skills: Promise<McpSkillCatalog> | undefined;
 
 	constructor() {
 		super();
@@ -675,6 +714,7 @@ export class McpGatewayConformanceInvoker extends Disposable implements IMcpGate
 			{ uri: RESOURCE.staticText, name: 'Static Text Resource', description: 'A static text resource for testing', mimeType: 'text/plain' },
 			{ uri: RESOURCE.staticBinary, name: 'Static Binary Resource', description: 'A static binary resource (image) for testing', mimeType: 'image/png' },
 			{ uri: RESOURCE.watched, name: 'Watched Resource', description: 'A resource subscribers get updates for', mimeType: 'text/plain' },
+			...(await this._skillCatalog()).resources(),
 		];
 	}
 
@@ -696,7 +736,30 @@ export class McpGatewayConformanceInvoker extends Disposable implements IMcpGate
 			const id = decodeURIComponent(match[1]);
 			return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify({ id, templateTest: true, data: `Data for ID: ${id}` }) }] };
 		}
+		const skillFile = (await this._skillCatalog()).read(uri);
+		if (skillFile) {
+			return skillFile;
+		}
 		throw new McpGatewayResourceNotFoundError(uri);
+	}
+
+	// ---- skills (SEP-2640) ------------------------------------------------------
+
+	private _skillCatalog(): Promise<McpSkillCatalog> {
+		this._skills ??= McpSkillCatalog.create(CONFORMANCE_SKILLS);
+		return this._skills;
+	}
+
+	async listSkills(): Promise<readonly McpSkills.Skill[]> {
+		return (await this._skillCatalog()).entries;
+	}
+
+	async getSkill(uri: string): Promise<McpSkills.Skill | undefined> {
+		return (await this._skillCatalog()).getSkill(uri);
+	}
+
+	async readDirectory(uri: string): Promise<readonly MCPLegacy.Resource[] | undefined> {
+		return (await this._skillCatalog()).readDirectory(uri);
 	}
 
 	async subscribeResource(uri: string): Promise<IDisposable> {

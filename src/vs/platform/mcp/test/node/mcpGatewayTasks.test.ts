@@ -287,10 +287,11 @@ suite('MCP - GatewayDispatcher - Tasks extension', () => {
 	test('server/discover advertises the extension under capabilities.extensions, the legacy initialize does not', () => {
 		const dispatcher = createDispatcher();
 		const capabilities = dispatcher.discoverResult().capabilities;
-		assert.deepStrictEqual(capabilities.extensions, { [McpTasks.EXTENSION_ID]: {} });
+		// The fixture also serves the Skills extension (mcpGatewaySkills.test.ts), in both eras.
+		assert.deepStrictEqual(capabilities.extensions, { [McpTasks.EXTENSION_ID]: {}, 'io.modelcontextprotocol/skills': { directoryRead: true } });
 		assert.strictEqual(Object.prototype.hasOwnProperty.call(capabilities, 'tasks'), false);
 		const legacy = dispatcher.legacyInitializeCapabilities();
-		assert.strictEqual(legacy.extensions, undefined);
+		assert.deepStrictEqual(legacy.extensions, { 'io.modelcontextprotocol/skills': { directoryRead: true } });
 		assert.strictEqual(legacy.tasks, undefined);
 		const plain = createDispatcher({
 			onDidChangeTools: Event.None,

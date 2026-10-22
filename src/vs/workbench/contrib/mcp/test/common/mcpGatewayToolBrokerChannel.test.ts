@@ -17,11 +17,12 @@ import { ContributionEnablementState } from '../../../chat/common/enablement.js'
 import { NullLogService } from '../../../../../platform/log/common/log.js';
 import { IMcpGatewayServerCapabilities, IMcpGatewayServerDescriptor } from '../../../../../platform/mcp/common/mcpGateway.js';
 import { MCP } from '../../../../../platform/mcp/common/modelContextProtocol.js';
+import { McpSkills } from '../../../../../platform/mcp/common/modelContextProtocolSkills.js';
 import { ToolProgress } from '../../../chat/common/tools/languageModelToolsService.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { IMcpGatewayResourceUpdateEvent, IMcpGatewayToolLogEvent, IMcpGatewayToolProgressEvent, McpGatewayToolBrokerChannel } from '../../common/mcpGatewayToolBrokerChannel.js';
 import { McpServerRequestHandler } from '../../common/mcpServerRequestHandler.js';
-import { IMcpIcons, IMcpServer, IMcpServerConnection, IMcpTool, IMcpToolCallContext, McpCapability, McpConnectionState, McpServerCacheState, McpServerDefinition, McpServerTransportType, McpToolVisibility } from '../../common/mcpTypes.js';
+import { IMcpIcons, IMcpServer, IMcpServerConnection, IMcpSkill, IMcpTool, IMcpToolCallContext, McpCapability, McpConnectionState, McpServerCacheState, McpServerDefinition, McpServerTransportType, McpToolVisibility, MpcResponseError } from '../../common/mcpTypes.js';
 import { TestMcpService } from './testMcpService.js';
 
 suite('McpGatewayToolBrokerChannel', () => {
@@ -573,6 +574,64 @@ suite('McpGatewayToolBrokerChannel', () => {
 		assert.strictEqual(handler.calls[0].token, cts.token);
 	});
 
+	suite('Skills extension (SEP-2640)', () => {
+		const ENTRY: McpSkills.Skill = { uri: 'skill://git/SKILL.md', frontmatter: { name: 'git', description: 'Git' }, resources: McpSkills.DYNAMIC };
+
+		test('getServerCapabilities reports the extension and its directoryRead setting from the capability bits of the server', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+			mcpService.servers.set([
+				createServer('c', 'skills', [], McpServerCacheState.Live, { capabilities: McpCapability.Resources | McpCapability.Skills }),
+				createServer('c', 'directories', [], McpServerCacheState.Live, { capabilities: McpCapability.Resources | McpCapability.Skills | McpCapability.SkillsDirectoryRead }),
+				createServer('c', 'plain', [], McpServerCacheState.Live, { capabilities: McpCapability.Resources }),
+			], undefined);
+			const skillsOf = async (serverId: string) => (await channel.call<IMcpGatewayServerCapabilities>(undefined, 'getServerCapabilities', { serverId })).skills;
+			assert.deepStrictEqual(await skillsOf('skills'), { directoryRead: false });
+			assert.deepStrictEqual(await skillsOf('directories'), { directoryRead: true });
+			assert.strictEqual(await skillsOf('plain'), undefined);
+		});
+
+		test('listSkillsForServer passes the listed entries on, and nothing for a server without the extension', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+			const skill = { entry: ENTRY } as IMcpSkill;
+			mcpService.servers.set([
+				createServer('c', 'skills', [], McpServerCacheState.Live, { capabilities: McpCapability.Skills, skills: [skill] }),
+				createServer('c', 'plain', [], McpServerCacheState.Live, { capabilities: McpCapability.Resources, skills: [skill] }),
+			], undefined);
+			assert.deepStrictEqual(await channel.call(undefined, 'listSkillsForServer', { serverId: 'skills' }), [ENTRY]);
+			assert.deepStrictEqual(await channel.call(undefined, 'listSkillsForServer', { serverId: 'plain' }), []);
+		});
+
+		test('getSkillForServer validates the entry of the server; an unknown skill or an invalid entry is undefined', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+			const handler = ds.add(new StubRequestHandler());
+			mcpService.servers.set([createServer('c', 'skills', [], McpServerCacheState.Live, { handler, capabilities: McpCapability.Skills })], undefined);
+
+			handler.skill = ENTRY;
+			assert.deepStrictEqual(await channel.call(undefined, 'getSkillForServer', { serverId: 'skills', uri: ENTRY.uri }), ENTRY);
+			assert.deepStrictEqual(handler.calls.map(call => [call.method, call.params]), [['getSkill', { uri: ENTRY.uri }]]);
+			handler.skill = { ...ENTRY, resources: 'static' };
+			assert.strictEqual(await channel.call(undefined, 'getSkillForServer', { serverId: 'skills', uri: ENTRY.uri }), undefined);
+			handler.skill = undefined;
+			assert.strictEqual(await channel.call(undefined, 'getSkillForServer', { serverId: 'skills', uri: 'skill://nope/SKILL.md' }), undefined);
+			handler.failure = new MpcResponseError('boom', MCP.INTERNAL_ERROR, undefined);
+			await assert.rejects(channel.call(undefined, 'getSkillForServer', { serverId: 'skills', uri: ENTRY.uri }), /boom/);
+		});
+
+		test('readDirectoryForServer passes the children on; a URI that is not a directory is undefined', async () => {
+			const mcpService = new TestMcpService();
+			const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
+			const handler = ds.add(new StubRequestHandler());
+			mcpService.servers.set([createServer('c', 'skills', [], McpServerCacheState.Live, { handler, capabilities: McpCapability.Skills | McpCapability.SkillsDirectoryRead })], undefined);
+			handler.directory = [{ uri: 'skill://git/SKILL.md', name: 'git' }];
+			assert.deepStrictEqual(await channel.call(undefined, 'readDirectoryForServer', { serverId: 'skills', uri: 'skill://git' }), handler.directory);
+			handler.directory = undefined;
+			assert.strictEqual(await channel.call(undefined, 'readDirectoryForServer', { serverId: 'skills', uri: ENTRY.uri }), undefined);
+		});
+	});
+
 	test('readResourceForServer passes the IPC token to the handler', async () => {
 		const mcpService = new TestMcpService();
 		const channel = ds.add(new McpGatewayToolBrokerChannel(mcpService, new NullLogService()));
@@ -894,6 +953,29 @@ class StubRequestHandler extends Disposable {
 		return this._record('listResourceTemplates', undefined, undefined, undefined, () => []);
 	}
 
+	/** The entry `skills/get` answers with; undefined: the server answers -32602. */
+	skill: unknown;
+	/** The children `resources/directory/read` answers with; undefined: the server answers -32602. */
+	directory: MCPLegacy.Resource[] | undefined;
+
+	getSkill(params: { uri: string }, token?: CancellationToken): Promise<unknown> {
+		return this._record('getSkill', params, token, undefined, () => {
+			if (this.skill === undefined) {
+				throw new MpcResponseError('Unknown skill', MCP.INVALID_PARAMS, undefined);
+			}
+			return this.skill;
+		});
+	}
+
+	readDirectory(params: { uri: string }, token?: CancellationToken): Promise<MCPLegacy.Resource[]> {
+		return this._record('readDirectory', params, token, undefined, () => {
+			if (this.directory === undefined) {
+				throw new MpcResponseError('Not a directory', MCP.INVALID_PARAMS, undefined);
+			}
+			return this.directory;
+		});
+	}
+
 	subscribeResource(uri: string): IDisposable {
 		if (this.failure) {
 			throw this.failure;
@@ -905,7 +987,7 @@ class StubRequestHandler extends Disposable {
 
 	private _record<T>(method: string, params: unknown, token: CancellationToken | undefined, context: IMcpToolCallContext | undefined, result: () => T): Promise<T> {
 		this.calls.push({ method, params, token, context });
-		return this.failure ? Promise.reject(this.failure) : Promise.resolve(result());
+		return this.failure ? Promise.reject(this.failure) : new Promise<T>(resolve => resolve(result()));
 	}
 }
 
@@ -915,6 +997,8 @@ interface IServerOptions {
 	readonly capabilities?: McpCapability;
 	/** Capabilities the server learns when it starts. */
 	readonly capabilitiesOnStart?: McpCapability;
+	/** What `skills()` lists. */
+	readonly skills?: readonly IMcpSkill[];
 }
 
 type TestServer = IMcpServer & {
@@ -985,6 +1069,8 @@ function createServer(
 		capabilities,
 		resources: () => (async function* () { })(),
 		resourceTemplates: async () => [],
+		skills: async () => [...options.skills ?? []],
+		loadSkill: async () => { throw new Error('not used'); },
 		dispose: () => { },
 		toolsValue: tools,
 		promptsValue: prompts,
@@ -1029,6 +1115,8 @@ function createNeverStartingServer(
 		capabilities: observableValue(owner, undefined),
 		resources: () => (async function* () { })(),
 		resourceTemplates: async () => [],
+		skills: async () => [],
+		loadSkill: async () => { throw new Error('not used'); },
 		dispose: () => { },
 		get startCalls() { return startCalls; },
 		get startBehavior() { return startBehavior; },

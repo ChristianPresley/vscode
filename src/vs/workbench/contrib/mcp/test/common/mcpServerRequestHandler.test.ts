@@ -15,7 +15,7 @@ import { IStorageService } from '../../../../../platform/storage/common/storage.
 import { TestLoggerService, TestProductService, TestStorageService } from '../../../../test/common/workbenchTestServices.js';
 import { IMcpHostDelegate } from '../../common/mcpRegistryTypes.js';
 import { IMcpServerRequestHandlerOptions, McpProtocolFailure, McpServerRequestHandler, McpTask } from '../../common/mcpServerRequestHandler.js';
-import { IMcpMessageEnvelope, IMcpRequestAbort, McpClientError, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, MpcResponseError } from '../../common/mcpTypes.js';
+import { IMcpMessageEnvelope, IMcpRequestAbort, McpClientError, McpConnectionState, McpError, McpServerDefinition, McpServerLaunch, McpServerTransportType, MpcResponseError } from '../../common/mcpTypes.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { TEST_MODERN_SERVER_INFO, TestMcpMessageTransport } from './mcpRegistryTypes.js';
 import { IOutputService } from '../../../../services/output/common/output.js';
@@ -29,6 +29,7 @@ import { IJsonRpcRequest, isJsonRpcNotification, isJsonRpcRequest, isJsonRpcResp
 import { Emitter, Event } from '../../../../../base/common/event.js';
 import { LATEST_MCP_PROTOCOL_VERSION, META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_LOG_LEVEL, META_PROTOCOL_VERSION, MODERN_MCP_PROTOCOL_VERSIONS } from '../../../../../platform/mcp/common/mcpProtocolVersions.js';
 import { MCP } from '../../../../../platform/mcp/common/modelContextProtocol.js';
+import { McpSkills } from '../../../../../platform/mcp/common/modelContextProtocolSkills.js';
 import { buildClientCapabilities, McpProtocolEvent } from '../../common/mcpProtocolMeta.js';
 import { GrpcStatus } from '../../../../../base/common/grpc/status.js';
 
@@ -2225,5 +2226,79 @@ suite('Workbench - MCP - ServerRequestHandler - errors and aborts', () => {
 		const handler = await connect(store, services, transport);
 		handler.dispose();
 		await assert.rejects(handler.listTools(), isCancelled);
+	});
+});
+
+suite('Workbench - MCP - ServerRequestHandler - Skills extension', () => {
+	const store = ensureNoDisposablesAreLeakedInTestSuite();
+	const SKILLS_ENTRY = { uri: 'skill://git/SKILL.md', frontmatter: { name: 'git', description: 'Git' }, resources: 'dynamic' };
+
+	function skillsTransport(settings: Record<string, unknown> | undefined): TestMcpMessageTransport {
+		const capabilities: MCP.ServerCapabilities = { tools: {}, resources: {} };
+		if (settings) {
+			capabilities.extensions = { [McpSkills.EXTENSION_ID]: settings as MCP.JSONObject };
+		}
+		return store.add(new TestMcpMessageTransport({ era: 'modern', discoverResult: { capabilities } }));
+	}
+
+	test('the client declares no Skills capability: the extension is the server\'s alone', async () => {
+		const transport = skillsTransport({});
+		await connect(store, createTestServices(store), transport);
+		const meta = paramsOf(transport.getSentRequests('server/discover')[0])._meta as Record<string, unknown>;
+		const declared = (meta[META_CLIENT_CAPABILITIES] as MCP.ClientCapabilities).extensions ?? {};
+		assert.strictEqual(Object.prototype.hasOwnProperty.call(declared, McpSkills.EXTENSION_ID), false);
+	});
+
+	test('skills/list follows nextCursor across pages and returns the entries as received', async () => {
+		const transport = skillsTransport({});
+		transport.setResponder(McpSkills.METHOD_LIST, req => paramsOf(req).cursor === undefined
+			? completeResult(req, { skills: [SKILLS_ENTRY], nextCursor: 'page-2', ttlMs: 0, cacheScope: 'private' })
+			: completeResult(req, { skills: [{ ...SKILLS_ENTRY, uri: 'skill://other/SKILL.md' }], ttlMs: 0, cacheScope: 'private' }));
+		const handler = await connect(store, createTestServices(store), transport);
+		assert.deepStrictEqual(handler.skillsSettings, { directoryRead: false });
+		const skills = await handler.listSkills();
+		assert.deepStrictEqual(skills, [SKILLS_ENTRY, { ...SKILLS_ENTRY, uri: 'skill://other/SKILL.md' }]);
+		assert.deepStrictEqual(transport.getSentRequests(McpSkills.METHOD_LIST).map(req => paramsOf(req).cursor), [undefined, 'page-2']);
+		assert.deepStrictEqual(transport.getSentRequests('resources/read'), [], 'listing reads no skill file');
+	});
+
+	test('skills/get sends the URI and returns the entry; an unknown skill rejects with the server\'s -32602', async () => {
+		const transport = skillsTransport({});
+		transport.setResponder(McpSkills.METHOD_GET, req => paramsOf(req).uri === SKILLS_ENTRY.uri ? completeResult(req, { skill: SKILLS_ENTRY, ttlMs: 0, cacheScope: 'private' }) : errorResult(req, MCP.INVALID_PARAMS, 'Unknown skill'));
+		const handler = await connect(store, createTestServices(store), transport);
+		assert.deepStrictEqual(await handler.getSkill({ uri: SKILLS_ENTRY.uri }), SKILLS_ENTRY);
+		await assert.rejects(handler.getSkill({ uri: 'skill://nope/SKILL.md' }), (e: unknown) => e instanceof MpcResponseError && e.code === MCP.INVALID_PARAMS);
+	});
+
+	test('resources/directory/read is sent only to a server that declared directoryRead: true', async () => {
+		const without = skillsTransport({});
+		const plain = await connect(store, createTestServices(store), without);
+		await assert.rejects(plain.readDirectory({ uri: 'skill://git' }), McpError);
+		assert.deepStrictEqual(without.getSentRequests(McpSkills.METHOD_DIRECTORY_READ), []);
+
+		const transport = skillsTransport({ directoryRead: true });
+		const children = [{ uri: 'skill://git/SKILL.md', name: 'git', mimeType: 'text/markdown' }, { uri: 'skill://git/docs', name: 'docs', mimeType: 'inode/directory' }];
+		transport.setResponder(McpSkills.METHOD_DIRECTORY_READ, req => completeResult(req, { resources: paramsOf(req).cursor === undefined ? [children[0]] : [children[1]], nextCursor: paramsOf(req).cursor === undefined ? 'next' : undefined }));
+		const handler = await connect(store, createTestServices(store), transport);
+		assert.deepStrictEqual(await handler.readDirectory({ uri: 'skill://git' }), children);
+		assert.deepStrictEqual(transport.getSentRequests(McpSkills.METHOD_DIRECTORY_READ).map(req => [paramsOf(req).uri, paramsOf(req).cursor]), [['skill://git', undefined], ['skill://git', 'next']]);
+	});
+
+	test('a server without the extension gets no skills request', async () => {
+		const transport = skillsTransport(undefined);
+		const handler = await connect(store, createTestServices(store), transport);
+		assert.strictEqual(handler.skillsSettings, undefined);
+		await assert.rejects(handler.listSkills(), McpError);
+		await assert.rejects(handler.getSkill({ uri: SKILLS_ENTRY.uri }), McpError);
+		assert.deepStrictEqual(transport.getSentRequests(McpSkills.METHOD_LIST), []);
+	});
+
+	test('a 2025-11-25 server declares the extension in its initialize capabilities', async () => {
+		const transport = store.add(new TestMcpMessageTransport({ initializeResult: { capabilities: { resources: {}, extensions: { [McpSkills.EXTENSION_ID]: { directoryRead: true } } } } }));
+		transport.setResponder(McpSkills.METHOD_LIST, req => ({ jsonrpc: MCP.JSONRPC_VERSION, id: req.id, result: { skills: [SKILLS_ENTRY] } }));
+		const handler = await connect(store, createTestServices(store), transport);
+		assert.strictEqual(handler.era, 'legacy');
+		assert.deepStrictEqual(handler.skillsSettings, { directoryRead: true });
+		assert.deepStrictEqual(await handler.listSkills(), [SKILLS_ENTRY]);
 	});
 });
