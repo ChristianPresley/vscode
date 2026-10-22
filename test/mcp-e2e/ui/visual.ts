@@ -1522,12 +1522,12 @@ async function main(): Promise<number> {
 					const buttons = (await toast.locator('.monaco-button').allInnerTexts().catch(() => [] as string[])).map(b => b.trim());
 					await shot(page, '26-elicitation-url-notification.png', 'URL elicitation outside chat',
 						'A notification from "MCP Server (zig-http-faults)": the server\'s message "MCP E2E URL elicitation: consent for test_tool_with_logging (round <n>)", then "This will open https://url-elicitation.mcp-e2e.test/consent?id=<n>" (the full URL, with its host), and an Open URL button.', {
-							'the server\'s message': message.includes('MCP E2E URL elicitation: consent for test_tool_with_logging'),
-							'the full URL the server sent': !!url && message.includes(`This will open ${url}`),
-							'the host of the URL': !!hostOf(url) && message.includes(hostOf(url)),
-							'source MCP Server (zig-http-faults)': toastText.includes(`MCP Server (${urlServer})`),
-							'Open URL button': buttons.includes('Open URL'),
-						}, `${url ?? '(no URL elicitation in the MCP log)'}\n${toastText}`.slice(0, 400));
+						'the server\'s message': message.includes('MCP E2E URL elicitation: consent for test_tool_with_logging'),
+						'the full URL the server sent': !!url && message.includes(`This will open ${url}`),
+						'the host of the URL': !!hostOf(url) && message.includes(hostOf(url)),
+						'source MCP Server (zig-http-faults)': toastText.includes(`MCP Server (${urlServer})`),
+						'Open URL button': buttons.includes('Open URL'),
+					}, `${url ?? '(no URL elicitation in the MCP log)'}\n${toastText}`.slice(0, 400));
 				},
 			},
 			onDialog: {
@@ -1539,11 +1539,11 @@ async function main(): Promise<number> {
 					const buttons = (await page.locator('.monaco-dialog-box .monaco-button').allInnerTexts().catch(() => [] as string[])).map(b => b.trim());
 					await shot(page, '26b-elicitation-url-open-website.png', 'URL elicitation: the link protection prompt',
 						'After Open URL: the modal dialog "Do you want Code - OSS to open the external website?" with the full URL (url-elicitation.mcp-e2e.test is not a trusted domain) and the buttons Open, Copy, Configure Trusted Domains and Cancel.', {
-							'asks to open the external website': openWebsite(text),
-							'the full URL': !!url && text.includes(url),
-							'Open button': buttons.includes('Open'),
-							'Cancel button': buttons.includes('Cancel'),
-						}, `${url ?? '(no URL elicitation in the MCP log)'}\n${text}`.slice(0, 400));
+						'asks to open the external website': openWebsite(text),
+						'the full URL': !!url && text.includes(url),
+						'Open button': buttons.includes('Open'),
+						'Cancel button': buttons.includes('Cancel'),
+					}, `${url ?? '(no URL elicitation in the MCP log)'}\n${text}`.slice(0, 400));
 				},
 			},
 		});
