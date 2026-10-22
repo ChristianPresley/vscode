@@ -38,3 +38,14 @@ interop checks.
 
 Both bindings are test fixtures only: VS Code does not generate code from
 them.
+
+## Notices
+
+These files are development-only test data and are not shipped with VS Code.
+`cgmanifest.json` registers both upstream repositories with
+`"developmentDependency": true`, so they are not listed in
+`ThirdPartyNotices.txt`; the upstream licenses are kept next to the copies
+instead (`LICENSE-google-mcp-grpc-proto`, `LICENSE-zig-sdk`). The
+`ChristianPresley/zig-sdk` registration also covers
+`test/mcp-conformance/requirements-2026-07-28.json`, which is converted from
+its `docs/spec/requirements.zon`.

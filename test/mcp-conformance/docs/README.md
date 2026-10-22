@@ -12,7 +12,7 @@
 
 `mcp-conformance-matrix.md` is rendered from three files of the harness folder:
 
-- `requirements-2026-07-28.json`: the 733 normative sentences of the specification, converted from `docs/spec/requirements.zon` of [zig-sdk](https://github.com/ChristianPresley/zig-sdk) v0.5.2 (Apache-2.0) by `tools/convert-requirements.ts`.
+- `requirements-2026-07-28.json`: the 733 normative sentences of the specification, converted from `docs/spec/requirements.zon` of [zig-sdk](https://github.com/ChristianPresley/zig-sdk) v0.6.0 (Apache-2.0) by `tools/convert-requirements.ts`.
 - `requirement-tests.json`: the mapping of every requirement to the tests (`{ "file", "test" }`) and conformance scenarios (`{ "leg", "revision", "scenario", "check"? }`) that cover it, with a status (`tested`, `partial`, `deviation`, `gap` or `n-a`) and a reason where the status needs one.
 - `requirement-matrix.md`: one row per scenario of the suite's requirement sets.
 

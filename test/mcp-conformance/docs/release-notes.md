@@ -9,7 +9,7 @@ VS Code speaks the 2026-07-28 revision of the [Model Context Protocol](https://m
 - **Sampling.** A sampling request's `maxTokens` limits the model's answer (it is passed to the language model as the `max_tokens` option). When a language model with tool calling is available, VS Code declares `sampling.tools` and passes the request's `tools` and `toolChoice` to the model.
 - **Elicitation messages.** The message of a form or URL elicitation is shown as literal text: no link, image or formatting in it is rendered, so a server cannot disguise a link. The URL of a URL elicitation is shown in full before it is opened.
 - **Subscriptions.** List changes and resource updates arrive on `subscriptions/listen` streams, which VS Code reopens with a growing backoff when they drop.
-- **Caching.** A public tool list stays valid for its `ttlMs` (at most a day) across reconnects, so a restarted server does not have to be listed again; private lists are listed again.
+- **Caching.** A public tool list stays valid for its `ttlMs` (at most a day) across reconnects, so a restarted server does not have to be listed again; private lists are listed again. A resource read is reused for its `ttlMs`, at least 3 seconds and at most 60, until the server reports the resource updated or the resource list changed.
 - **HTTP headers.** Requests carry `Mcp-Method` and `Mcp-Name`, and the parameters a tool marks with `x-mcp-header` are mirrored into `Mcp-Param-*` headers (Base64-encoded when needed). Tools with invalid annotations are dropped and logged; a header mismatch makes VS Code list the tools again and retry once.
 - **Schemas.** Tool input schemas, output schemas and elicitation forms are validated with JSON Schema 2020-12 or draft-07 (when `$schema` names it); without `$schema` a 2026-07-28 server gets 2020-12 and a server of an earlier revision draft-07. A `$ref` to a network URI is never fetched, and a `pattern` that cannot be compiled is not checked (a warning in the server's output). From a 2026-07-28 server, a tool whose schema names another dialect is not offered, a result whose `structuredContent` does not match the tool's output schema (or whose output schema does not compile) is an error, and a form whose schema does not compile is declined. For servers of earlier revisions a schema that does not compile is not checked, with a warning, as before.
 - **Tasks.** With the Tasks extension (`io.modelcontextprotocol/tasks`), a long tool call runs as a task that VS Code polls, answers input for and cancels.
@@ -80,7 +80,7 @@ The gateway limits `tools/call` to 50 requests a second (bursts of 100) and `com
 
 VS Code passes every scored client and server scenario of the official MCP conformance suite (`@modelcontextprotocol/conformance` 0.2.0-alpha.12) for 2026-07-28 and 2025-11-25, and every check of the not-scored Tasks and HTTP-header server scenarios. The [conformance matrix](mcp-conformance-matrix.md) maps each normative sentence of the specification to the tests that cover it and lists the deliberate deviations, among them:
 
-- Resource reads are coalesced for 3 seconds whatever `ttlMs` the server sends.
+- Resource reads are reused for at least 3 seconds, also when the server's `ttlMs` is 0, absent, negative or shorter.
 - Microsoft Entra ID sign-ins send no `resource` parameter.
 - Icons are also accepted over `http` from the server's own host and as `file:` URIs from local stdio servers.
 - The typed gRPC binding cannot carry subscriptions, notifications, pagination beyond the first page or tasks.

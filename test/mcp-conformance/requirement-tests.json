@@ -9424,11 +9424,20 @@
 		},
 		{
 			"id": "server/utilities/caching#018-4f05f9",
-			"status": "tested",
+			"status": "deviation",
+			"reason": "An expired list is fetched again (a public tool list on reconnect). A resource read whose positive ttlMs is under 3 seconds is still reused until the 3-second floor, counted from the request (see the deviation note); one with a longer ttlMs is read again once it has expired (at most 60 seconds).",
 			"tests": [
 				{
 					"file": "src/vs/workbench/contrib/mcp/test/common/mcpService.test.ts",
 					"test": "an expired public tool list is re-listed on reconnect"
+				},
+				{
+					"file": "src/vs/workbench/contrib/mcp/test/common/mcpResourceFilesystem.test.ts",
+					"test": "the cache lifetime is the server ttlMs clamped to 3-60 s; no ttlMs and ttlMs 0 get the floor"
+				},
+				{
+					"file": "src/vs/workbench/contrib/mcp/test/common/mcpResourceFilesystem.test.ts",
+					"test": "a slow read is reused only for what is left of its lifetime once it completes"
 				}
 			]
 		},

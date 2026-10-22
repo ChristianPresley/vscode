@@ -149,6 +149,10 @@ jobs:
     steps:
       - name: Checkout microsoft/vscode
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A pull request is checked out as its merge commit; the ESLint step
+          # diffs it against its first parent, the base branch.
+          fetch-depth: 2
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -204,7 +208,59 @@ jobs:
 
       - name: ESLint
         if: ${{ !cancelled() }}
-        run: npm run eslint -- src/vs/platform/mcp src/vs/workbench/contrib/mcp src/vs/workbench/api/common/extHostMcp.ts src/vs/workbench/api/node/mcpConformance*.ts src/vs/base/common/jsonSchemaValidator src/vs/base/common/protobuf src/vs/base/common/grpc
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -e
+
+          # The TypeScript of the push paths above, the tests of the OAuth helpers and
+          # of the loopback server, and the end-to-end harness.
+          targets=(
+            src/vs/platform/mcp
+            src/vs/workbench/contrib/mcp
+            src/vs/workbench/api/common/extHostMcp.ts
+            src/vs/workbench/api/common/mcpOAuthClientFactory.ts
+            src/vs/workbench/api/browser/mainThreadMcp.ts
+            src/vs/workbench/api/node/extHostMcpNode.ts
+            src/vs/workbench/api/node/extHostMcpGrpc.ts
+            'src/vs/workbench/api/node/mcpConformance*.ts'
+            src/vs/workbench/api/test/node/loopbackServer.test.ts
+            src/vs/base/common/oauth.ts
+            src/vs/base/common/oauthClient.ts
+            src/vs/base/test/common/oauthProtocolHelpers.test.ts
+            src/vs/base/common/jsonRpcProtocol.ts
+            src/vs/base/common/jsonSchemaValidator
+            src/vs/base/common/protobuf
+            src/vs/base/common/grpc
+            src/vs/base/common/sseParser.ts
+            src/vs/base/common/envfile.ts
+            src/vs/base/node/grpcChannel.ts
+            src/vs/base/node/grpcServer.ts
+            build/mcp
+            test/mcp-conformance
+            test/mcp-grpc
+            test/mcp-e2e
+          )
+
+          # A pull request also lints every TypeScript file it changes: the diff of
+          # its merge commit against the base branch, as `git diff main...HEAD` lists
+          # them. Files that ESLint ignores (the vendored schema) are left out, since
+          # naming one is a warning.
+          if [ "$EVENT_NAME" = pull_request ] && git rev-parse --verify --quiet HEAD^2 > /dev/null; then
+            changed=$(git diff --name-only --diff-filter=d HEAD^1 HEAD -- '*.ts')
+            if [ -n "$changed" ]; then
+              mapfile -t changed_files <<< "$changed"
+              lintable=$(node --input-type=module -e "import { ESLint } from 'eslint'; const eslint = new ESLint(); for (const file of process.argv.slice(1)) { if (!(await eslint.isPathIgnored(file))) { console.log(file); } }" -- "${changed_files[@]}")
+              if [ -n "$lintable" ]; then
+                mapfile -t lintable_files <<< "$lintable"
+                echo "Also linting the ${#lintable_files[@]} TypeScript files the pull request changes."
+                targets+=("${lintable_files[@]}")
+              fi
+            fi
+          fi
+
+          npm run eslint -- "${targets[@]}"
 
       - name: Hygiene
         if: ${{ !cancelled() }}

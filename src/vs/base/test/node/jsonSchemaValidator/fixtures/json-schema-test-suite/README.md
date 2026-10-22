@@ -19,3 +19,7 @@ Copied files, below the root of the upstream repository:
 
 The tests reference remote documents as `http://localhost:1234/<path below remotes>`;
 `src/vs/base/test/node/jsonSchemaValidator/jsonSchemaTestSuite.test.ts` supplies them in memory.
+
+These files are development-only test data and are not shipped with VS Code. `cgmanifest.json` registers
+`json-schema-org/JSON-Schema-Test-Suite` with `"developmentDependency": true`, so it is not listed in
+`ThirdPartyNotices.txt`; the upstream license is kept next to the copies instead (`LICENSE`).
