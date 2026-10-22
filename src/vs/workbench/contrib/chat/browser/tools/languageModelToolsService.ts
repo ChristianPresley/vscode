@@ -52,7 +52,7 @@ import { HookType } from '../../common/promptSyntax/hookTypes.js';
 import { CopilotChatSettingId, CopilotToolId } from '../../common/tools/copilotToolIds.js';
 import { ILanguageModelToolsConfirmationService } from '../../common/tools/languageModelToolsConfirmationService.js';
 import { TerminalToolId } from '../../common/tools/terminalToolIds.js';
-import { CountTokensCallback, createToolSchemaUri, IBeginToolCallOptions, IExternalPreToolUseHookResult, ILanguageModelToolsService, IPreparedToolInvocation, isToolSet, IToolData, IToolImpl, IToolInvocation, IToolInvokedEvent, IToolResult, IToolResultInputOutputDetails, IToolSet, SpecedToolAliases, stringifyPromptTsxPart, ToolAndToolSetEnablementMap, ToolDataSource, ToolInvocationPresentation, toolMatchesModel, ToolSet, ToolSetForModel, VSCodeToolReference } from '../../common/tools/languageModelToolsService.js';
+import { CountTokensCallback, createToolSchemaUri, IBeginToolCallOptions, IExternalPreToolUseHookResult, ILanguageModelToolsService, IPreparedToolInvocation, isToolSet, IToolData, IToolImpl, IToolInvocation, IToolInvokedEvent, IToolResult, IToolInvocationGate, IToolResultInputOutputDetails, IToolSet, SpecedToolAliases, stringifyPromptTsxPart, ToolAndToolSetEnablementMap, ToolDataSource, ToolInvocationPresentation, toolMatchesModel, ToolSet, ToolSetForModel, VSCodeToolReference } from '../../common/tools/languageModelToolsService.js';
 import { IToolResultCompressor } from '../../common/tools/toolResultCompressor.js';
 import { getToolConfirmationAlert } from '../accessibility/chatAccessibilityProvider.js';
 import { IChatWidgetService } from '../chat.js';
@@ -88,6 +88,9 @@ const toolIdsThatCannotBeAutoApproved = new Set([
 	'vscode_get_confirmation_with_options',
 	'vscode_get_modified_files_confirmation',
 ]);
+
+/** A preToolUse hook result, or the 'ask' of a tool invocation gate ({@link IToolInvocationGate}), which wins over the hook. */
+type IConfirmationDecision = IExternalPreToolUseHookResult & { readonly fromGate?: boolean };
 
 const toolIdsThatAlwaysRequireConfirmation: ReadonlySet<string> = new Set([
 	TerminalToolId.CreateAndRunTask,
@@ -137,6 +140,8 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 	private readonly _ctxToolsCount: IContextKey<number>;
 
 	private readonly _callsByRequestId = new Map<string, ITrackedCall[]>();
+
+	private readonly _invocationGates = new Set<IToolInvocationGate>();
 
 	/** Pending tool calls in the streaming phase, keyed by toolCallId */
 	private readonly _pendingToolCalls = new Map<string, ChatToolInvocation>();
@@ -372,6 +377,28 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 		);
 	}
 
+	registerToolInvocationGate(gate: IToolInvocationGate): IDisposable {
+		this._invocationGates.add(gate);
+		return toDisposable(() => this._invocationGates.delete(gate));
+	}
+
+	/** The reasons of the gates that hold this call, joined; undefined when none does. A gate that fails holds the call. */
+	private async _gateConfirmationReason(dto: IToolInvocation, tool: IToolData, token: CancellationToken): Promise<string | undefined> {
+		if (this._invocationGates.size === 0) {
+			return undefined;
+		}
+		const reasons = await Promise.all([...this._invocationGates].map(async gate => {
+			try {
+				return await gate.confirmationRequired(dto, tool, token);
+			} catch (e) {
+				this._logService.error(`[LanguageModelToolsService#invokeTool] A tool invocation gate failed for ${dto.toolId}, confirmation required: ${toErrorMessage(e)}`);
+				return localize('toolInvocationGateFailed', "A check of this tool call failed, so it needs your confirmation");
+			}
+		}));
+		const held = reasons.filter((reason): reason is string => reason !== undefined);
+		return held.length > 0 ? held.join(' ') : undefined;
+	}
+
 	getTools(model: ILanguageModelChatMetadata | undefined): Iterable<IToolData> {
 		const toolDatas = Iterable.map(this._tools.values(), i => i.data);
 		const extensionToolsEnabled = this._configurationService.getValue<boolean>(ChatConfiguration.ExtensionToolsEnabled);
@@ -598,6 +625,12 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 			this._pendingToolCalls.delete(pendingToolCallKey);
 		}
 
+		// A gate's hold wins over a hook that allows the call: the user must confirm it
+		const gateReason = await this._gateConfirmationReason(dto, tool.data, token);
+		const confirmationDecision: IConfirmationDecision | undefined = gateReason !== undefined
+			? { ...preToolUseHookResult, permissionDecision: 'ask', permissionDecisionReason: gateReason, fromGate: true }
+			: preToolUseHookResult;
+
 		let toolResult: IToolResult | undefined;
 		let prepareTimeWatch: StopWatch | undefined;
 		let invocationTimeWatch: StopWatch | undefined;
@@ -616,10 +649,10 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 				dto.userSelectedTools = request.userSelectedTools && { ...request.userSelectedTools };
 
 				prepareTimeWatch = StopWatch.create(true);
-				preparedInvocation = await this.prepareToolInvocationWithHookResult(tool, dto, preToolUseHookResult, token);
+				preparedInvocation = await this.prepareToolInvocationWithHookResult(tool, dto, confirmationDecision, token);
 				prepareTimeWatch.stop();
 
-				const { autoConfirmed: resolvedAutoConfirmed, preparedInvocation: updatedPreparedInvocation } = await this.resolveAutoConfirmFromHook(preToolUseHookResult, tool, dto, preparedInvocation, dto.context?.sessionResource);
+				const { autoConfirmed: resolvedAutoConfirmed, preparedInvocation: updatedPreparedInvocation } = await this.resolveAutoConfirmFromHook(confirmationDecision, tool, dto, preparedInvocation, dto.context?.sessionResource);
 				preparedInvocation = updatedPreparedInvocation;
 
 				// A caller (e.g. the agent host) may have resolved auto-approval
@@ -629,7 +662,7 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 				// confirmation, so never let `preApproved` override it.
 				const preResolvedAutoConfirmed = toolIdsThatAlwaysRequireConfirmation.has(tool.data.id)
 					? undefined
-					: resolvedAutoConfirmed ?? (preToolUseHookResult?.permissionDecision === 'ask' ? undefined : dto.preApproved);
+					: resolvedAutoConfirmed ?? (confirmationDecision?.permissionDecision === 'ask' ? undefined : dto.preApproved);
 
 				// In Autopilot, run the risk classifier on an auto-approved call that would
 				// otherwise show a confirmation. A "red" rating skips the call; anything else
@@ -707,14 +740,14 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 				}
 			} else {
 				prepareTimeWatch = StopWatch.create(true);
-				preparedInvocation = await this.prepareToolInvocationWithHookResult(tool, dto, preToolUseHookResult, token);
+				preparedInvocation = await this.prepareToolInvocationWithHookResult(tool, dto, confirmationDecision, token);
 				prepareTimeWatch.stop();
 
-				const { autoConfirmed: fallbackAutoConfirmed, preparedInvocation: updatedPreparedInvocation } = await this.resolveAutoConfirmFromHook(preToolUseHookResult, tool, dto, preparedInvocation, undefined);
+				const { autoConfirmed: fallbackAutoConfirmed, preparedInvocation: updatedPreparedInvocation } = await this.resolveAutoConfirmFromHook(confirmationDecision, tool, dto, preparedInvocation, undefined);
 				preparedInvocation = updatedPreparedInvocation;
 				const autoConfirmed = toolIdsThatAlwaysRequireConfirmation.has(tool.data.id)
 					? undefined
-					: fallbackAutoConfirmed ?? (preToolUseHookResult?.permissionDecision === 'ask' ? undefined : dto.preApproved);
+					: fallbackAutoConfirmed ?? (confirmationDecision?.permissionDecision === 'ask' ? undefined : dto.preApproved);
 				if (preparedInvocation?.confirmationMessages?.title && !autoConfirmed) {
 					const result = await this._dialogService.confirm({ message: renderAsPlaintext(preparedInvocation.confirmationMessages.title), detail: renderAsPlaintext(preparedInvocation.confirmationMessages.message!) });
 					if (!result.confirmed) {
@@ -814,9 +847,11 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 		}
 	}
 
-	private async prepareToolInvocationWithHookResult(tool: IToolEntry, dto: IToolInvocation, hookResult: IExternalPreToolUseHookResult | undefined, token: CancellationToken): Promise<IPreparedToolInvocation | undefined> {
+	private async prepareToolInvocationWithHookResult(tool: IToolEntry, dto: IToolInvocation, hookResult: IConfirmationDecision | undefined, token: CancellationToken): Promise<IPreparedToolInvocation | undefined> {
 		let forceConfirmationReason: string | undefined;
-		if (hookResult?.permissionDecision === 'ask') {
+		if (hookResult?.fromGate) {
+			forceConfirmationReason = hookResult.permissionDecisionReason;
+		} else if (hookResult?.permissionDecision === 'ask') {
 			const hookMessage = localize('preToolUseHookRequiredConfirmation', "{0} required confirmation", HookType.PreToolUse);
 			forceConfirmationReason = hookResult.permissionDecisionReason
 				? `${hookMessage}: ${hookResult.permissionDecisionReason}`
@@ -869,7 +904,7 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 	 * since when the hook returns 'ask' and preparedInvocation was undefined, we create one.
 	 */
 	private async resolveAutoConfirmFromHook(
-		hookResult: IExternalPreToolUseHookResult | undefined,
+		hookResult: IConfirmationDecision | undefined,
 		tool: IToolEntry,
 		dto: IToolInvocation,
 		preparedInvocation: IPreparedToolInvocation | undefined,
@@ -889,9 +924,11 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 				}
 				const fullReferenceName = getToolFullReferenceName(tool.data);
 				const hookReason = hookResult.permissionDecisionReason;
-				const hookNote = hookReason
-					? localize('hookRequiresConfirmation.messageWithReason', "{0} hook required confirmation: {1}", HookType.PreToolUse, hookReason)
-					: localize('hookRequiresConfirmation.message', "{0} hook required confirmation", HookType.PreToolUse);
+				const hookNote = hookResult.fromGate && hookReason
+					? hookReason
+					: hookReason
+						? localize('hookRequiresConfirmation.messageWithReason', "{0} hook required confirmation: {1}", HookType.PreToolUse, hookReason)
+						: localize('hookRequiresConfirmation.message', "{0} hook required confirmation", HookType.PreToolUse);
 				preparedInvocation.confirmationMessages = {
 					...preparedInvocation.confirmationMessages,
 					title: localize('hookRequiresConfirmation.title', "Use the '{0}' tool?", fullReferenceName),
@@ -905,9 +942,11 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 			} else {
 				// Tool already has its own confirmation - prepend hook note
 				const hookReason = hookResult.permissionDecisionReason;
-				const hookNote = hookReason
-					? localize('hookRequiresConfirmation.note', "{0} hook required confirmation: {1}", HookType.PreToolUse, hookReason)
-					: localize('hookRequiresConfirmation.noteNoReason', "{0} hook required confirmation", HookType.PreToolUse);
+				const hookNote = hookResult.fromGate && hookReason
+					? hookReason
+					: hookReason
+						? localize('hookRequiresConfirmation.note', "{0} hook required confirmation: {1}", HookType.PreToolUse, hookReason)
+						: localize('hookRequiresConfirmation.noteNoReason', "{0} hook required confirmation", HookType.PreToolUse);
 
 				const existing = preparedInvocation.confirmationMessages!;
 				if (preparedInvocation.toolSpecificData?.kind === 'terminal') {

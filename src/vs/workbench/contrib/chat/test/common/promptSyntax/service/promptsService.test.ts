@@ -45,8 +45,8 @@ import { MockChatSessionsService } from '../../mockChatSessionsService.js';
 import { PromptsConfig } from '../../../../common/promptSyntax/config/config.js';
 import { AGENTS_SOURCE_FOLDER, CLAUDE_CONFIG_FOLDER, HOOKS_SOURCE_FOLDER, INSTRUCTION_FILE_EXTENSION, INSTRUCTIONS_DEFAULT_SOURCE_FOLDER, LEGACY_MODE_DEFAULT_SOURCE_FOLDER, PROMPT_DEFAULT_SOURCE_FOLDER, PROMPT_FILE_EXTENSION } from '../../../../common/promptSyntax/config/promptFileLocations.js';
 import { INSTRUCTIONS_LANGUAGE_ID, PROMPT_LANGUAGE_ID, PromptFileSource, PromptsType, Target } from '../../../../common/promptSyntax/promptTypes.js';
-import { IAgentDiscoveryResult, IAgentSource, ICustomAgent, IPromptFileContext, IPromptPath, IPromptsService, PromptsStorage } from '../../../../common/promptSyntax/service/promptsService.js';
-import { PromptsService } from '../../../../common/promptSyntax/service/promptsServiceImpl.js';
+import { IAgentDiscoveryResult, IAgentSkill, IAgentSource, ICustomAgent, IPromptFileContext, IPromptPath, IPromptsService, PromptsStorage } from '../../../../common/promptSyntax/service/promptsService.js';
+import { mergeProvidedSkills, PromptsService } from '../../../../common/promptSyntax/service/promptsServiceImpl.js';
 import { mockFiles } from '../testUtils/mockFilesystem.js';
 import { InMemoryStorageService, IStorageService } from '../../../../../../../platform/storage/common/storage.js';
 import { IPathService } from '../../../../../../services/path/common/pathService.js';
@@ -3673,6 +3673,74 @@ suite('PromptsService', () => {
 
 			const result = await service.findAgentSkills(CancellationToken.None);
 			assert.strictEqual(result, undefined);
+		});
+
+		function mcpSkill(serverId: string, serverLabel: string, name: string): IAgentSkill {
+			const skillUri = `skill://${name}/SKILL.md`;
+			return {
+				uri: URI.from({ scheme: 'mcp-resource', authority: serverId, path: `/${name}/SKILL.md` }),
+				storage: PromptsStorage.mcp,
+				name,
+				description: `${name} from ${serverLabel}`,
+				disableModelInvocation: false,
+				userInvocable: false,
+				mcp: { serverId, serverLabel, skillUri },
+			};
+		}
+
+		test('provided MCP skills join the skill files, keyed by URI; a colliding name is qualified and never shadows a skill file', async () => {
+			testConfigService.setUserConfiguration(PromptsConfig.USE_AGENT_SKILLS, true);
+			testConfigService.setUserConfiguration(PromptsConfig.SKILLS_LOCATION_KEY, {});
+			const rootFolderUri = URI.file('/provided-skills-test');
+			workspaceContextService.setWorkspace(testWorkspace(rootFolderUri));
+			await mockFiles(fileService, [{
+				path: '/provided-skills-test/.github/skills/pdf-processing/SKILL.md',
+				contents: ['---', 'name: pdf-processing', 'description: "The local PDF skill"', '---', 'Local.'],
+			}]);
+
+			const onDidChange = disposables.add(new Emitter<void>());
+			let provided = [mcpSkill('server.a', 'Server A', 'pdf-processing'), mcpSkill('server.a', 'Server A', 'forms')];
+			let changes = 0;
+			disposables.add(service.onDidChangeSkills(() => changes++));
+			let seen = changes;
+			const registration = service.registerAgentSkillProvider({ onDidChangeSkills: onDidChange.event, provideSkills: async () => provided });
+			assert.ok(changes > seen, 'registering a provider changes the skills');
+
+			const skills = await service.findAgentSkills(CancellationToken.None);
+			assert.deepStrictEqual(skills?.map(s => [s.name, s.storage, s.mcp?.serverId]), [
+				['pdf-processing', PromptsStorage.local, undefined],
+				['Server A/pdf-processing', PromptsStorage.mcp, 'server.a'],
+				['forms', PromptsStorage.mcp, 'server.a'],
+			]);
+			assert.strictEqual(skills?.[1].uri.toString(), provided[0].uri.toString(), 'the URI (server and SKILL.md) is the key');
+
+			provided = [mcpSkill('server.b', 'Server B', 'forms')];
+			seen = changes;
+			onDidChange.fire();
+			assert.ok(changes > seen, 'the change event of the provider changes the skills');
+			assert.deepStrictEqual((await service.findAgentSkills(CancellationToken.None))?.map(s => s.name), ['pdf-processing', 'forms']);
+
+			seen = changes;
+			registration.dispose();
+			assert.ok(changes > seen, 'removing a provider changes the skills');
+			assert.deepStrictEqual((await service.findAgentSkills(CancellationToken.None))?.map(s => s.name), ['pdf-processing']);
+		});
+
+		test('a provider that fails lists nothing and leaves the skill files', async () => {
+			testConfigService.setUserConfiguration(PromptsConfig.USE_AGENT_SKILLS, true);
+			testConfigService.setUserConfiguration(PromptsConfig.SKILLS_LOCATION_KEY, {});
+			workspaceContextService.setWorkspace(testWorkspace(URI.file('/failing-provider-test')));
+			disposables.add(service.registerAgentSkillProvider({ onDidChangeSkills: Event.None, provideSkills: async () => { throw new Error('server gone'); } }));
+			assert.deepStrictEqual(await service.findAgentSkills(CancellationToken.None), []);
+		});
+
+		test('colliding provided names are qualified by server label, then by server id, never dropped', () => {
+			const merged = mergeProvidedSkills([], [
+				mcpSkill('server.a', 'Shared', 'refunds'),
+				mcpSkill('server.b', 'Shared', 'refunds'),
+				mcpSkill('server.c', 'Other', 'unique'),
+			]);
+			assert.deepStrictEqual(merged.map(s => s.name), ['Shared/refunds', 'server.b/refunds', 'unique']);
 		});
 
 		test('should find skills in workspace and user home', async () => {

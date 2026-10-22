@@ -5279,6 +5279,71 @@ suite('LanguageModelToolsService', () => {
 		});
 	});
 
+	suite('tool invocation gates', () => {
+		let gateService: LanguageModelToolsService;
+		let gateChatService: MockChatService;
+
+		setup(() => {
+			const setup = createTestToolsService(store);
+			gateService = setup.service;
+			gateChatService = setup.chatService;
+		});
+
+		async function invokeAllowedByHook(toolId: string, sessionId: string): Promise<{ invocation: ChatToolInvocation; done: Promise<unknown>; invoked: () => boolean }> {
+			let invoked = false;
+			const tool = registerToolForTest(gateService, store, toolId, {
+				invoke: async () => {
+					invoked = true;
+					return { content: [{ kind: 'text', value: 'ran' }] };
+				},
+			});
+			const capture: { invocation?: ChatToolInvocation } = {};
+			stubGetSession(gateChatService, sessionId, { requestId: 'req1', capture, modeInfo: { permissionLevel: ChatPermissionLevel.AutoApprove } });
+			const dto = tool.makeDto({ test: 1 }, { sessionId });
+			dto.preToolUseResult = { permissionDecision: 'allow' };
+			dto.preApproved = { type: ToolConfirmKind.ConfirmationNotNeeded };
+			const done = gateService.invokeTool(dto, async () => 0, CancellationToken.None);
+			const invocation = await waitForPublishedInvocation(capture);
+			return { invocation, done, invoked: () => invoked };
+		}
+
+		test('a call a gate holds waits for the user, though a hook allows it, the session auto-approves and it was pre-approved', async () => {
+			const reasons: string[] = [];
+			store.add(gateService.registerToolInvocationGate({
+				confirmationRequired: async (dto, tool) => {
+					reasons.push(tool.id);
+					return 'An MCP skill is active in this chat.';
+				}
+			}));
+			const { invocation, done, invoked } = await invokeAllowedByHook('gatedTool', 'gate-held');
+			assert.deepStrictEqual(reasons, ['gatedTool']);
+			assert.strictEqual(invocation.state.get().type, IChatToolInvocation.StateKind.WaitingForConfirmation);
+			const message = invocation.confirmationMessages?.message;
+			assert.ok((typeof message === 'string' ? message : message?.value)?.includes('An MCP skill is active in this chat.'));
+			assert.strictEqual(invocation.confirmationMessages?.allowAutoConfirm, false);
+			assert.strictEqual(invoked(), false);
+
+			IChatToolInvocation.confirmWith(invocation, { type: ToolConfirmKind.UserAction });
+			await done;
+			assert.strictEqual(invoked(), true);
+		});
+
+		test('a gate that fails holds the call; a gate that does not hold it, or is gone, changes nothing', async () => {
+			const failing = gateService.registerToolInvocationGate({ confirmationRequired: async () => { throw new Error('boom'); } });
+			const held = await invokeAllowedByHook('failingGateTool', 'gate-failing');
+			assert.strictEqual(held.invocation.state.get().type, IChatToolInvocation.StateKind.WaitingForConfirmation);
+			IChatToolInvocation.confirmWith(held.invocation, { type: ToolConfirmKind.UserAction });
+			await held.done;
+			failing.dispose();
+
+			store.add(gateService.registerToolInvocationGate({ confirmationRequired: async () => undefined }));
+			const free = await invokeAllowedByHook('freeTool', 'gate-free');
+			await free.done;
+			assert.strictEqual(free.invoked(), true);
+			assert.notStrictEqual(free.invocation.state.get().type, IChatToolInvocation.StateKind.WaitingForConfirmation);
+		});
+	});
+
 	suite('preApproved (out-of-band auto-approval)', () => {
 		let preApprovedService: LanguageModelToolsService;
 		let preApprovedChatService: MockChatService;

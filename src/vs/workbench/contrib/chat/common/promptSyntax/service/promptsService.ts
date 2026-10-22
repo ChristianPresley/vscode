@@ -120,6 +120,8 @@ export enum PromptsStorage {
 	extension = 'extension',
 	plugin = 'plugin',
 	builtIn = 'builtin',
+	/** Served by an MCP server (Skills extension, SEP-2640); only agent skills come from here, see {@link IAgentSkillMcpOrigin}. */
+	mcp = 'mcp',
 }
 
 export function isUserToggleableCustomization(type: PromptsType, storage: PromptsStorage): boolean {
@@ -470,6 +472,40 @@ export interface IAgentSkill {
 	 * Optional session types that describe when this skill should be offered.
 	 */
 	readonly sessionTypes?: readonly string[];
+	/**
+	 * Set for a skill an MCP server serves (storage {@link PromptsStorage.mcp}).
+	 * Such a skill is no file: it is loaded with the MCP skill tool
+	 * ({@link McpSkillToolReferenceName}) by its server and `SKILL.md` URI.
+	 */
+	readonly mcp?: IAgentSkillMcpOrigin;
+}
+
+/**
+ * The origin of an MCP-served skill (Skills extension, SEP-2640). Its
+ * identity is the server and the `SKILL.md` URI together, never the name.
+ */
+export interface IAgentSkillMcpOrigin {
+	/** The host-assigned identity of the server (its definition id), never the server's self-reported name. */
+	readonly serverId: string;
+	/** The host's label for the server. */
+	readonly serverLabel: string;
+	/** The URI of the skill's `SKILL.md` on the server. */
+	readonly skillUri: string;
+}
+
+/**
+ * Supplies agent skills that do not come from prompt files, such as the
+ * skills of connected MCP servers. Listing a skill reads none of its files.
+ */
+export interface IAgentSkillProvider {
+	readonly onDidChangeSkills: Event<void>;
+	provideSkills(token: CancellationToken): Promise<readonly IAgentSkill[]>;
+}
+
+/** The reference names of the tools that load MCP-served skills and read their files. */
+export const enum McpSkillToolReferenceName {
+	ReadSkill = 'readMcpSkill',
+	ReadSkillFile = 'readMcpSkillFile',
 }
 
 /**
@@ -764,6 +800,13 @@ export interface IPromptsService extends IDisposable {
 	 * Gets list of agent skills files.
 	 */
 	findAgentSkills(token: CancellationToken): Promise<IAgentSkill[] | undefined>;
+
+	/**
+	 * Registers a provider whose skills {@link findAgentSkills} lists next to
+	 * the skill files. A provided skill whose name another skill already has
+	 * is listed under a qualified name, so that it never shadows the other.
+	 */
+	registerAgentSkillProvider(provider: IAgentSkillProvider): IDisposable;
 
 	/**
 	 * Event that is triggered when the list of skills changes.

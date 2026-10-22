@@ -690,6 +690,7 @@ suite('AgentHostClientTools', () => {
 				registerToolData: () => toDisposable(() => { }),
 				registerToolImplementation: () => toDisposable(() => { }),
 				registerTool: () => toDisposable(() => { }),
+				registerToolInvocationGate: () => toDisposable(() => { }),
 				getTools: () => tools,
 				getAllToolsIncludingDisabled: () => tools,
 				getTool: (id: string) => tools.find(t => t.id === id),

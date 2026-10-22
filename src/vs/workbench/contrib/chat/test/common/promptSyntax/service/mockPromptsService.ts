@@ -11,7 +11,7 @@ import { ITextModel } from '../../../../../../../editor/common/model.js';
 import { IExtensionDescription } from '../../../../../../../platform/extensions/common/extensions.js';
 import { PromptsType } from '../../../../common/promptSyntax/promptTypes.js';
 import { ParsedPromptFile } from '../../../../common/promptSyntax/promptFileParser.js';
-import { IAgentSkill, ICustomAgent, IPromptDiscoveryInfo, IPromptFileContext, IPromptFileResource, IPromptPath, IPromptsService, IAgentInstructionFile, IInstructionFile, PromptsStorage } from '../../../../common/promptSyntax/service/promptsService.js';
+import { IAgentSkill, IAgentSkillProvider, ICustomAgent, IPromptDiscoveryInfo, IPromptFileContext, IPromptFileResource, IPromptPath, IPromptsService, IAgentInstructionFile, IInstructionFile, PromptsStorage } from '../../../../common/promptSyntax/service/promptsService.js';
 import { ResourceSet } from '../../../../../../../base/common/map.js';
 
 export class MockPromptsService implements IPromptsService {
@@ -63,6 +63,7 @@ export class MockPromptsService implements IPromptsService {
 	setDisabledPromptFiles(type: PromptsType, uris: ResourceSet): void { throw new Error('Method not implemented.'); }
 	registerPromptFileProvider(extension: IExtensionDescription, type: PromptsType, provider: { providePromptFiles: (context: IPromptFileContext, token: CancellationToken) => Promise<IPromptFileResource[] | undefined> }): IDisposable { throw new Error('Method not implemented.'); }
 	findAgentSkills(token: CancellationToken): Promise<IAgentSkill[] | undefined> { throw new Error('Method not implemented.'); }
+	registerAgentSkillProvider(provider: IAgentSkillProvider): IDisposable { throw new Error('Method not implemented.'); }
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	getHooks(_token: CancellationToken): Promise<any> { throw new Error('Method not implemented.'); }
 	getInstructionFiles(_token: CancellationToken): Promise<readonly IInstructionFile[]> { throw new Error('Method not implemented.'); }

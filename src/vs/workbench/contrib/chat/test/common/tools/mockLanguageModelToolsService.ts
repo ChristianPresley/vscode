@@ -16,7 +16,7 @@ import { ChatRequestToolReferenceEntry } from '../../../common/attachments/chatV
 import { IVariableReference } from '../../../common/chatModes.js';
 import { IChatToolInvocation } from '../../../common/chatService/chatService.js';
 import { ILanguageModelChatMetadata } from '../../../common/languageModels.js';
-import { CountTokensCallback, IBeginToolCallOptions, ILanguageModelToolsService, ToolAndToolSetEnablementMap, IToolData, IToolImpl, IToolInvocation, IToolInvokedEvent, IToolResult, IToolSet, ToolDataSource, ToolSet } from '../../../common/tools/languageModelToolsService.js';
+import { CountTokensCallback, IBeginToolCallOptions, ILanguageModelToolsService, ToolAndToolSetEnablementMap, IToolData, IToolImpl, IToolInvocation, IToolInvocationGate, IToolInvokedEvent, IToolResult, IToolSet, ToolDataSource, ToolSet } from '../../../common/tools/languageModelToolsService.js';
 
 export class MockLanguageModelToolsService extends Disposable implements ILanguageModelToolsService {
 	_serviceBrand: undefined;
@@ -81,6 +81,10 @@ export class MockLanguageModelToolsService extends Disposable implements ILangua
 	}
 
 	registerTool(toolData: IToolData, tool: IToolImpl): IDisposable {
+		return Disposable.None;
+	}
+
+	registerToolInvocationGate(gate: IToolInvocationGate): IDisposable {
 		return Disposable.None;
 	}
 

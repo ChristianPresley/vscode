@@ -8,7 +8,7 @@ import { CancellationError, isCancellationError } from '../../../../../../base/c
 import { Emitter, Event } from '../../../../../../base/common/event.js';
 import { ParseError, parse as parseJSONC } from '../../../../../../base/common/json.js';
 import { getParseErrorMessage } from '../../../../../../base/common/jsonErrorMessages.js';
-import { Disposable, DisposableStore, IDisposable, MutableDisposable } from '../../../../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore, IDisposable, MutableDisposable, toDisposable } from '../../../../../../base/common/lifecycle.js';
 import { StopWatch } from '../../../../../../base/common/stopwatch.js';
 import { autorun, IReader, observableFromEvent } from '../../../../../../base/common/observable.js';
 import { ResourceMap, ResourceSet } from '../../../../../../base/common/map.js';
@@ -34,7 +34,7 @@ import { AGENT_MD_FILENAME, CLAUDE_CONFIG_FOLDER, CLAUDE_LOCAL_MD_FILENAME, CLAU
 import { PROMPT_LANGUAGE_ID, PromptFileSource, PromptsType, Target, getPromptsTypeForLanguageId } from '../promptTypes.js';
 import { IWorkspaceInstructionFile, PromptFilesLocator } from '../utils/promptFilesLocator.js';
 import { evaluateApplyToPattern, PromptFileParser, ParsedPromptFile, PromptHeaderAttributes } from '../promptFileParser.js';
-import { IAgentInstructions, IAgentSource, IChatPromptSlashCommand, IConfiguredHooksInfo, ICustomAgent, IExtensionPromptPath, ILocalPromptPath, IPluginPromptPath, IBuiltinPromptPath, IPromptPath, IPromptsService, IAgentSkill, IInstructionDiscoveryInfo, IInstructionDiscoveryResult, IInstructionFile, IUserPromptPath, PromptsStorage, IPromptFileContext, IPromptFileResource, IPromptDiscoveryInfo, IPromptFileDiscoveryResult, IPromptSourceFolderResult, ICustomAgentVisibility, IAgentInstructionFile, AgentInstructionFileType, Logger, ISlashCommandDiscoveryInfo, ISlashCommandDiscoveryResult, IAgentDiscoveryInfo, IAgentDiscoveryResult, IHookDiscoveryInfo, IResolvedChatPromptSlashCommand, matchesSessionType } from './promptsService.js';
+import { IAgentInstructions, IAgentSource, IChatPromptSlashCommand, IConfiguredHooksInfo, ICustomAgent, IExtensionPromptPath, ILocalPromptPath, IPluginPromptPath, IBuiltinPromptPath, IPromptPath, IPromptsService, IAgentSkill, IAgentSkillProvider, IInstructionDiscoveryInfo, IInstructionDiscoveryResult, IInstructionFile, IUserPromptPath, PromptsStorage, IPromptFileContext, IPromptFileResource, IPromptDiscoveryInfo, IPromptFileDiscoveryResult, IPromptSourceFolderResult, ICustomAgentVisibility, IAgentInstructionFile, AgentInstructionFileType, Logger, ISlashCommandDiscoveryInfo, ISlashCommandDiscoveryResult, IAgentDiscoveryInfo, IAgentDiscoveryResult, IHookDiscoveryInfo, IResolvedChatPromptSlashCommand, matchesSessionType } from './promptsService.js';
 import { Delayer, Limiter, raceCancellationError } from '../../../../../../base/common/async.js';
 import { Schemas } from '../../../../../../base/common/network.js';
 import { ChatRequestHooks, parseSubagentHooksFromYaml } from '../hookSchema.js';
@@ -112,6 +112,12 @@ export class PromptsService extends Disposable implements IPromptsService {
 	 * Cached skill discovery info.
 	 */
 	private readonly cachedSkills: CachedPromise<IPromptDiscoveryInfo>;
+
+	/**
+	 * Providers of skills that are no prompt files (MCP-served skills).
+	 */
+	private readonly agentSkillProviders = new Set<IAgentSkillProvider>();
+	private readonly _onDidChangeProvidedSkills = this._register(new Emitter<void>());
 
 	/**
 	 * Cached instructions.
@@ -1073,7 +1079,19 @@ export class PromptsService extends Disposable implements IPromptsService {
 	}
 
 	public get onDidChangeSkills(): Event<void> {
-		return this.cachedSkills.onDidChangePromise;
+		return Event.any(this.cachedSkills.onDidChangePromise, this._onDidChangeProvidedSkills.event);
+	}
+
+	public registerAgentSkillProvider(provider: IAgentSkillProvider): IDisposable {
+		const store = new DisposableStore();
+		this.agentSkillProviders.add(provider);
+		store.add(provider.onDidChangeSkills(() => this._onDidChangeProvidedSkills.fire()));
+		store.add(toDisposable(() => {
+			this.agentSkillProviders.delete(provider);
+			this._onDidChangeProvidedSkills.fire();
+		}));
+		this._onDidChangeProvidedSkills.fire();
+		return store;
 	}
 
 	public get onDidChangeHooks(): Event<void> {
@@ -1088,7 +1106,28 @@ export class PromptsService extends Disposable implements IPromptsService {
 
 		const discoveryInfo = await this.cachedSkills.get(token);
 		const result = this.skillsFromDiscoveryInfo(discoveryInfo);
-		return result;
+		if (this.agentSkillProviders.size === 0) {
+			return result;
+		}
+		return mergeProvidedSkills(result, await this.provideSkills(token));
+	}
+
+	private async provideSkills(token: CancellationToken): Promise<IAgentSkill[]> {
+		const provided = await Promise.all([...this.agentSkillProviders].map(async provider => {
+			try {
+				return await provider.provideSkills(token);
+			} catch (error) {
+				if (!isCancellationError(error)) {
+					this.logger.warn(`[findAgentSkills] A skill provider failed: ${error}`);
+				}
+				return [];
+			}
+		}));
+		return provided.flat().map(skill => ({
+			...skill,
+			name: this.truncateAgentSkillName(skill.name, skill.uri),
+			description: this.truncateAgentSkillDescription(skill.description, skill.uri),
+		}));
 	}
 
 	/**
@@ -1784,4 +1823,33 @@ export namespace CustomAgent {
 		return { id, uri, name, description, model, tools, handOffs, argumentHint, target, visibility, agents, agentInstructions, source, sessionTypes, hooks, enabled };
 
 	}
+}
+
+/**
+ * Adds provided skills to the skill files. A provided skill is keyed by its
+ * URI, never by its name: one whose name another skill already has (a skill
+ * file, or a skill of another provider or server) is listed under a name
+ * qualified with its server's label, then its server id, so that a same-named
+ * skill from another origin is never shadowed or replaced. Skill files keep
+ * their names.
+ */
+export function mergeProvidedSkills(files: readonly IAgentSkill[], provided: readonly IAgentSkill[]): IAgentSkill[] {
+	const counts = new Map<string, number>();
+	for (const skill of [...files, ...provided]) {
+		counts.set(skill.name, (counts.get(skill.name) ?? 0) + 1);
+	}
+	const taken = new Set(files.map(skill => skill.name));
+	const result = [...files];
+	for (const skill of provided) {
+		let name = skill.name;
+		if ((counts.get(name) ?? 0) > 1 && skill.mcp) {
+			name = `${skill.mcp.serverLabel}/${skill.name}`;
+			if (taken.has(name)) {
+				name = `${skill.mcp.serverId}/${skill.name}`;
+			}
+		}
+		taken.add(name);
+		result.push(name === skill.name ? skill : { ...skill, name });
+	}
+	return result;
 }
