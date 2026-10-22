@@ -16,7 +16,7 @@ import { ILoggerService, NullLogger, NullLoggerService } from '../../../log/comm
 import { IMcpGatewayInvokeContext, IMcpGatewayServerDescriptor, IMcpGatewayService, IMcpGatewaySingleServerInvoker, IMcpGatewayToolInvoker } from '../../common/mcpGateway.js';
 import { LEGACY_TRANSPORT_ERROR, MAX_LISTEN_RESOURCE_SUBSCRIPTIONS } from '../../common/mcpGatewayProtocol.js';
 import { MCP_PROTOCOL_VERSION_HEADER } from '../../common/mcpHttpHeaders.js';
-import { LATEST_MCP_PROTOCOL_VERSION, META_CLIENT_INFO, META_SERVER_INFO, META_SUBSCRIPTION_ID } from '../../common/mcpProtocolVersions.js';
+import { LATEST_MCP_PROTOCOL_VERSION, META_CLIENT_INFO, META_SERVER_INFO, META_SUBSCRIPTION_ID, SUPPORTED_MCP_PROTOCOL_VERSIONS } from '../../common/mcpProtocolVersions.js';
 import { MCP } from '../../common/modelContextProtocol.js';
 import { MCPLegacy } from '../../common/modelContextProtocolLegacy.js';
 import { CONFORMANCE_HIDDEN_TOOL, CONFORMANCE_SERVER_INFO, McpGatewayConformanceInvoker } from '../../node/mcpGatewayConformanceInvoker.js';
@@ -218,6 +218,25 @@ suite('MCP - GatewayRoute (HTTP)', () => {
 
 		const mismatch = await post(url, modernRequest('tools/list', {}, 43, {}, { 'Mcp-Method': 'prompts/list' }));
 		assert.deepStrictEqual([mismatch.status, mismatch.body.error?.code], [400, MCP.HEADER_MISMATCH]);
+
+		// A version of neither era on a body without a _meta version is -32022 before an era is
+		// chosen, even without Mcp-Method; it lists the versions of both eras.
+		const list = (id: number) => JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/list', params: {} });
+		for (const [index, version] of ['v999.0.0', '2099-01-01', ' 2099-01-01 '].entries()) {
+			const other = await post(url, { headers: { ...LEGACY_HEADERS, [MCP_PROTOCOL_VERSION_HEADER]: version }, body: list(50 + index) });
+			assert.deepStrictEqual([other.status, other.body.error?.code, other.body.id], [400, MCP.UNSUPPORTED_PROTOCOL_VERSION, 50 + index], version);
+			assert.deepStrictEqual(other.body.error?.data, { supported: [...SUPPORTED_MCP_PROTOCOL_VERSIONS], requested: version.trim() }, version);
+		}
+		const wrongMethod = await post(url, { headers: { ...LEGACY_HEADERS, [MCP_PROTOCOL_VERSION_HEADER]: 'v999.0.0', 'Mcp-Method': 'prompts/list' }, body: list(53) });
+		assert.deepStrictEqual([wrongMethod.status, wrongMethod.body.error?.code], [400, MCP.UNSUPPORTED_PROTOCOL_VERSION]);
+		// Unchanged: a header that disagrees with the _meta version is -32020, and a legacy
+		// header or an empty one on a body without _meta is legacy traffic without a session.
+		const disagrees = await post(url, modernRequest('tools/list', {}, 54, {}, { [MCP_PROTOCOL_VERSION_HEADER]: 'v999.0.0' }));
+		assert.deepStrictEqual([disagrees.status, disagrees.body.error?.code], [400, MCP.HEADER_MISMATCH]);
+		for (const version of ['2025-11-25', '']) {
+			const legacy = await post(url, { headers: { ...LEGACY_HEADERS, [MCP_PROTOCOL_VERSION_HEADER]: version }, body: list(55) });
+			assert.deepStrictEqual([legacy.status, legacy.body.error?.code], [400, LEGACY_NOT_INITIALIZED], JSON.stringify(version));
+		}
 
 		for (const method of ['initialize', 'ping', 'logging/setLevel', 'resources/subscribe', 'unknown/method']) {
 			const removed = await post(url, modernRequest(method, {}, 44));

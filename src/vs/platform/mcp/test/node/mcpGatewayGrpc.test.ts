@@ -385,6 +385,14 @@ suite('MCP - Gateway gRPC listener', () => {
 		const initialize = await runTunnel(channel(), { body: { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'old', version: '1' } } }, metadata: { ...ROUTE_A_METADATA } });
 		assert.strictEqual(initialize.trailers.status, GrpcStatus.INVALID_ARGUMENT);
 		assert.strictEqual(errorBin(initialize.trailers).error.code, MCP.UNSUPPORTED_PROTOCOL_VERSION);
+
+		// The version metadata is judged before the missing _meta and the other mirrored metadata.
+		for (const version of ['2099-01-01', '2025-11-25']) {
+			const noMeta = await runTunnel(channel(), { body: { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, metadata: { ...ROUTE_A_METADATA, 'mcp-protocol-version': version } });
+			assert.strictEqual(noMeta.trailers.status, GrpcStatus.INVALID_ARGUMENT, version);
+			const error = errorBin(noMeta.trailers).error;
+			assert.deepStrictEqual([error.code, error.data?.supported, error.data?.requested], [MCP.UNSUPPORTED_PROTOCOL_VERSION, [LATEST_MCP_PROTOCOL_VERSION], version]);
+		}
 	});
 
 	test('malformed and unexpected tunnel messages', async () => {
