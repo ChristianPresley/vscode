@@ -1149,6 +1149,9 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 			(tool, rule) => {
 				this.logService.warn(`[ConversationHistorySummarizer] Tool ${tool} failed validation: ${rule}`);
 			},
+			(tool, reason) => {
+				this.logService.warn(`[ConversationHistorySummarizer] Tool ${tool} was dropped: ${reason}`);
+			}
 		) : undefined;
 		const toolOpts = normalizedTools?.length ? {
 			tools: normalizedTools,

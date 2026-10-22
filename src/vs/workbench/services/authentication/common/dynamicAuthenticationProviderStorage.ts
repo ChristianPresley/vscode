@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
-import { IAuthorizationTokenResponse } from '../../../../base/common/oauth.js';
+import { IAuthorizationTokenResponse, OAuthTokenEndpointAuthMethod } from '../../../../base/common/oauth.js';
 import { Event } from '../../../../base/common/event.js';
 
 export const IDynamicAuthenticationProviderStorageService = createDecorator<IDynamicAuthenticationProviderStorageService>('dynamicAuthenticationProviderStorageService');
@@ -18,6 +18,13 @@ export interface DynamicAuthenticationProviderInfo {
 	readonly issuer?: string;
 	readonly authorizationServer: string;
 	readonly clientId: string;
+}
+
+export interface IDynamicAuthenticationProviderClientRegistration {
+	readonly clientId?: string;
+	readonly clientSecret?: string;
+	/** How the client authenticates at the token endpoint (RFC 6749 section 2.3); absent for registrations stored by older versions. */
+	readonly tokenEndpointAuthMethod?: OAuthTokenEndpointAuthMethod;
 }
 
 export interface DynamicAuthenticationProviderTokensChangeEvent {
@@ -38,11 +45,12 @@ export interface IDynamicAuthenticationProviderStorageService {
 	readonly onDidChangeTokens: Event<DynamicAuthenticationProviderTokensChangeEvent>;
 
 	/**
-	 * Get the client details (ID and secret) for a dynamic authentication provider.
+	 * Get the client details (ID, secret and token endpoint authentication method) for a dynamic authentication provider.
 	 * @param providerId The provider ID or authorization server URL.
-	 * @returns The client details if they exist, undefined otherwise.
+	 * @returns The client details if they exist, undefined otherwise. Registrations stored by older
+	 * versions have no `tokenEndpointAuthMethod`.
 	 */
-	getClientRegistration(providerId: string): Promise<{ clientId?: string; clientSecret?: string } | undefined>;
+	getClientRegistration(providerId: string): Promise<IDynamicAuthenticationProviderClientRegistration | undefined>;
 
 	/**
 	 * Store both client ID and client secret for a dynamic authentication provider.
@@ -51,8 +59,9 @@ export interface IDynamicAuthenticationProviderStorageService {
 	 * @param clientId The client ID to store.
 	 * @param clientSecret Optional client secret to store.
 	 * @param label Optional label for the provider.
+	 * @param tokenEndpointAuthMethod Optional token endpoint authentication method the client was registered with.
 	 */
-	storeClientRegistration(providerId: string, authorizationServer: string, clientId: string, clientSecret?: string, label?: string): Promise<void>;
+	storeClientRegistration(providerId: string, authorizationServer: string, clientId: string, clientSecret?: string, label?: string, tokenEndpointAuthMethod?: OAuthTokenEndpointAuthMethod): Promise<void>;
 
 	/**
 	 * Get all dynamic authentication providers that have been interacted with.

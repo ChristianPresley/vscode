@@ -6,19 +6,24 @@
 import { Mutable } from '../../../../base/common/types.js';
 import { localize } from '../../../../nls.js';
 import { getCopilotGlobalMcpConfigurationError } from '../../../../platform/mcp/common/mcpCopilotGlobalConfiguration.js';
-import { IMcpRemoteServerConfiguration, IMcpServerConfiguration, IMcpStdioServerConfiguration, McpServerType } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
+import { IMcpGrpcServerConfiguration, IMcpGrpcServerTlsConfiguration, IMcpRemoteServerConfiguration, IMcpServerConfiguration, IMcpStdioServerConfiguration, McpGrpcBinding, McpServerType } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
 import { getEditedMcpServerConfiguration } from '../../../../platform/mcp/common/mcpResourceScannerService.js';
 import { getWorkspaceRootMcpConfigurationError, McpResourceFormat } from '../../../../platform/mcp/common/mcpWorkspaceConfiguration.js';
 
 /**
  * The server kinds offered by the configuration form. `Http` and `Sse` both
  * persist as {@link McpServerType.REMOTE}; `Sse` additionally pins `transport: 'sse'`.
+ * `Grpc` persists as {@link McpServerType.GRPC}.
  */
 export const enum McpServerFormKind {
 	Stdio = 'stdio',
 	Http = 'http',
 	Sse = 'sse',
+	Grpc = 'grpc',
 }
+
+/** The gRPC bindings the form offers, in display order. */
+export const mcpServerFormGrpcBindings: readonly McpGrpcBinding[] = ['auto', 'tunnel', 'typed'];
 
 export interface IMcpServerFormKeyValue {
 	name: string;
@@ -42,6 +47,14 @@ export interface IMcpServerFormState {
 	env: IMcpServerFormKeyValue[];
 	url: string;
 	headers: IMcpServerFormKeyValue[];
+	/** gRPC only: the service binding; `undefined` leaves the file's default (`auto`). */
+	binding: McpGrpcBinding | undefined;
+	/** gRPC only: path to a PEM certificate authority bundle. */
+	tlsCa: string;
+	/** gRPC only: whether server certificate verification is skipped. */
+	tlsInsecure: boolean;
+	/** gRPC only: the host name checked against the server certificate. */
+	tlsServerName: string;
 }
 
 /**
@@ -67,16 +80,18 @@ export interface IMcpServerFormCapabilities {
 	readonly cwd: boolean;
 	/** Whether VS Code `${input:...}` variables are resolved for this file. */
 	readonly inputVariables: boolean;
+	/** Whether the gRPC binding and TLS fields can be stored; only VS Code's own `mcp.json` holds gRPC servers. */
+	readonly grpcOptions: boolean;
 }
 
 export function getMcpServerFormCapabilities(format: McpResourceFormat): IMcpServerFormCapabilities {
 	switch (format) {
 		case McpResourceFormat.WorkspaceRoot:
-			return { kinds: [McpServerFormKind.Stdio, McpServerFormKind.Http], envFile: false, cwd: false, inputVariables: false };
+			return { kinds: [McpServerFormKind.Stdio, McpServerFormKind.Http], envFile: false, cwd: false, inputVariables: false, grpcOptions: false };
 		case McpResourceFormat.CopilotGlobal:
-			return { kinds: [McpServerFormKind.Stdio, McpServerFormKind.Http, McpServerFormKind.Sse], envFile: false, cwd: true, inputVariables: false };
+			return { kinds: [McpServerFormKind.Stdio, McpServerFormKind.Http, McpServerFormKind.Sse], envFile: false, cwd: true, inputVariables: false, grpcOptions: false };
 		default:
-			return { kinds: [McpServerFormKind.Stdio, McpServerFormKind.Http, McpServerFormKind.Sse], envFile: true, cwd: true, inputVariables: true };
+			return { kinds: [McpServerFormKind.Stdio, McpServerFormKind.Http, McpServerFormKind.Sse, McpServerFormKind.Grpc], envFile: true, cwd: true, inputVariables: true, grpcOptions: true };
 	}
 }
 
@@ -98,7 +113,7 @@ export function getMcpServerFormatError(name: string, previous: IMcpServerConfig
 }
 
 export function toMcpServerFormState(config: IMcpServerConfiguration): IMcpServerFormState {
-	const empty: IMcpServerFormState = { kind: McpServerFormKind.Stdio, command: '', args: '', cwd: '', envFile: '', env: [], url: '', headers: [] };
+	const empty: IMcpServerFormState = { kind: McpServerFormKind.Stdio, command: '', args: '', cwd: '', envFile: '', env: [], url: '', headers: [], binding: undefined, tlsCa: '', tlsInsecure: false, tlsServerName: '' };
 	if (config.type === McpServerType.LOCAL) {
 		return {
 			...empty,
@@ -109,11 +124,24 @@ export function toMcpServerFormState(config: IMcpServerConfiguration): IMcpServe
 			env: Object.entries(config.env ?? {}).map(([name, value]) => ({ name, value: value === null ? '' : String(value), origin: name })),
 		};
 	}
+	const headers = Object.entries(config.headers ?? {}).map(([name, value]) => ({ name, value, origin: name }));
+	if (config.type === McpServerType.GRPC) {
+		return {
+			...empty,
+			kind: McpServerFormKind.Grpc,
+			url: config.url ?? '',
+			headers,
+			binding: mcpServerFormGrpcBindings.includes(config.binding!) ? config.binding : undefined,
+			tlsCa: config.tls?.ca ?? '',
+			tlsInsecure: config.tls?.insecure === true,
+			tlsServerName: config.tls?.serverName ?? '',
+		};
+	}
 	return {
 		...empty,
 		kind: config.transport === 'sse' ? McpServerFormKind.Sse : McpServerFormKind.Http,
 		url: config.url ?? '',
-		headers: Object.entries(config.headers ?? {}).map(([name, value]) => ({ name, value, origin: name })),
+		headers,
 	};
 }
 
@@ -166,6 +194,10 @@ export function validateMcpServerFormState(state: IMcpServerFormState): IMcpServ
 		const url = state.url.trim();
 		if (!url) {
 			result.url = localize('mcpForm.url.required', "A URL is required.");
+		} else if (state.kind === McpServerFormKind.Grpc) {
+			if (!/^grpcs?:\/\/.+/i.test(url) && !url.includes('${')) {
+				result.url = localize('mcpForm.url.invalidGrpc', "The URL must start with 'grpc://' or 'grpcs://'.");
+			}
 		} else if (!/^https?:\/\/.+/i.test(url) && !url.includes('${')) {
 			result.url = localize('mcpForm.url.invalid', "The URL must start with 'http://' or 'https://'.");
 		}
@@ -246,7 +278,7 @@ function validateKeyValues(entries: readonly IMcpServerFormKeyValue[], kind: str
  * Callers should validate the state with {@link validateMcpServerFormState} first.
  */
 export function toMcpServerConfiguration(state: IMcpServerFormState, original: IMcpServerConfiguration): IMcpServerConfiguration {
-	const common = { version: original.version, gallery: original.gallery, dev: original.dev };
+	const common = { version: original.version, gallery: original.gallery, dev: original.dev, protocolVersion: original.protocolVersion };
 
 	if (state.kind === McpServerFormKind.Stdio) {
 		const base = original.type === McpServerType.LOCAL ? original : common;
@@ -271,7 +303,6 @@ export function toMcpServerConfiguration(state: IMcpServerFormState, original: I
 		return removeUndefined(result);
 	}
 
-	const base = original.type === McpServerType.REMOTE ? original : common;
 	const headers: Record<string, string> = {};
 	for (const { name, value } of state.headers) {
 		const key = name.trim();
@@ -279,8 +310,37 @@ export function toMcpServerConfiguration(state: IMcpServerFormState, original: I
 			headers[key] = value;
 		}
 	}
+
+	if (state.kind === McpServerFormKind.Grpc) {
+		const base = original.type === McpServerType.GRPC ? original : common;
+		// Properties the form does not show (`oauth`, `deadlineMs`, `keepAliveMs`) and TLS settings
+		// it does not edit stay as they are; `headers` and `oauth` carry over from an HTTP server.
+		const carried = original.type === McpServerType.REMOTE ? { oauth: original.oauth } : {};
+		const tls: Mutable<IMcpGrpcServerTlsConfiguration> = {
+			...(original.type === McpServerType.GRPC ? original.tls : undefined),
+			ca: state.tlsCa.trim() || undefined,
+			insecure: state.tlsInsecure || undefined,
+			serverName: state.tlsServerName.trim() || undefined,
+		};
+		removeUndefined(tls);
+		const result: Mutable<IMcpGrpcServerConfiguration> = {
+			...carried,
+			...base,
+			type: McpServerType.GRPC,
+			url: state.url.trim(),
+			headers: Object.keys(headers).length ? headers : undefined,
+			binding: state.binding,
+			tls: Object.keys(tls).length ? tls : undefined,
+		};
+		return removeUndefined(result);
+	}
+
+	const base = original.type === McpServerType.REMOTE ? original : common;
+	// A gRPC server's `headers` and `oauth` have the same meaning for an HTTP server, so they carry over.
+	const carried = original.type === McpServerType.GRPC ? { oauth: original.oauth } : {};
 	const originalTransport = original.type === McpServerType.REMOTE ? original.transport : undefined;
 	const result: Mutable<IMcpRemoteServerConfiguration> = {
+		...carried,
 		...base,
 		type: McpServerType.REMOTE,
 		url: state.url.trim(),

@@ -7,6 +7,7 @@ import assert from 'assert';
 import { DeferredPromise } from '../../../../../../base/common/async.js';
 import { bufferToStream, VSBuffer } from '../../../../../../base/common/buffer.js';
 import { isCancellationError } from '../../../../../../base/common/errors.js';
+import { IAuthorizationServerMetadata } from '../../../../../../base/common/oauth.js';
 import { Event } from '../../../../../../base/common/event.js';
 import { DisposableStore } from '../../../../../../base/common/lifecycle.js';
 import { isObject } from '../../../../../../base/common/types.js';
@@ -1363,6 +1364,132 @@ suite('resolveMcpServerAuthentication', () => {
 			],
 			providerCreations: ['https://identity.avalara.com/ https://identity.avalara.com'],
 			warnings: [],
+		});
+	});
+
+	test('creates a dynamic provider only from metadata that passes the MCP transport\'s discovery rules: the issuer is the authorization server and the endpoints are HTTPS or loopback', async () => {
+		const authorizationServer = 'https://auth.example.com/tenant';
+		const valid: IAuthorizationServerMetadata = {
+			issuer: authorizationServer,
+			authorization_endpoint: 'https://auth.example.com/tenant/authorize',
+			token_endpoint: 'https://auth.example.com/tenant/token',
+			registration_endpoint: 'https://auth.example.com/tenant/register',
+			response_types_supported: ['code'],
+		};
+		const cases: Record<string, { server: string; metadata: IAuthorizationServerMetadata }> = {
+			'valid': { server: authorizationServer, metadata: valid },
+			'another issuer': { server: authorizationServer, metadata: { ...valid, issuer: 'https://attacker.example.com/tenant' } },
+			'a trailing-slash variant of an issuer with a path': { server: authorizationServer, metadata: { ...valid, issuer: `${authorizationServer}/` } },
+			'a bare origin without its trailing slash': { server: 'https://auth.example.com', metadata: { ...valid, issuer: 'https://auth.example.com' } },
+			'a plain-HTTP token endpoint': { server: authorizationServer, metadata: { ...valid, token_endpoint: 'http://auth.example.com/tenant/token' } },
+			'a plain-HTTP authorization endpoint': { server: authorizationServer, metadata: { ...valid, authorization_endpoint: 'http://auth.example.com/tenant/authorize' } },
+			'a plain-HTTP device authorization endpoint': { server: authorizationServer, metadata: { ...valid, device_authorization_endpoint: 'http://auth.example.com/tenant/device' } },
+			'a loopback authorization server': { server: 'http://127.0.0.1:4711', metadata: { ...valid, issuer: 'http://127.0.0.1:4711', authorization_endpoint: 'http://127.0.0.1:4711/authorize', token_endpoint: 'http://127.0.0.1:4711/token' } },
+			'a plain-HTTP authorization server': { server: 'http://auth.example.com', metadata: { ...valid, issuer: 'http://auth.example.com' } },
+			// Checked where the provider registers dynamically (extHostAuthentication.test.ts): a pre-registered client never contacts it.
+			'a plain-HTTP registration endpoint': { server: authorizationServer, metadata: { ...valid, registration_endpoint: 'http://auth.example.com/tenant/register' } },
+		};
+		const outcomes: Record<string, string> = {};
+		for (const [name, { server, metadata }] of Object.entries(cases)) {
+			const metadataRequests: string[] = [];
+			const providerCreations: string[] = [];
+			const warnings: string[] = [];
+			const instantiationService = disposables.add(new TestInstantiationService());
+			instantiationService.stub(IAuthenticationService, createMockAuthService({
+				createDynamicAuthenticationProvider: async (_authorizationServer, created) => {
+					providerCreations.push(created.issuer);
+					return undefined;
+				},
+			}));
+			instantiationService.stub(IAuthenticationMcpAccessService, {});
+			instantiationService.stub(IAuthenticationMcpService, { getAccountPreference: () => undefined });
+			instantiationService.stub(IAuthenticationMcpUsageService, {});
+			instantiationService.stub(IDynamicAuthenticationProviderStorageService, {
+				getClientRegistration: () => Promise.resolve({ clientId: 'registered-client' }),
+			});
+			instantiationService.stub(ILogService, new class extends NullLogService {
+				override warn(_message: string, error?: Error): void {
+					warnings.push(error?.message ?? '');
+				}
+			}());
+			await instantiationService.invokeFunction(resolveMcpServerAuthentication, {
+				resource: 'https://mcp.example.com/mcp',
+				authorization_servers: [server],
+			}, {
+				allowInteraction: false,
+				logPrefix: '[AgentHost]',
+				mcpServerId: 'server-id',
+				mcpServerName: 'Example',
+				mcpServerUrl: 'https://mcp.example.com/mcp',
+				scopes: [],
+				authorizationServerMetadataFetcher: async identifier => {
+					metadataRequests.push(identifier);
+					return { metadata, discoveryUrl: `${identifier}/.well-known/oauth-authorization-server`, errors: [] };
+				},
+				authenticate: async () => { },
+			});
+			const reason = warnings[0] === undefined ? '' : /issuer/.test(warnings[0]) ? ' (issuer)' : /not served over HTTPS/.test(warnings[0]) ? ` (${/The (.+?) http/.exec(warnings[0])?.[1]})` : ` (${warnings[0]})`;
+			outcomes[name] = `${metadataRequests.length} metadata requests, ${providerCreations.length ? 'created' : 'not created'}${reason}`;
+		}
+		assert.deepStrictEqual(outcomes, {
+			'valid': '1 metadata requests, created',
+			'another issuer': '1 metadata requests, not created (issuer)',
+			'a trailing-slash variant of an issuer with a path': '1 metadata requests, not created (issuer)',
+			'a bare origin without its trailing slash': '1 metadata requests, created',
+			'a plain-HTTP token endpoint': '1 metadata requests, not created (token endpoint)',
+			'a plain-HTTP authorization endpoint': '1 metadata requests, not created (authorization endpoint)',
+			'a plain-HTTP device authorization endpoint': '1 metadata requests, not created (device authorization endpoint)',
+			'a loopback authorization server': '1 metadata requests, created',
+			'a plain-HTTP authorization server': '0 metadata requests, not created (authorization server)',
+			'a plain-HTTP registration endpoint': '1 metadata requests, created',
+		});
+	});
+
+	test('the metadata service skips a document that names another issuer, as the MCP transport\'s discovery does', async () => {
+		const requestedUrls: string[] = [];
+		const created: string[] = [];
+		const instantiationService = disposables.add(new TestInstantiationService());
+		instantiationService.stub(IAuthenticationService, createMockAuthService({
+			createDynamicAuthenticationProvider: async (_authorizationServer, metadata) => {
+				created.push(`${metadata.issuer} ${metadata.token_endpoint}`);
+				return undefined;
+			},
+		}));
+		instantiationService.stub(IAuthenticationMcpAccessService, {});
+		instantiationService.stub(IAuthenticationMcpService, { getAccountPreference: () => undefined });
+		instantiationService.stub(IAuthenticationMcpUsageService, {});
+		instantiationService.stub(IDynamicAuthenticationProviderStorageService, {
+			getClientRegistration: () => Promise.resolve({ clientId: 'registered-client' }),
+		});
+		instantiationService.stub(ILogService, new NullLogService());
+		const requestService = new class extends mock<IRequestService>() {
+			override async request(options: Parameters<IRequestService['request']>[0]) {
+				assert.ok(options.url);
+				requestedUrls.push(options.url);
+				// RFC 8414 metadata naming another issuer first, then OpenID Connect Discovery naming the right one.
+				const metadata = options.url.endsWith('/.well-known/oauth-authorization-server/tenant')
+					? { issuer: 'https://attacker.example.com/tenant', authorization_endpoint: 'https://attacker.example.com/authorize', token_endpoint: 'https://attacker.example.com/token', response_types_supported: ['code'] }
+					: { issuer: 'https://auth.example.com/tenant', authorization_endpoint: 'https://auth.example.com/tenant/authorize', token_endpoint: 'https://auth.example.com/tenant/token', response_types_supported: ['code'] };
+				return { res: { headers: {}, statusCode: 200 }, stream: bufferToStream(VSBuffer.fromString(JSON.stringify(metadata))) };
+			}
+		}();
+		instantiationService.stub(IAgentHostMcpOAuthMetadataService, new AgentHostMcpOAuthMetadataService(requestService));
+
+		await instantiationService.invokeFunction(resolveMcpServerAuthentication, {
+			resource: 'https://mcp.example.com/mcp',
+			authorization_servers: ['https://auth.example.com/tenant'],
+		}, {
+			allowInteraction: false,
+			logPrefix: '[AgentHost]',
+			mcpServerId: 'server-id',
+			mcpServerName: 'Example',
+			mcpServerUrl: 'https://mcp.example.com/mcp',
+			scopes: [],
+			authenticate: async () => { },
+		});
+		assert.deepStrictEqual({ requestedUrls, created }, {
+			requestedUrls: ['https://auth.example.com/.well-known/oauth-authorization-server/tenant', 'https://auth.example.com/.well-known/openid-configuration/tenant'],
+			created: ['https://auth.example.com/tenant https://auth.example.com/tenant/token'],
 		});
 	});
 

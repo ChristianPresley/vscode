@@ -16,6 +16,9 @@ outputs:
   copilot:
     description: "'true' when the Copilot extension checks in extensions/copilot/ need to run."
     value: ${{ steps.detect.outputs.copilot }}
+  mcp:
+    description: "'true' when the MCP conformance suite and the MCP static checks need to run."
+    value: ${{ steps.detect.outputs.mcp }}
 
 runs:
   using: composite

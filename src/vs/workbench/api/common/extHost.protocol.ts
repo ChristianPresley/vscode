@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { JsonRpcId } from '../../../base/common/jsonRpcProtocol.js';
 import { VSBuffer } from '../../../base/common/buffer.js';
 import { CancellationToken } from '../../../base/common/cancellation.js';
 import { IRemoteConsoleLog } from '../../../base/common/console.js';
@@ -11,7 +12,7 @@ import { IRelativePattern } from '../../../base/common/glob.js';
 import { IMarkdownString } from '../../../base/common/htmlContent.js';
 import { IJSONSchema } from '../../../base/common/jsonSchema.js';
 import { IDisposable } from '../../../base/common/lifecycle.js';
-import { IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, IAuthorizationTokenResponse } from '../../../base/common/oauth.js';
+import { IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, IAuthorizationTokenResponse, OAuthTokenEndpointAuthMethod } from '../../../base/common/oauth.js';
 import * as performance from '../../../base/common/performance.js';
 import Severity from '../../../base/common/severity.js';
 import { ThemeColor, ThemeIcon } from '../../../base/common/themables.js';
@@ -70,7 +71,7 @@ import { IChatMessage, IChatResponsePart, ILanguageModelChatInfoOptions, ILangua
 import { IPreparedToolInvocation, IStreamedToolInvocation, IToolInvocation, IToolInvocationPreparationContext, IToolInvocationStreamContext, IToolProgressStep, IToolResult, ToolDataSource } from '../../contrib/chat/common/tools/languageModelToolsService.js';
 import { IPromptFileContext, IPromptFileResource } from '../../contrib/chat/common/promptSyntax/service/promptsService.js';
 import { DebugConfigurationProviderTriggerKind, IAdapterDescriptor, IConfig, IDebugSessionReplMode, IDebugTestRunReference, IDebugVisualization, IDebugVisualizationContext, IDebugVisualizationTreeItem, MainThreadDebugVisualization } from '../../contrib/debug/common/debug.js';
-import { McpCollectionDefinition, McpConnectionState, McpServerDefinition, McpServerEnvironmentVariableExpansion, McpServerLaunch } from '../../contrib/mcp/common/mcpTypes.js';
+import { IMcpMessageEnvelope, IMcpRequestAbort, McpCollectionDefinition, McpConnectionState, McpServerDefinition, McpServerEnvironmentVariableExpansion, McpServerLaunch } from '../../contrib/mcp/common/mcpTypes.js';
 import * as notebookCommon from '../../contrib/notebook/common/notebookCommon.js';
 import { CellExecutionUpdateType } from '../../contrib/notebook/common/notebookExecutionService.js';
 import { ICellExecutionComplete, ICellExecutionStateUpdate } from '../../contrib/notebook/common/notebookExecutionStateService.js';
@@ -212,6 +213,24 @@ export interface IRegisterDynamicAuthenticationProviderDetails extends IRegister
 	clientId: string;
 	clientSecret?: string;
 	authorizationServer: UriComponents;
+	/** How the client authenticates at the token endpoint, as registered. */
+	tokenEndpointAuthMethod?: OAuthTokenEndpointAuthMethod;
+}
+
+/** How the extension host sets up a dynamic authentication provider it registers. */
+export interface IRegisterDynamicAuthProviderOptions {
+	/**
+	 * Refuse to sign in when the authorization server does not advertise PKCE
+	 * `S256` (MCP servers, whose metadata the MCP transport produced). Other
+	 * providers still send an `S256` challenge but only log the omission.
+	 */
+	readonly requireAdvertisedPkce?: boolean;
+	/**
+	 * Dynamic client registration may use a plain-HTTP registration endpoint
+	 * on a non-loopback host (an MCP server's `oauth.allowInsecureHttp`).
+	 * Otherwise the provider registers only at an HTTPS or loopback endpoint.
+	 */
+	readonly allowInsecureHttp?: boolean;
 }
 
 export interface IXaaProviderDiscovery {
@@ -235,7 +254,7 @@ export interface MainThreadAuthenticationShape extends IDisposable {
 	$promptForResourceClientSecret(resourceClientId: string, resource: string): Promise<string | undefined>;
 	$registerDynamicAuthenticationProvider(details: IRegisterDynamicAuthenticationProviderDetails): Promise<void>;
 	$setSessionsForDynamicAuthProvider(authProviderId: string, clientId: string, sessions: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<void>;
-	$sendDidChangeDynamicProviderInfo({ providerId, clientId, authorizationServer, label, clientSecret }: { providerId: string; clientId?: string; authorizationServer?: UriComponents; label?: string; clientSecret?: string }): Promise<void>;
+	$sendDidChangeDynamicProviderInfo({ providerId, clientId, authorizationServer, label, clientSecret, tokenEndpointAuthMethod }: { providerId: string; clientId?: string; authorizationServer?: UriComponents; label?: string; clientSecret?: string; tokenEndpointAuthMethod?: OAuthTokenEndpointAuthMethod }): Promise<void>;
 }
 
 export interface MainThreadSecretStateShape extends IDisposable {
@@ -2581,7 +2600,7 @@ export interface ExtHostAuthenticationShape {
 	$removeSession(id: string, sessionId: string): Promise<void>;
 	$onDidChangeAuthenticationSessions(id: string, label: string, extensionIdFilter?: string[]): Promise<void>;
 	$onDidUnregisterAuthenticationProvider(id: string): Promise<void>;
-	$registerDynamicAuthProvider(authorizationServer: UriComponents, serverMetadata: IAuthorizationServerMetadata, resource?: IAuthorizationProtectedResourceMetadata, clientId?: string, clientSecret?: string, initialTokens?: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<string>;
+	$registerDynamicAuthProvider(authorizationServer: UriComponents, serverMetadata: IAuthorizationServerMetadata, resource?: IAuthorizationProtectedResourceMetadata, clientId?: string, clientSecret?: string, initialTokens?: (IAuthorizationTokenResponse & { created_at: number })[], tokenEndpointAuthMethod?: OAuthTokenEndpointAuthMethod, options?: IRegisterDynamicAuthProviderOptions): Promise<string>;
 	$registerXaaAuthProvider(issuer: UriComponents, serverMetadata: IAuthorizationServerMetadata, clientId?: string, clientSecret?: string, initialTokens?: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<string>;
 	$onDidChangeDynamicAuthProviderTokens(authProviderId: string, clientId: string, tokens?: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<void>;
 }
@@ -3716,10 +3735,25 @@ export interface ExtHostMcpShape {
 	$resolveMcpLaunch(collectionId: string, label: string): Promise<McpServerLaunch.Serialized | undefined>;
 	$startMcp(id: number, opts: IStartMcpOptions): void;
 	$stopMcp(id: number): void;
-	$sendMessage(id: number, message: string): void;
+	$sendMessage(id: number, message: string, envelope?: IMcpMessageEnvelope): void;
+	$cancelRequest(id: number, requestId: JsonRpcId): void;
 	$waitForInitialCollectionProviders(): Promise<void>;
 	$onDidChangeMcpServerDefinitions(servers: McpServerDefinition.Serialized[]): void;
-	$onDidChangeGatewayServers(gatewayId: string, servers: { label: string; address: UriComponents }[]): void;
+	$onDidChangeGatewayServers(gatewayId: string, servers: IMcpGatewayServerDto[]): void;
+}
+
+/** One server of an MCP gateway: its HTTP endpoint and, when the gateway serves gRPC, its gRPC endpoint. */
+export interface IMcpGatewayServerDto {
+	label: string;
+	address: UriComponents;
+	/** `grpc://127.0.0.1:<port>/<routeId>`, only for a gateway started with `grpc: true`; calls send the route id as the `mcp-gateway-route` metadata. */
+	grpcAddress?: UriComponents;
+}
+
+/** `vscode.McpGatewayStartOptions` over the protocol. */
+export interface IMcpGatewayStartOptionsDto {
+	/** Also serve the gateway over gRPC (only `true` opts in). */
+	grpc?: boolean;
 }
 
 export interface IMcpAuthenticationDetails {
@@ -3727,6 +3761,14 @@ export interface IMcpAuthenticationDetails {
 	authorizationServerMetadata: IAuthorizationServerMetadata;
 	resourceMetadata: IAuthorizationProtectedResourceMetadata | undefined;
 	scopes: string[] | undefined;
+	/**
+	 * The canonical URI of the MCP server (RFC 8707 section 2), as the
+	 * transport's discovery keys it: always the server's own URL, also when the
+	 * protected resource metadata publishes a `resource` (that one is in
+	 * {@link resourceMetadata}, and the main thread prefers it as the
+	 * resource indicator).
+	 */
+	resource?: string;
 	clientId?: string;
 	/**
 	 * When true, the MCP server has opted into enterprise-managed authentication
@@ -3741,6 +3783,16 @@ export interface IMcpAuthenticationOptions {
 	errorOnUserInteraction?: boolean;
 	forceNewRegistration?: boolean;
 	clientId?: string;
+	/** An access token the resource rejected (401); it must not be returned again. */
+	rejectedToken?: string;
+}
+
+/** An authorization server VS Code holds a client registration with for a protected resource. */
+export interface IMcpRegisteredAuthorizationServer {
+	/** The authorization server: an `authorization_servers` entry as listed, or its URI form (`URI.toString(true)`). */
+	readonly authorizationServer: string;
+	/** The `resource` of the protected resource metadata the registration was made for; any resource when omitted. */
+	readonly resource?: string;
 }
 
 export const enum IAuthResourceMetadataSource {
@@ -3766,12 +3818,21 @@ export interface MainThreadMcpShape {
 	$onDidChangeState(id: number, state: McpConnectionState): void;
 	$onDidPublishLog(id: number, level: LogLevel, log: string): void;
 	$onDidReceiveMessage(id: number, message: string): void;
+	$onDidAbortRequest(id: number, abort: IMcpRequestAbort): void;
 	$upsertMcpCollection(collection: McpCollectionDefinition.FromExtHost, servers: McpServerDefinition.Serialized[]): void;
 	$deleteMcpCollection(collectionId: string): void;
 	$getTokenFromServerMetadata(id: number, authDetails: IMcpAuthenticationDetails, options?: IMcpAuthenticationOptions): Promise<string | undefined>;
 	$getTokenForProviderId(id: number, providerId: string, scopes: string[], options?: IMcpAuthenticationOptions): Promise<string | undefined>;
+	/**
+	 * The authorization servers that already have a client registration (a
+	 * dynamic authentication provider) for the protected resource at
+	 * `resource`; discovery prefers the first `authorization_servers` entry
+	 * among them, so the choice survives restarts. Hosts that persist no
+	 * registrations (the conformance client) leave it out.
+	 */
+	$getRegisteredAuthorizationServers?(id: number, resource: string): Promise<IMcpRegisteredAuthorizationServer[]>;
 	$logMcpAuthSetup(data: IAuthMetadataSource): void;
-	$startMcpGateway(chatSessionResource?: UriComponents): Promise<{ servers: { label: string; address: UriComponents }[]; gatewayId: string } | undefined>;
+	$startMcpGateway(chatSessionResource?: UriComponents, options?: IMcpGatewayStartOptionsDto): Promise<{ servers: IMcpGatewayServerDto[]; gatewayId: string } | undefined>;
 	$disposeMcpGateway(gatewayId: string): void;
 }
 

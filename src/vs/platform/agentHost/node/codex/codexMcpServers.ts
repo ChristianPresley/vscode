@@ -252,9 +252,9 @@ export interface ICodexMcpServerConfigJson {
 /**
  * Narrows an untrusted root-config value to a supported
  * {@link IMcpServerConfiguration}: a `stdio` server with a string `command`,
- * or an `http` server with a string `url`. Mirrors Copilot's
- * `isSupportedMcpServerConfiguration` so a malformed entry can't surface as a
- * `command`/`url: undefined` server.
+ * or an `http` server with a string `url`. `grpc` servers are not supported by
+ * codex and are skipped. Mirrors Copilot's `isSupportedMcpServerConfiguration`
+ * so a malformed entry can't surface as a `command`/`url: undefined` server.
  */
 export function isSupportedMcpServerConfiguration(value: unknown): value is IMcpServerConfiguration {
 	if (!value || typeof value !== 'object') {
@@ -307,6 +307,9 @@ function toCodexStringArray(values: readonly unknown[] | undefined): string[] {
  * trusted, so a single malformed entry can't make codex reject the config.
  */
 export function toCodexMcpServerJson(config: IMcpServerConfiguration, defaultCwd?: URI): ICodexMcpServerConfigJson {
+	if (config.type === McpServerType.GRPC) {
+		throw new Error(`MCP server configurations of type '${config.type}' are not supported by codex`);
+	}
 	if (config.type === McpServerType.LOCAL) {
 		const out: ICodexMcpServerConfigJson = { command: config.command };
 		const args = toCodexStringArray(config.args);

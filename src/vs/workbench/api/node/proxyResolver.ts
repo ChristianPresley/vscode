@@ -11,7 +11,7 @@ import { ExtHostExtensionService } from './extHostExtensionService.js';
 import { URI } from '../../../base/common/uri.js';
 import { ILogService, LogLevel as LogServiceLevel } from '../../../platform/log/common/log.js';
 import { IExtensionDescription } from '../../../platform/extensions/common/extensions.js';
-import { LogLevel, createHttpPatch, createProxyAuthorizationLookup, createProxyResolver, createTlsPatch, ProxySupportSetting, ProxyAgentParams, createNetPatch, loadSystemCertificates, ResolveProxyWithRequest } from '@vscode/proxy-agent';
+import { LogLevel, createHttpPatch, createProxyAuthorizationLookup, createProxyResolver, createTlsPatch, ProxySupportSetting, ProxyAgentParams, createNetPatch, getOrLoadAdditionalCertificates, loadSystemCertificates, ResolveProxyWithRequest } from '@vscode/proxy-agent';
 import { systemCertificatesNodeDefault } from '../../../platform/request/common/request.js';
 import { DisposableStore } from '../../../base/common/lifecycle.js';
 import { createRequire } from 'node:module';
@@ -141,12 +141,33 @@ export function connectProxyResolver(
 	const target = (proxyAgent as any).default || proxyAgent;
 	target.resolveProxyURL = resolveProxyURL;
 	target.resolveProxyByURL = resolveProxyByURL;
+	// For connections that tunnel through a proxy themselves (the gRPC transport of MCP),
+	// which must also honour `http.proxySupport: off`.
+	target.lookupProxyAuthorization = params.lookupProxyAuthorization;
+	target.getProxySupport = params.getProxySupport;
+	// The certificate authorities the patched fetch verifies servers with, for the same
+	// connections: the patched `tls.connect` adds the system certificates only under
+	// `http.experimental.systemCertificatesV2`, and never to a call with its own `ca`.
+	target.loadCaCertificates = () => loadFetchCaCertificates(params);
 
 	patchGlobalFetch(params, configProvider, mainThreadTelemetry, initData, resolveProxyURL, disposables);
 	patchGlobalWebSocket(params, resolveProxyURL);
 
 	const lookup = createPatchedModules(params, resolveProxyWithRequest);
 	return configureModuleLoading(extensionService, lookup);
+}
+
+/**
+ * The certificate authorities `fetch` verifies servers with (see `createFetchPatch` in
+ * `@vscode/proxy-agent`): Node's bundled roots and the additional (operating system)
+ * certificates when `http.systemCertificates` is on, in either version of the setting;
+ * `undefined` when it is off, which leaves Node's bundled roots.
+ */
+export async function loadFetchCaCertificates(params: Pick<ProxyAgentParams, 'addCertificatesV1' | 'addCertificatesV2' | 'loadSystemCertificatesFromNode' | 'loadAdditionalCertificates'>): Promise<string[] | undefined> {
+	if (!params.addCertificatesV1() && !params.addCertificatesV2()) {
+		return undefined;
+	}
+	return [...tls.rootCertificates, ...await getOrLoadAdditionalCertificates(params as ProxyAgentParams)];
 }
 
 const unsafeHeaders = [

@@ -26,7 +26,8 @@ import { ExtensionHostKind } from '../../services/extensions/common/extensionHos
 import { Dto, Proxied } from '../../services/extensions/common/proxyIdentifier.js';
 import { IURLService } from '../../../platform/url/common/url.js';
 import { DeferredPromise, raceTimeout } from '../../../base/common/async.js';
-import { fetchAuthorizationServerMetadata, IAuthorizationTokenResponse } from '../../../base/common/oauth.js';
+import { fetchAuthorizationServerMetadata, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isValidClientMetadataUrl, OAuthIssuerMismatchError, OAuthTokenEndpointAuthMethod } from '../../../base/common/oauth.js';
+import { parseStoredClientSecret, serializeStoredClientSecret } from '../../contrib/mcp/common/mcpOAuthClientSecret.js';
 import { IDynamicAuthenticationProviderStorageService } from '../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
 import { IClipboardService } from '../../../platform/clipboard/common/clipboardService.js';
 import { IQuickInputService } from '../../../platform/quickinput/common/quickInput.js';
@@ -63,6 +64,35 @@ function prepareSessionRequest(options: AuthenticationGetSessionOptions) {
 		authorizationServer: URI.revive(requestOptions.authorizationServer)
 	};
 	return { clearSessionPreference, createIfNone, forceNewSession, silent, providerOptions };
+}
+
+/**
+ * The metadata of the enterprise identity provider (`mcp.enterpriseManagedAuth.idp.issuer`). The IdP client
+ * credentials and the user's sign-in go to the endpoints it names, so its `issuer` must be that identifier
+ * (RFC 8414 section 3.3); a document naming another issuer fails the sign-in. The identifier arrives as a
+ * {@link URI}, which spells a bare origin with a trailing slash whether or not it was configured with one, so
+ * for a bare origin both spellings are the identifier; an issuer with a path must match exactly.
+ */
+export async function fetchXaaIdpMetadata(issuer: URI, logService: ILogService): Promise<IAuthorizationServerMetadata> {
+	const identifier = issuer.toString(true);
+	const bareOrigin = (issuer.path === '' || issuer.path === '/') && !issuer.query;
+	try {
+		const { metadata } = await fetchAuthorizationServerMetadata(identifier, { validateIssuer: true, issuerTolerance: bareOrigin ? 'trailing-slash' : 'exact' });
+		return metadata;
+	} catch (error) {
+		const errors: unknown[] = error instanceof AggregateError ? error.errors : [error];
+		const mismatch = errors.find((e): e is OAuthIssuerMismatchError => e instanceof OAuthIssuerMismatchError);
+		if (mismatch) {
+			logService.error(`[XAA] Rejecting the identity provider metadata: ${mismatch.message}`);
+			throw mismatch;
+		}
+		throw error;
+	}
+}
+
+/** The `nonce` parameter of a callback URI's query; `undefined` without one. */
+function nonceOfQuery(query: string | undefined): string | undefined {
+	return query ? new URLSearchParams(query).get('nonce') ?? undefined : undefined;
 }
 
 class MainThreadAuthenticationProvider extends Disposable implements IAuthenticationProvider {
@@ -178,20 +208,29 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 		this._register(authenticationService.registerAuthenticationProviderHostDelegate({
 			// Prefer Node.js extension hosts when they're available. No CORS issues etc.
 			priority: extHostContext.extensionHostKind === ExtensionHostKind.LocalWebWorker ? 0 : 1,
-			create: async (authorizationServer, serverMetadata, resource, overrideClientId, overrideClientSecret) => {
+			create: async (authorizationServer, serverMetadata, resource, overrideClientId, overrideClientSecret, options) => {
 				const authProviderId = getDynamicAuthenticationProviderId(authorizationServer, resource);
 				const clientDetails = await this.dynamicAuthProviderStorageService.getClientRegistration(authProviderId);
 				let clientId = overrideClientId ?? clientDetails?.clientId;
 				const clientSecret = overrideClientId
 					? overrideClientSecret
 					: (overrideClientSecret ?? clientDetails?.clientSecret);
+				// The recorded method belongs to the stored registration only.
+				let tokenEndpointAuthMethod = !overrideClientId && clientDetails?.clientId === clientId ? clientDetails?.tokenEndpointAuthMethod : undefined;
 				let initialTokens: (IAuthorizationTokenResponse & { created_at: number })[] | undefined = undefined;
 				if (clientId) {
 					initialTokens = await this.dynamicAuthProviderStorageService.getSessionsForDynamicAuthProvider(authProviderId, clientId);
 					// If we don't already have a client id, check if the server supports the Client Id Metadata flow (see docs on the property)
 					// and add the "client id" if so.
 				} else if (serverMetadata.client_id_metadata_document_supported) {
-					clientId = this.productService.authClientIdMetadataUrl;
+					const metadataUrl = this.productService.authClientIdMetadataUrl;
+					// A Client ID Metadata Document is identified by an https URL with a path and no fragment.
+					if (metadataUrl && isValidClientMetadataUrl(metadataUrl)) {
+						clientId = metadataUrl;
+						tokenEndpointAuthMethod = 'none';
+					} else if (metadataUrl) {
+						this.logService.warn(`Not using the client ID metadata document URL '${metadataUrl}': it must be an https URL with a path and no fragment.`);
+					}
 				}
 				return await this._proxy.$registerDynamicAuthProvider(
 					authorizationServer,
@@ -199,13 +238,18 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 					resource,
 					clientId,
 					clientSecret,
-					initialTokens
+					initialTokens,
+					tokenEndpointAuthMethod,
+					options?.requireAdvertisedPkce || options?.allowInsecureHttp ? {
+						...(options.requireAdvertisedPkce ? { requireAdvertisedPkce: true } : {}),
+						...(options.allowInsecureHttp ? { allowInsecureHttp: true } : {}),
+					} : undefined
 				);
 			},
 			createXaa: async (issuer) => {
 				// XAA providers are keyed by issuer alone so they can be reused across many enterprise-managed servers.
 				const authProviderId = `xaa:${issuer.toString(true)}`;
-				const { metadata: serverMetadata } = await fetchAuthorizationServerMetadata(issuer.toString(true));
+				const serverMetadata = await fetchXaaIdpMetadata(issuer, this.logService);
 
 				// Prefer the user-configured IdP client_id / client_secret over any cached registration.
 				// XAA requires a pre-provisioned (admin-approved) client_id at the IdP — there is no DCR
@@ -305,11 +349,21 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 		return this.authenticationService.removeSession(providerId, sessionId);
 	}
 
+	/**
+	 * Waits for the redirect to `expectedUri`: a URI with its scheme, authority
+	 * and path and, when `expectedUri` carries a `nonce` (each sign-in's own),
+	 * the same nonce, so that concurrent sign-ins to one authorization server
+	 * each get their own redirect.
+	 */
 	async $waitForUriHandler(expectedUri: UriComponents): Promise<UriComponents> {
+		const expectedNonce = nonceOfQuery(expectedUri.query);
 		const deferredPromise = new DeferredPromise<UriComponents>();
 		const disposable = this.urlService.registerHandler({
 			handleURL: async (uri: URI) => {
 				if (uri.scheme !== expectedUri.scheme || uri.authority !== expectedUri.authority || uri.path !== expectedUri.path) {
+					return false;
+				}
+				if (expectedNonce !== undefined && nonceOfQuery(uri.query) !== expectedNonce) {
 					return false;
 				}
 				deferredPromise.complete(uri);
@@ -317,11 +371,15 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 				return true;
 			}
 		});
-		const result = await raceTimeout(deferredPromise.p, 5 * 60 * 1000); // 5 minutes
-		if (!result) {
-			throw new Error('Timed out waiting for URI handler');
+		try {
+			const result = await raceTimeout(deferredPromise.p, 5 * 60 * 1000); // 5 minutes
+			if (!result) {
+				throw new Error('Timed out waiting for URI handler');
+			}
+			return result;
+		} finally {
+			disposable.dispose();
 		}
-		return await deferredPromise.p;
 	}
 
 	$showContinueNotification(message: string): Promise<boolean> {
@@ -356,14 +414,14 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 			supportedAuthorizationServers: [details.authorizationServer],
 			resourceServer: details.resourceServer,
 		});
-		await this.dynamicAuthProviderStorageService.storeClientRegistration(details.id, URI.revive(details.authorizationServer).toString(true), details.clientId, details.clientSecret, details.label);
+		await this.dynamicAuthProviderStorageService.storeClientRegistration(details.id, URI.revive(details.authorizationServer).toString(true), details.clientId, details.clientSecret, details.label, details.tokenEndpointAuthMethod);
 	}
 
 	async $setSessionsForDynamicAuthProvider(authProviderId: string, clientId: string, sessions: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<void> {
 		await this.dynamicAuthProviderStorageService.setSessionsForDynamicAuthProvider(authProviderId, clientId, sessions);
 	}
 
-	async $sendDidChangeDynamicProviderInfo({ providerId, clientId, authorizationServer, label, clientSecret }: Partial<{ providerId: string; clientId: string; authorizationServer: UriComponents; label: string; clientSecret: string }>): Promise<void> {
+	async $sendDidChangeDynamicProviderInfo({ providerId, clientId, authorizationServer, label, clientSecret, tokenEndpointAuthMethod }: Partial<{ providerId: string; clientId: string; authorizationServer: UriComponents; label: string; clientSecret: string; tokenEndpointAuthMethod: OAuthTokenEndpointAuthMethod }>): Promise<void> {
 		this.logService.info(`Client ID for authentication provider ${providerId} changed to ${clientId}`);
 		const existing = this.dynamicAuthProviderStorageService.getInteractedProviders().find(p => p.providerId === providerId);
 		if (!existing) {
@@ -376,7 +434,8 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 			authorizationServer ? URI.revive(authorizationServer).toString(true) : existing.authorizationServer,
 			clientId || existing.clientId,
 			clientSecret,
-			label || existing.label
+			label || existing.label,
+			tokenEndpointAuthMethod
 		);
 	}
 
@@ -747,7 +806,10 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 				// Clear any stale value so subsequent prompts can still capture a fresh secret if needed.
 				await this.secretStorageService.delete(key);
 			} else {
-				await this.secretStorageService.set(key, trimmed);
+				// Bound to an issuer on its first successful use (mainThreadMcp); a binding the key already
+				// carries stays, since the main thread checked it against this sign-in's issuer.
+				const existing = parseStoredClientSecret(await this.secretStorageService.get(key));
+				await this.secretStorageService.set(key, serializeStoredClientSecret({ clientSecret: trimmed, issuer: existing?.issuer }));
 			}
 		} catch (err) {
 			this.logService.warn(`[XAA] Failed to persist resource client secret for ${resource} / ${resourceClientId}: ${(err as Error).message}`);

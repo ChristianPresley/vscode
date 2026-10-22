@@ -8,8 +8,9 @@ import { URI, UriComponents } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../platform/log/common/log.js';
 import { IconPathDto } from '../../common/extHost.protocol.js';
-import { ChatPromptReference, ChatRequestModeInstructions, ChatResponseVoiceProgressPart, ChatToolInvocationPart, IconPath } from '../../common/extHostTypeConverters.js';
-import { ChatReferenceBinaryData, ChatResponseVoiceProgressPart as ExtHostChatResponseVoiceProgressPart, ChatSubagentToolInvocationData, ChatToolInvocationPart as ExtHostChatToolInvocationPart, ThemeColor, ThemeIcon } from '../../common/extHostTypes.js';
+import { ChatPromptReference, ChatRequestModeInstructions, ChatResponseVoiceProgressPart, ChatToolInvocationPart, IconPath, McpServerDefinition } from '../../common/extHostTypeConverters.js';
+import { ChatReferenceBinaryData, ChatResponseVoiceProgressPart as ExtHostChatResponseVoiceProgressPart, ChatSubagentToolInvocationData, ChatToolInvocationPart as ExtHostChatToolInvocationPart, McpGrpcBinding, McpGrpcServerDefinition, McpHttpServerDefinition, ThemeColor, ThemeIcon } from '../../common/extHostTypes.js';
+import { McpServerTransportType } from '../../../contrib/mcp/common/mcpTypes.js';
 import { IElementVariableEntry } from '../../../contrib/chat/common/attachments/chatVariableEntries.js';
 import { IChatRequestModeInstructions } from '../../../contrib/chat/common/model/chatModel.js';
 import { Dto } from '../../../services/extensions/common/proxyIdentifier.js';
@@ -290,6 +291,72 @@ suite('extHostTypeConverters', function () {
 			assert.strictEqual(backToApi.toolReferences?.[0].range, undefined);
 			assert.strictEqual(backToApi.toolReferences?.[1].name, 'tool2');
 			assert.deepStrictEqual(backToApi.toolReferences?.[1].range, [10, 20]);
+		});
+	});
+
+	suite('McpServerDefinition', function () {
+		test('converts gRPC definitions before the HTTP shape they extend', function () {
+			const grpc = new McpGrpcServerDefinition('gRPC', URI.parse('grpcs://mcp.example.com:50051'), { Authorization: 'Bearer token' }, '1.0.0', { serverName: 'mcp.internal' }, McpGrpcBinding.Tunnel);
+			const http = new McpHttpServerDefinition('HTTP', URI.parse('https://mcp.example.com/mcp'));
+			const grpcLaunch = McpServerDefinition.from(grpc);
+			assert.ok(grpcLaunch.type === McpServerTransportType.Grpc);
+			const back = McpServerDefinition.to({ id: 'grpc', label: 'gRPC', cacheNonce: '1.0.0', launch: grpcLaunch });
+
+			assert.deepStrictEqual({
+				grpc: { ...grpcLaunch, uri: URI.revive(grpcLaunch.uri).toString(true) },
+				httpType: McpServerDefinition.from(http).type,
+				back: back instanceof McpGrpcServerDefinition ? {
+					label: back.label,
+					uri: back.uri.toString(true),
+					headers: back.headers,
+					version: back.version,
+					tls: back.tls,
+					binding: back.binding,
+				} : undefined,
+				isHttpDefinition: back instanceof McpHttpServerDefinition,
+			}, {
+				grpc: {
+					type: McpServerTransportType.Grpc,
+					uri: 'grpcs://mcp.example.com:50051',
+					headers: [['Authorization', 'Bearer token']],
+					tls: { serverName: 'mcp.internal' },
+					binding: 'tunnel',
+				},
+				httpType: McpServerTransportType.HTTP,
+				back: {
+					label: 'gRPC',
+					uri: 'grpcs://mcp.example.com:50051',
+					headers: { Authorization: 'Bearer token' },
+					version: '1.0.0',
+					tls: { serverName: 'mcp.internal' },
+					binding: McpGrpcBinding.Tunnel,
+				},
+				isHttpDefinition: true,
+			});
+		});
+
+		test('converts the keepAliveMs of gRPC definitions both ways, 0 included, and leaves it out when unset', function () {
+			const roundTrip = (keepAliveMs: number | undefined) => {
+				const grpc = new McpGrpcServerDefinition('gRPC', URI.parse('grpcs://mcp.example.com:50051'));
+				grpc.keepAliveMs = keepAliveMs;
+				const launch = McpServerDefinition.from(grpc);
+				const back = McpServerDefinition.to({ id: 'grpc', label: 'gRPC', cacheNonce: '$$NONE', launch });
+				return {
+					hasKey: Object.prototype.hasOwnProperty.call(launch, 'keepAliveMs'),
+					launch: launch.type === McpServerTransportType.Grpc ? launch.keepAliveMs : 'not gRPC',
+					back: back instanceof McpGrpcServerDefinition ? back.keepAliveMs : 'not gRPC',
+				};
+			};
+			assert.deepStrictEqual([0, 600_000, undefined].map(roundTrip), [
+				{ hasKey: true, launch: 0, back: 0 },
+				{ hasKey: true, launch: 600_000, back: 600_000 },
+				{ hasKey: false, launch: undefined, back: undefined },
+			]);
+		});
+
+		test('rejects gRPC definitions whose URI is not grpc:// or grpcs://', function () {
+			const launch = McpServerDefinition.from(new McpGrpcServerDefinition('gRPC', URI.parse('https://mcp.example.com/mcp')));
+			assert.throws(() => McpServerDefinition.to({ id: 'grpc', label: 'gRPC', cacheNonce: '$$NONE', launch }), /must start with 'grpc:\/\/' or 'grpcs:\/\/'/);
 		});
 	});
 

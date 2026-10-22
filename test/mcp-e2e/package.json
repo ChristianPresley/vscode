@@ -1,0 +1,13 @@
+{
+	"name": "code-oss-dev-mcp-e2e",
+	"version": "0.1.0",
+	"description": "End-to-end tests of the installed VS Code fork with a llama.cpp model, MCP servers over every transport and both protocol revisions, in WSL containers.",
+	"license": "MIT",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"e2e": "pwsh -NoProfile -File run-e2e.ps1",
+		"e2e:skip-build": "pwsh -NoProfile -File run-e2e.ps1 -SkipBuild",
+		"typecheck": "node ../../node_modules/typescript/bin/tsc6 -p extension/tsconfig.json --noEmit && node ../../node_modules/typescript/bin/tsc6 -p tsconfig.json --noEmit"
+	}
+}

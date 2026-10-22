@@ -8,7 +8,7 @@ import { localize } from '../../../../nls.js';
 import { ObservableMemento, observableMemento } from '../../../../platform/observable/common/observableMemento.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { IMcpServer } from './mcpTypes.js';
-import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
 const enum Constants {
 	SamplingRetentionDays = 7,
@@ -23,7 +23,7 @@ export interface ISamplingStoredData {
 	// Requests per day, max length of `Constants.SamplingRetentionDays`
 	bins: number[];
 	// Last sampling requests/responses
-	lastReqs: { request: MCP.SamplingMessage[]; response: string; at: number; model: string }[];
+	lastReqs: { request: MCPLegacy.SamplingMessage[]; response: string; at: number; model: string }[];
 }
 
 const samplingMemento = observableMemento<ReadonlyMap<string, ISamplingStoredData>>({
@@ -95,7 +95,7 @@ export class McpSamplingLog extends Disposable {
 		return result.join('\n');
 	}
 
-	public async add(server: IMcpServer, request: MCP.SamplingMessage[], response: string, model: string) {
+	public async add(server: IMcpServer, request: MCPLegacy.SamplingMessage[], response: string, model: string) {
 		const now = Date.now();
 		const utcOrdinal = Math.floor(now / Constants.MsPerDay);
 		const storage = this._getLogStorageForServer(server);

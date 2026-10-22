@@ -8,12 +8,13 @@ import { assertNever, softAssertNever } from '../../../../base/common/assert.js'
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { CancellationError } from '../../../../base/common/errors.js';
 import { MarkdownString } from '../../../../base/common/htmlContent.js';
-import { DisposableStore } from '../../../../base/common/lifecycle.js';
+import { DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
 import { autorun } from '../../../../base/common/observable.js';
 import { isDefined } from '../../../../base/common/types.js';
-import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { localize } from '../../../../nls.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
+import { McpProtocolEra } from '../../../../platform/mcp/common/mcpProtocolVersions.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { IQuickInputService, IQuickPick, IQuickPickItem } from '../../../../platform/quickinput/common/quickInput.js';
@@ -21,46 +22,247 @@ import { ChatElicitationRequestPart } from '../../chat/common/model/chatProgress
 import { ChatQuestionCarouselData } from '../../chat/common/model/chatProgressTypes/chatQuestionCarouselData.js';
 import { ChatModel } from '../../chat/common/model/chatModel.js';
 import { ElicitationState, IChatQuestion, IChatQuestionAnswers, IChatQuestionValidation, IChatService } from '../../chat/common/chatService/chatService.js';
-import { ElicitationKind, ElicitResult, IFormModeElicitResult, IMcpElicitationService, IMcpServer, IMcpToolCallContext, IUrlModeElicitResult, McpConnectionState, MpcResponseError } from '../common/mcpTypes.js';
+import { checkElicitationSchema, isAcceptableElicitationUrl } from '../common/mcpProtocolMeta.js';
+import { ElicitationKind, ElicitResult, IFormModeElicitResult, IMcpElicitationService, IMcpElicitOptions, IMcpServer, IMcpToolCallContext, IUrlModeElicitResult, McpConnectionState, MpcResponseError } from '../common/mcpTypes.js';
 import { mcpServerToSourceData } from '../common/mcpTypesUtils.js';
-import { MCP } from '../common/modelContextProtocol.js';
+import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
 
 const noneItem: IQuickPickItem = { id: undefined, label: localize('mcp.elicit.enum.none', 'None'), description: localize('mcp.elicit.enum.none.description', 'No selection'), alwaysShow: true };
 
-type Pre20251125ElicitationParams = Omit<MCP.ElicitRequestFormParams, 'mode'> & { mode?: undefined };
+type Pre20251125ElicitationParams = Omit<MCPLegacy.ElicitRequestFormParams, 'mode'> & { mode?: undefined };
 
-function isFormElicitation(params: MCP.ElicitRequest['params'] | Pre20251125ElicitationParams): params is (MCP.ElicitRequestFormParams | Pre20251125ElicitationParams) {
+function isFormElicitation(params: MCPLegacy.ElicitRequest['params'] | Pre20251125ElicitationParams): params is (MCPLegacy.ElicitRequestFormParams | Pre20251125ElicitationParams) {
 	return params.mode === 'form' || (params.mode === undefined && !!(params as Pre20251125ElicitationParams).requestedSchema);
 }
 
-function isUrlElicitation(params: MCP.ElicitRequest['params']): params is MCP.ElicitRequestURLParams {
+function isUrlElicitation(params: MCPLegacy.ElicitRequest['params']): params is MCPLegacy.ElicitRequestURLParams {
 	return params.mode === 'url';
 }
 
-function isLegacyTitledEnumSchema(schema: MCP.PrimitiveSchemaDefinition): schema is MCP.LegacyTitledEnumSchema & { enumNames: string[] } {
-	const cast = schema as MCP.LegacyTitledEnumSchema;
+function isLegacyTitledEnumSchema(schema: MCPLegacy.PrimitiveSchemaDefinition): schema is MCPLegacy.LegacyTitledEnumSchema & { enumNames: string[] } {
+	const cast = schema as MCPLegacy.LegacyTitledEnumSchema;
 	return cast.type === 'string' && Array.isArray(cast.enum) && Array.isArray(cast.enumNames);
 }
 
-function isUntitledEnumSchema(schema: MCP.PrimitiveSchemaDefinition): schema is MCP.LegacyTitledEnumSchema | MCP.UntitledSingleSelectEnumSchema {
-	const cast = schema as MCP.LegacyTitledEnumSchema | MCP.UntitledSingleSelectEnumSchema;
+function isUntitledEnumSchema(schema: MCPLegacy.PrimitiveSchemaDefinition): schema is MCPLegacy.LegacyTitledEnumSchema | MCPLegacy.UntitledSingleSelectEnumSchema {
+	const cast = schema as MCPLegacy.LegacyTitledEnumSchema | MCPLegacy.UntitledSingleSelectEnumSchema;
 	return cast.type === 'string' && Array.isArray(cast.enum);
 }
 
-function isTitledSingleEnumSchema(schema: MCP.PrimitiveSchemaDefinition): schema is MCP.TitledSingleSelectEnumSchema {
-	const cast = schema as MCP.TitledSingleSelectEnumSchema;
+function isTitledSingleEnumSchema(schema: MCPLegacy.PrimitiveSchemaDefinition): schema is MCPLegacy.TitledSingleSelectEnumSchema {
+	const cast = schema as MCPLegacy.TitledSingleSelectEnumSchema;
 	return cast.type === 'string' && Array.isArray(cast.oneOf);
 }
 
-function isUntitledMultiEnumSchema(schema: MCP.PrimitiveSchemaDefinition): schema is MCP.UntitledMultiSelectEnumSchema {
-	const cast = schema as MCP.UntitledMultiSelectEnumSchema;
+function isUntitledMultiEnumSchema(schema: MCPLegacy.PrimitiveSchemaDefinition): schema is MCPLegacy.UntitledMultiSelectEnumSchema {
+	const cast = schema as MCPLegacy.UntitledMultiSelectEnumSchema;
 	return cast.type === 'array' && !!cast.items?.enum;
 }
 
-function isTitledMultiEnumSchema(schema: MCP.PrimitiveSchemaDefinition): schema is MCP.TitledMultiSelectEnumSchema {
-	const cast = schema as MCP.TitledMultiSelectEnumSchema;
+function isTitledMultiEnumSchema(schema: MCPLegacy.PrimitiveSchemaDefinition): schema is MCPLegacy.TitledMultiSelectEnumSchema {
+	const cast = schema as MCPLegacy.TitledMultiSelectEnumSchema;
 	return cast.type === 'array' && !!cast.items?.anyOf;
 }
+
+//#region pure helpers
+
+/**
+ * What the service does with a URL-mode elicitation: refuse it outright
+ * (elicitation.mdx "Safe URL Handling"), ask the user to open the URL, or,
+ * when a modern server re-asks for a URL the user already opened, ask the
+ * user to continue once they are done there.
+ */
+export type UrlElicitationPlan =
+	| { readonly kind: 'reject'; readonly url: string; readonly reason: string }
+	| {
+		readonly kind: 'open' | 'resume';
+		readonly url: string;
+		/** The host as the browser resolves it: lower-cased ASCII, punycode for an IDN. */
+		readonly hostname: string;
+		/** The Unicode form of the host when it carries non-ASCII; `undefined` for a plain ASCII host. */
+		readonly unicodeHostname: string | undefined;
+		/**
+		 * Legacy servers follow an accepted URL elicitation with
+		 * `notifications/elicitation/complete`; modern servers learn the outcome
+		 * when the client re-sends the tool call, so there is nothing to wait for.
+		 */
+		readonly waitsForCompletion: boolean;
+	};
+
+export function resolveUrlElicitationPlan(params: { readonly url: string }, options: IMcpElicitOptions | undefined, era: McpProtocolEra | undefined): UrlElicitationPlan {
+	const check = isAcceptableElicitationUrl(params.url);
+	if (!check.ok) {
+		return { kind: 'reject', url: params.url, reason: check.reason ?? 'the URL is not acceptable' };
+	}
+	return {
+		kind: options?.resume ? 'resume' : 'open',
+		url: params.url,
+		hostname: check.hostname,
+		unicodeHostname: check.isIdn ? punycodeHostnameToUnicode(check.hostname) : undefined,
+		waitsForCompletion: era !== 'modern',
+	};
+}
+
+/** A form elicitation that asks for consent alone: there are no properties to fill in. */
+export function isEmptyFormSchema(params: { readonly requestedSchema?: { readonly properties?: Readonly<Record<string, unknown>> } }): boolean {
+	const properties = params.requestedSchema?.properties;
+	return !properties || Object.keys(properties).length === 0;
+}
+
+/** Every ASCII punctuation character: CommonMark lets each be backslash-escaped, and an escaped character is never syntax. */
+const MARKDOWN_PUNCTUATION = /[\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]/g;
+
+/**
+ * Server-provided text as Markdown that renders literally, so no link can
+ * form in it: not `[text](url)` nor `<url>`, and not the bare `https://…`,
+ * `www.…` and e-mail autolinks that {@link MarkdownString.appendText} lets
+ * through. elicitation.mdx "Safe URL Handling": clients SHOULD NOT render
+ * URLs as clickable in any field of an elicitation request, except the `url`
+ * of a URL elicitation (which the consent prompt shows as code, not a link).
+ */
+export function literalMarkdown(text: string): MarkdownString {
+	const paragraphs = text.split(/\r\n|\r|\n/).map(line => line
+		.replace(MARKDOWN_PUNCTUATION, '\\$&')
+		// leading whitespace would otherwise start an indented code block
+		.replace(/^[ \t]+/, indent => '&nbsp;'.repeat(indent.length)));
+	return new MarkdownString(paragraphs.join('\n\n'));
+}
+
+/** Whether `text` could render as a link when shown as Markdown: link or autolink syntax, a URL, a `www.` host or an e-mail address. */
+export function mayRenderAsLink(text: string): boolean {
+	return /[[<@]|:\/\/|www\./i.test(text);
+}
+
+/**
+ * The consent prompt for a URL elicitation: the server's message, the full
+ * URL, the host it resolves to and, for an internationalized host, both its
+ * Unicode and punycode spellings with a warning.
+ */
+export function buildUrlElicitationMessage(message: string, plan: Extract<UrlElicitationPlan, { kind: 'open' | 'resume' }>): MarkdownString {
+	const md = literalMarkdown(message);
+	md.appendMarkdown('\n\n' + (plan.kind === 'resume'
+		? localize('mcp.elicit.url.resume', 'You already opened this URL. Continue once you have finished there.')
+		: localize('mcp.elicit.url.instruction', 'Open this URL?')));
+	md.appendCodeblock('', plan.url);
+	if (plan.unicodeHostname !== undefined && plan.unicodeHostname !== plan.hostname) {
+		md.appendMarkdown('\n\n' + localize('mcp.elicit.url.host.idn', 'Host: `{0}` (`{1}`)', plan.unicodeHostname, plan.hostname));
+	} else {
+		md.appendMarkdown('\n\n' + localize('mcp.elicit.url.host', 'Host: `{0}`', plan.hostname));
+	}
+	if (plan.unicodeHostname !== undefined) {
+		md.appendMarkdown('\n\n' + localize('mcp.elicit.url.idnWarning', 'Warning: this host uses an internationalized domain name, which can look like a different site. Check it carefully before opening.'));
+	}
+	return md;
+}
+
+const PUNYCODE_BASE = 36;
+const PUNYCODE_TMIN = 1;
+const PUNYCODE_TMAX = 26;
+const PUNYCODE_SKEW = 38;
+const PUNYCODE_DAMP = 700;
+const PUNYCODE_INITIAL_BIAS = 72;
+const PUNYCODE_INITIAL_N = 128;
+
+function punycodeAdapt(delta: number, numPoints: number, firstTime: boolean): number {
+	delta = firstTime ? Math.floor(delta / PUNYCODE_DAMP) : delta >> 1;
+	delta += Math.floor(delta / numPoints);
+	let k = 0;
+	while (delta > ((PUNYCODE_BASE - PUNYCODE_TMIN) * PUNYCODE_TMAX) >> 1) {
+		delta = Math.floor(delta / (PUNYCODE_BASE - PUNYCODE_TMIN));
+		k += PUNYCODE_BASE;
+	}
+	return k + Math.floor((PUNYCODE_BASE - PUNYCODE_TMIN + 1) * delta / (delta + PUNYCODE_SKEW));
+}
+
+function punycodeDigit(charCode: number): number {
+	if (charCode >= 48 && charCode <= 57) {
+		return charCode - 22; // '0'..'9' → 26..35
+	}
+	if (charCode >= 65 && charCode <= 90) {
+		return charCode - 65; // 'A'..'Z' → 0..25
+	}
+	if (charCode >= 97 && charCode <= 122) {
+		return charCode - 97; // 'a'..'z' → 0..25
+	}
+	return PUNYCODE_BASE;
+}
+
+/** RFC 3492 decoding of one label (without its `xn--` prefix); `undefined` when the label is malformed. */
+function decodePunycodeLabel(input: string): string | undefined {
+	const output: number[] = [];
+	const basicEnd = input.lastIndexOf('-');
+	for (let j = 0; j < Math.max(basicEnd, 0); j++) {
+		const charCode = input.charCodeAt(j);
+		if (charCode >= 0x80) {
+			return undefined;
+		}
+		output.push(charCode);
+	}
+
+	let n = PUNYCODE_INITIAL_N;
+	let i = 0;
+	let bias = PUNYCODE_INITIAL_BIAS;
+	for (let index = basicEnd > 0 ? basicEnd + 1 : 0; index < input.length;) {
+		const oldI = i;
+		let w = 1;
+		for (let k = PUNYCODE_BASE; ; k += PUNYCODE_BASE) {
+			if (index >= input.length) {
+				return undefined;
+			}
+			const digit = punycodeDigit(input.charCodeAt(index++));
+			if (digit >= PUNYCODE_BASE) {
+				return undefined;
+			}
+			i += digit * w;
+			const t = k <= bias ? PUNYCODE_TMIN : k >= bias + PUNYCODE_TMAX ? PUNYCODE_TMAX : k - bias;
+			if (digit < t) {
+				break;
+			}
+			w *= PUNYCODE_BASE - t;
+		}
+		const outLength = output.length + 1;
+		bias = punycodeAdapt(i - oldI, outLength, oldI === 0);
+		n += Math.floor(i / outLength);
+		i %= outLength;
+		if (n > 0x10FFFF) {
+			return undefined;
+		}
+		output.splice(i++, 0, n);
+	}
+	return String.fromCodePoint(...output);
+}
+
+/**
+ * The Unicode spelling of a hostname whose labels may be punycode (`xn--`).
+ * Hostnames are case-insensitive, so punycode labels are decoded in lower
+ * case; labels that do not decode are kept as they are.
+ */
+export function punycodeHostnameToUnicode(hostname: string): string {
+	return hostname.split('.').map(label => {
+		const lower = label.toLowerCase();
+		if (!lower.startsWith('xn--')) {
+			return label;
+		}
+		return decodePunycodeLabel(lower.slice(4)) ?? label;
+	}).join('.');
+}
+
+/** The era the server negotiated, if it has a live protocol handler. */
+function getServerEra(server: IMcpServer): McpProtocolEra | undefined {
+	const handler = server.connection.get()?.handler.get();
+	try {
+		return handler?.era;
+	} catch {
+		return undefined; // not negotiated yet
+	}
+}
+
+/** The revision the server negotiated, if it has a live protocol handler; it decides how its form schemas are read. */
+function getServerProtocolVersion(server: IMcpServer): string | undefined {
+	return server.connection.get()?.handler.get()?.currentProtocolVersion;
+}
+
+//#endregion
 
 export class McpElicitationService implements IMcpElicitationService {
 	declare readonly _serviceBrand: undefined;
@@ -70,22 +272,38 @@ export class McpElicitationService implements IMcpElicitationService {
 		@IQuickInputService private readonly _quickInputService: IQuickInputService,
 		@IChatService private readonly _chatService: IChatService,
 		@IOpenerService private readonly _openerService: IOpenerService,
+		@ILogService private readonly _logService: ILogService,
 	) { }
 
-	public elicit(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCP.ElicitRequest['params'], token: CancellationToken): Promise<ElicitResult> {
+	public elicit(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCPLegacy.ElicitRequest['params'], token: CancellationToken, options?: IMcpElicitOptions): Promise<ElicitResult> {
 		if (isFormElicitation(elicitation)) {
 			return this._elicitForm(server, context, elicitation, token);
 		} else if (isUrlElicitation(elicitation)) {
-			return this._elicitUrl(server, context, elicitation, token);
+			return this._elicitUrl(server, context, elicitation, token, options);
 		} else {
 			softAssertNever(elicitation);
-			return Promise.reject(new MpcResponseError('Unsupported elicitation type', MCP.INVALID_PARAMS, undefined));
+			return Promise.reject(new MpcResponseError('Unsupported elicitation type', MCPLegacy.INVALID_PARAMS, undefined));
 		}
 	}
 
-	private async _elicitForm(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCP.ElicitRequestFormParams | Pre20251125ElicitationParams, token: CancellationToken): Promise<IFormModeElicitResult> {
+	private async _elicitForm(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCPLegacy.ElicitRequestFormParams | Pre20251125ElicitationParams, token: CancellationToken): Promise<IFormModeElicitResult> {
+		// basic/index.mdx (2026-07-28): a schema that does not compile is rejected, not treated as
+		// permissive. Nothing is shown: the answer could not be validated. Servers speaking
+		// 2025-11-25 or older get their form as before, with a warning in the log.
+		const schemaProblem = checkElicitationSchema(elicitation.requestedSchema, getServerProtocolVersion(server), warning => {
+			this._logService.warn(`[MCP] The form elicitation from "${server.definition.label}": ${warning}`);
+		});
+		if (schemaProblem !== undefined) {
+			this._logService.warn(`[MCP] Declined the form elicitation from "${server.definition.label}" because its requested schema does not compile: ${schemaProblem}`);
+			return { kind: ElicitationKind.Form, value: { action: 'decline' }, dispose: () => { } };
+		}
+
+		if (isEmptyFormSchema(elicitation)) {
+			return this._elicitConsent(server, context, elicitation, token);
+		}
+
 		const store = new DisposableStore();
-		const value = await new Promise<MCP.ElicitResult>(resolve => {
+		const value = await new Promise<MCPLegacy.ElicitResult>(resolve => {
 			const chatModel = context?.chatSessionResource && this._chatService.getSession(context.chatSessionResource);
 			if (chatModel instanceof ChatModel) {
 				const request = chatModel.getRequests().at(-1);
@@ -97,7 +315,7 @@ export class McpElicitationService implements IMcpElicitationService {
 						/* resolveId */ undefined,
 						/* data */ undefined,
 						/* isUsed */ undefined,
-						/* message */ new MarkdownString(elicitation.message),
+						/* message */ literalMarkdown(elicitation.message),
 						/* source */ mcpServerToSourceData(server),
 					);
 
@@ -135,51 +353,141 @@ export class McpElicitationService implements IMcpElicitationService {
 			});
 			store.add(handle.onDidClose(() => resolve({ action: 'cancel' })));
 			store.add(token.onCancellationRequested(() => resolve({ action: 'cancel' })));
+			store.add(toDisposable(() => handle.close()));
 
 		}).finally(() => store.dispose());
 
 		return { kind: ElicitationKind.Form, value, dispose: () => { } };
 	}
 
-	private async _elicitUrl(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCP.ElicitRequestURLParams, token: CancellationToken): Promise<IUrlModeElicitResult> {
-		const promiseStore = new DisposableStore();
+	/**
+	 * A form elicitation without properties asks for consent alone: Accept
+	 * returns an empty content object, Decline and Cancel return their actions.
+	 */
+	private async _elicitConsent(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCPLegacy.ElicitRequestFormParams | Pre20251125ElicitationParams, token: CancellationToken): Promise<IFormModeElicitResult> {
+		const store = new DisposableStore();
+		let part: ChatElicitationRequestPart | undefined;
+		const value = await new Promise<MCPLegacy.ElicitResult>(resolve => {
+			if (token.isCancellationRequested) {
+				resolve({ action: 'cancel' });
+				return;
+			}
 
-		// We create this ahead of time in case e.g. a user manually opens the URL beforehand
-		const completePromise = new Promise<void>((resolve, reject) => {
-			promiseStore.add(token.onCancellationRequested(() => reject(new CancellationError())));
-			promiseStore.add(autorun(reader => {
-				const cnx = server.connection.read(reader);
-				const handler = cnx?.handler.read(reader);
-				if (handler) {
-					reader.store.add(handler.onDidReceiveElicitationCompleteNotification(e => {
-						if (e.params.elicitationId === elicitation.elicitationId) {
-							resolve();
+			const chatModel = context?.chatSessionResource && this._chatService.getSession(context.chatSessionResource);
+			const request = chatModel instanceof ChatModel ? chatModel.getRequests().at(-1) : undefined;
+			if (chatModel instanceof ChatModel && request) {
+				const cancelAction = store.add(new Action('mcp.elicit.consent.cancel', localize('mcp.elicit.cancel', 'Cancel'), undefined, true));
+				part = new ChatElicitationRequestPart(
+					localize('mcp.elicit.consent.title', 'Confirmation Required'),
+					literalMarkdown(elicitation.message),
+					localize('msg.subtitle', "{0} (MCP Server)", server.definition.label),
+					localize('mcp.elicit.consent.accept', 'Accept'),
+					localize('mcp.elicit.consent.decline', 'Decline'),
+					async selected => {
+						if (selected === true) {
+							resolve({ action: 'accept', content: {} });
+							return ElicitationState.Accepted;
 						}
-					}));
-				} else if (!McpConnectionState.isRunning(server.connectionState.read(reader))) {
-					reject(new CancellationError());
+						resolve({ action: 'cancel' });
+						return ElicitationState.Rejected;
+					},
+					() => {
+						resolve({ action: 'decline' });
+						return Promise.resolve(ElicitationState.Rejected);
+					},
+					mcpServerToSourceData(server),
+					[cancelAction],
+				);
+				chatModel.acceptResponseProgress(request, part);
+				store.add(token.onCancellationRequested(() => {
+					part?.hide();
+					resolve({ action: 'cancel' });
+				}));
+				return;
+			}
+
+			// Fallback: no chat session → notification
+			const handle = this._notificationService.notify({
+				message: elicitation.message,
+				source: localize('mcp.elicit.source', 'MCP Server ({0})', server.definition.label),
+				severity: Severity.Info,
+				actions: {
+					primary: [store.add(new Action('mcp.elicit.consent.accept', localize('mcp.elicit.consent.accept', 'Accept'), undefined, true, () => resolve({ action: 'accept', content: {} })))],
+					secondary: [
+						store.add(new Action('mcp.elicit.consent.decline', localize('mcp.elicit.consent.decline', 'Decline'), undefined, true, () => resolve({ action: 'decline' }))),
+						store.add(new Action('mcp.elicit.consent.cancel', localize('mcp.elicit.cancel', 'Cancel'), undefined, true, () => resolve({ action: 'cancel' }))),
+					],
 				}
-			}));
-		}).finally(() => promiseStore.dispose());
+			});
+			store.add(handle.onDidClose(() => resolve({ action: 'cancel' })));
+			store.add(token.onCancellationRequested(() => resolve({ action: 'cancel' })));
+			store.add(toDisposable(() => handle.close()));
+		}).finally(() => store.dispose());
+
+		return { kind: ElicitationKind.Form, value, dispose: () => part?.hide() };
+	}
+
+	private async _elicitUrl(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCPLegacy.ElicitRequestURLParams, token: CancellationToken, options: IMcpElicitOptions | undefined): Promise<IUrlModeElicitResult> {
+		const plan = resolveUrlElicitationPlan(elicitation, options, getServerEra(server));
+		if (plan.kind === 'reject') {
+			// elicitation.mdx "Safe URL Handling": nothing is opened or shown for a URL we will not navigate to.
+			this._logService.warn(`[MCP] Declined the URL elicitation from "${server.definition.label}" because ${plan.reason}: ${elicitation.url}`);
+			return { kind: ElicitationKind.URL, value: { action: 'decline' }, wait: Promise.resolve(), dispose: () => { } };
+		}
+
+		const promiseStore = new DisposableStore();
+		let part: ChatElicitationRequestPart | undefined;
+
+		// Legacy servers tell us when the out-of-band interaction is complete. We
+		// listen ahead of time in case e.g. a user manually opens the URL beforehand.
+		// Modern servers learn the outcome on the retried tool call, so the wait
+		// ends as soon as the user has answered.
+		let completePromise: Promise<void> | undefined;
+		if (plan.waitsForCompletion) {
+			completePromise = new Promise<void>((resolve, reject) => {
+				promiseStore.add(token.onCancellationRequested(() => reject(new CancellationError())));
+				promiseStore.add(autorun(reader => {
+					const cnx = server.connection.read(reader);
+					const handler = cnx?.handler.read(reader);
+					if (handler) {
+						reader.store.add(handler.onDidReceiveElicitationCompleteNotification(e => {
+							if (e.params.elicitationId === elicitation.elicitationId) {
+								resolve();
+							}
+						}));
+					} else if (!McpConnectionState.isRunning(server.connectionState.read(reader))) {
+						reject(new CancellationError());
+					}
+				}));
+			}).finally(() => promiseStore.dispose());
+		}
+
+		const answer = (): Promise<MCPLegacy.ElicitResult> => {
+			if (token.isCancellationRequested) {
+				return Promise.resolve({ action: 'cancel' });
+			}
+			// A resumed elicitation was already opened in an earlier round: consent alone is asked for.
+			return plan.kind === 'resume' ? Promise.resolve({ action: 'accept' }) : this._doElicitUrl(elicitation, token);
+		};
 
 		const store = new DisposableStore();
-		const value = await new Promise<MCP.ElicitResult>(resolve => {
+		const value = await new Promise<MCPLegacy.ElicitResult>(resolve => {
 			const chatModel = context?.chatSessionResource && this._chatService.getSession(context.chatSessionResource);
 			if (chatModel instanceof ChatModel) {
 				const request = chatModel.getRequests().at(-1);
 				if (request) {
-					const part = new ChatElicitationRequestPart(
+					const chatPart = new ChatElicitationRequestPart(
 						localize('mcp.elicit.url.title', 'Authorization Required'),
-						new MarkdownString().appendText(elicitation.message)
-							.appendMarkdown('\n\n' + localize('mcp.elicit.url.instruction', 'Open this URL?'))
-							.appendCodeblock('', elicitation.url),
+						buildUrlElicitationMessage(elicitation.message, plan),
 						localize('msg.subtitle', "{0} (MCP Server)", server.definition.label),
-						localize('mcp.elicit.url.open', 'Open {0}', URI.parse(elicitation.url).authority),
+						plan.kind === 'resume'
+							? localize('mcp.elicit.url.continue', 'Continue')
+							: localize('mcp.elicit.url.open', 'Open {0}', plan.hostname),
 						localize('mcp.elicit.reject', 'Cancel'),
 						async () => {
-							const result = await this._doElicitUrl(elicitation, token);
+							const result = await answer();
 							resolve(result);
-							completePromise.then(() => part.hide());
+							completePromise?.then(() => chatPart.hide(), () => { /* cancelled or stopped; the part is disposed with the result */ });
 							return result.action === 'accept' ? ElicitationState.Accepted : ElicitationState.Rejected;
 						},
 						() => {
@@ -188,32 +496,45 @@ export class McpElicitationService implements IMcpElicitationService {
 						},
 						mcpServerToSourceData(server),
 					);
-					chatModel.acceptResponseProgress(request, part);
+					part = chatPart;
+					chatModel.acceptResponseProgress(request, chatPart);
+					store.add(token.onCancellationRequested(() => {
+						chatPart.hide();
+						resolve({ action: 'cancel' });
+					}));
 				}
 			} else {
 				const handle = this._notificationService.notify({
-					message: elicitation.message + ' ' + localize('mcp.elicit.url.instruction2', 'This will open {0}', elicitation.url),
+					message: elicitation.message + ' ' + (plan.kind === 'resume'
+						? localize('mcp.elicit.url.resume2', 'You already opened {0}. Continue once you have finished there.', elicitation.url)
+						: localize('mcp.elicit.url.instruction2', 'This will open {0}', elicitation.url)),
 					source: localize('mcp.elicit.source', 'MCP Server ({0})', server.definition.label),
 					severity: Severity.Info,
 					actions: {
-						primary: [store.add(new Action('mcp.elicit.url.open2', localize('mcp.elicit.url.open2', 'Open URL'), undefined, true, () => resolve(this._doElicitUrl(elicitation, token))))],
+						primary: [store.add(new Action('mcp.elicit.url.open2', plan.kind === 'resume' ? localize('mcp.elicit.url.continue', 'Continue') : localize('mcp.elicit.url.open2', 'Open URL'), undefined, true, () => resolve(answer())))],
 						secondary: [store.add(new Action('mcp.elicit.cancel', localize('mcp.elicit.cancel', 'Cancel'), undefined, true, () => resolve({ action: 'decline' })))],
 					}
 				});
 				store.add(handle.onDidClose(() => resolve({ action: 'cancel' })));
 				store.add(token.onCancellationRequested(() => resolve({ action: 'cancel' })));
+				// A secondary action (Cancel) or a cancelled call answers without closing the
+				// notification, and its Open URL would still open the URL: close it once answered.
+				store.add(toDisposable(() => handle.close()));
 			}
 		}).finally(() => store.dispose());
 
 		return {
 			kind: ElicitationKind.URL,
 			value,
-			wait: completePromise,
-			dispose: () => promiseStore.dispose(),
+			wait: completePromise ?? Promise.resolve(),
+			dispose: () => {
+				promiseStore.dispose();
+				part?.hide();
+			},
 		};
 	}
 
-	private async _doElicitUrl(elicitation: MCP.ElicitRequestURLParams, token: CancellationToken): Promise<MCP.ElicitResult> {
+	private async _doElicitUrl(elicitation: MCPLegacy.ElicitRequestURLParams, token: CancellationToken): Promise<MCPLegacy.ElicitResult> {
 		if (token.isCancellationRequested) {
 			return { action: 'cancel' };
 		}
@@ -229,7 +550,7 @@ export class McpElicitationService implements IMcpElicitationService {
 		return { action: 'decline' };
 	}
 
-	private async _doElicitForm(elicitation: MCP.ElicitRequestFormParams | Pre20251125ElicitationParams, token: CancellationToken): Promise<MCP.ElicitResult> {
+	private async _doElicitForm(elicitation: MCPLegacy.ElicitRequestFormParams | Pre20251125ElicitationParams, token: CancellationToken): Promise<MCPLegacy.ElicitResult> {
 		const quickPick = this._quickInputService.createQuickPick<IQuickPickItem>();
 		const store = new DisposableStore();
 
@@ -304,7 +625,7 @@ export class McpElicitationService implements IMcpElicitationService {
 		}
 	}
 
-	private _getFieldPlaceholder(schema: MCP.PrimitiveSchemaDefinition, required: boolean): string {
+	private _getFieldPlaceholder(schema: MCPLegacy.PrimitiveSchemaDefinition, required: boolean): string {
 		let placeholder = schema.description || '';
 		if (!required) {
 			placeholder = placeholder ? `${placeholder} (${localize('optional', 'Optional')})` : localize('optional', 'Optional');
@@ -391,7 +712,7 @@ export class McpElicitationService implements IMcpElicitationService {
 
 	private async _handleInputField(
 		quickPick: IQuickPick<IQuickPickItem>,
-		schema: MCP.NumberSchema | MCP.StringSchema,
+		schema: MCPLegacy.NumberSchema | MCPLegacy.StringSchema,
 		required: boolean,
 		store: DisposableStore,
 		token: CancellationToken
@@ -454,7 +775,7 @@ export class McpElicitationService implements IMcpElicitationService {
 		});
 	}
 
-	private _validateInput(value: string, schema: MCP.NumberSchema | MCP.StringSchema): { isValid: boolean; message?: string } {
+	private _validateInput(value: string, schema: MCPLegacy.NumberSchema | MCPLegacy.StringSchema): { isValid: boolean; message?: string } {
 		switch (schema.type) {
 			case 'string':
 				return this._validateString(value, schema);
@@ -466,7 +787,7 @@ export class McpElicitationService implements IMcpElicitationService {
 		}
 	}
 
-	private _validateString(value: string, schema: MCP.StringSchema): { isValid: boolean; parsedValue?: string; message?: string } {
+	private _validateString(value: string, schema: MCPLegacy.StringSchema): { isValid: boolean; parsedValue?: string; message?: string } {
 		if (schema.minLength && value.length < schema.minLength) {
 			return { isValid: false, message: localize('mcp.elicit.validation.minLength', 'Minimum length is {0}', schema.minLength) };
 		}
@@ -515,7 +836,7 @@ export class McpElicitationService implements IMcpElicitationService {
 		}
 	}
 
-	private _validateNumber(value: string, schema: MCP.NumberSchema): { isValid: boolean; parsedValue?: number; message?: string } {
+	private _validateNumber(value: string, schema: MCPLegacy.NumberSchema): { isValid: boolean; parsedValue?: number; message?: string } {
 		const parsed = Number(value);
 		if (isNaN(parsed)) {
 			return { isValid: false, message: localize('mcp.elicit.validation.number', 'Please enter a valid number') };
@@ -536,7 +857,7 @@ export class McpElicitationService implements IMcpElicitationService {
 	 * Converts an MCP elicitation schema into IChatQuestion[] for the carousel UI.
 	 * Returns the questions and a map from question ID to schema property name.
 	 */
-	private _convertSchemaToQuestions(elicitation: MCP.ElicitRequestFormParams | Pre20251125ElicitationParams): { questions: IChatQuestion[]; idToPropertyMap: Map<string, string> } {
+	private _convertSchemaToQuestions(elicitation: MCPLegacy.ElicitRequestFormParams | Pre20251125ElicitationParams): { questions: IChatQuestion[]; idToPropertyMap: Map<string, string> } {
 		const properties = Object.entries(elicitation.requestedSchema.properties);
 		const requiredFields = new Set(elicitation.requestedSchema.required || []);
 		const questions: IChatQuestion[] = [];
@@ -656,6 +977,16 @@ export class McpElicitationService implements IMcpElicitationService {
 			}
 		}
 
+		// The carousel renders a question's title as Markdown (descriptions and
+		// option labels as text). A title that could form a link is shown
+		// literally instead; other titles keep their plain-text form, which the
+		// answer summary shows as it is.
+		for (const question of questions) {
+			if (mayRenderAsLink(question.title)) {
+				question.message = literalMarkdown(question.title);
+			}
+		}
+
 		return { questions, idToPropertyMap };
 	}
 
@@ -667,7 +998,7 @@ export class McpElicitationService implements IMcpElicitationService {
 	private _convertCarouselAnswersToElicitResult(
 		answers: IChatQuestionAnswers,
 		idToPropertyMap: Map<string, string>,
-		schemaProperties: Record<string, MCP.PrimitiveSchemaDefinition>,
+		schemaProperties: Record<string, MCPLegacy.PrimitiveSchemaDefinition>,
 	): Record<string, string | number | boolean | string[]> {
 		const content: Record<string, string | number | boolean | string[]> = {};
 

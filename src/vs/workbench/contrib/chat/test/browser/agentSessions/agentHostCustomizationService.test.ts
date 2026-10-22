@@ -37,7 +37,7 @@ import { IAuthenticationMcpService } from '../../../../../services/authenticatio
 import { IAuthenticationMcpUsageService } from '../../../../../services/authentication/browser/authenticationMcpUsageService.js';
 import { IDynamicAuthenticationProviderStorageService } from '../../../../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
 import { IMcpService } from '../../../../mcp/common/mcpTypes.js';
-import { MCP } from '../../../../mcp/common/modelContextProtocol.js';
+import { MCPLegacy } from '../../../../mcp/common/modelContextProtocolLegacy.js';
 import { AbstractAgentHostCustomizationService, IAgentHostCustomizationTarget, WorkbenchAgentHostCustomizationService } from '../../../browser/agentSessions/agentHost/agentHostCustomizationService.js';
 import { IAgentHostUntitledProvisionalSessionService } from '../../../browser/agentSessions/agentHost/agentHostUntitledProvisionalSessionService.js';
 import { IChatService } from '../../../common/chatService/chatService.js';
@@ -277,7 +277,7 @@ suite('AbstractAgentHostCustomizationService', () => {
 		const sut = createSut();
 		const session = URI.parse('vscode-agent-session:///session-1');
 		const channel = 'mcp://test-host/server-1';
-		const tools: MCP.Tool[] = [
+		const tools: MCPLegacy.Tool[] = [
 			{ name: 'first', title: 'First Tool', inputSchema: { type: 'object' } },
 			{ name: 'second', description: 'Second tool', inputSchema: { type: 'object' } },
 		];
@@ -289,7 +289,7 @@ suite('AbstractAgentHostCustomizationService', () => {
 			name: 'Plugin One',
 			children: [{ ...mcpServer('server-1', 'Server One'), state: { kind: McpServerStatus.Ready }, channel }],
 		}]);
-		target.handleMcpRequest = async (channel, method, params): Promise<MCP.ListToolsResult> => {
+		target.handleMcpRequest = async (channel, method, params): Promise<MCPLegacy.ListToolsResult> => {
 			calls.push({ channel, method, params });
 			return params?.cursor ? { tools: [tools[1]] } : { tools: [tools[0]], nextCursor: 'page-2' };
 		};

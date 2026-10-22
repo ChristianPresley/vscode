@@ -14,7 +14,7 @@ import { ILogger, log, LogLevel } from '../../../../platform/log/common/log.js';
 import { IMcpHostDelegate, IMcpMessageTransport } from './mcpRegistryTypes.js';
 import { McpServerRequestHandler } from './mcpServerRequestHandler.js';
 import { McpTaskManager } from './mcpTaskManager.js';
-import { IMcpClientMethods, IMcpPotentialSandboxBlock, IMcpServerConnection, McpCollectionDefinition, McpConnectionState, McpServerDefinition, McpServerLaunch } from './mcpTypes.js';
+import { IMcpClientMethods, IMcpNegotiationHints, IMcpPotentialSandboxBlock, IMcpServerConnection, McpCollectionDefinition, McpConnectionState, McpServerDefinition, McpServerLaunch } from './mcpTypes.js';
 
 export class McpServerConnection extends Disposable implements IMcpServerConnection {
 	private readonly _launch = this._register(new MutableDisposable<IReference<IMcpMessageTransport>>());
@@ -40,8 +40,19 @@ export class McpServerConnection extends Disposable implements IMcpServerConnect
 		super();
 	}
 
+	/**
+	 * The negotiation hint for the handler. The caller's hints are used as
+	 * given: McpServer already weighs the `protocolVersion` pinned in the
+	 * configuration against the revision it cached (a cached revision only
+	 * counts when it was negotiated under the same pin, so a rejected pin is
+	 * not sent again). Without caller hints, the pin is used.
+	 */
+	private static _negotiationHint(pinnedVersion: string | undefined, hints: IMcpNegotiationHints | undefined): IMcpNegotiationHints | undefined {
+		return hints ?? (pinnedVersion ? { protocolVersion: pinnedVersion } : undefined);
+	}
+
 	/** @inheritdoc */
-	public async start(methods: IMcpClientMethods): Promise<McpConnectionState> {
+	public async start(methods: IMcpClientMethods, hints?: IMcpNegotiationHints): Promise<McpConnectionState> {
 		if (this._store.isDisposed) {
 			return this._state.get();
 		}
@@ -59,7 +70,7 @@ export class McpServerConnection extends Disposable implements IMcpServerConnect
 
 		try {
 			const launch = this._delegate.start(this._collection, this.definition, this.launchDefinition, { errorOnUserInteraction: this._errorOnUserInteraction });
-			this._launch.value = this.adoptLaunch(launch, methods);
+			this._launch.value = this.adoptLaunch(launch, methods, hints);
 			return this._waitForState(McpConnectionState.Kind.Running, McpConnectionState.Kind.Error);
 		} catch (e) {
 			const errorState: McpConnectionState = {
@@ -71,7 +82,7 @@ export class McpServerConnection extends Disposable implements IMcpServerConnect
 		}
 	}
 
-	private adoptLaunch(launch: IMcpMessageTransport, methods: IMcpClientMethods): IReference<IMcpMessageTransport> {
+	private adoptLaunch(launch: IMcpMessageTransport, methods: IMcpClientMethods, hints?: IMcpNegotiationHints): IReference<IMcpMessageTransport> {
 		const store = new DisposableStore();
 		const cts = new CancellationTokenSource();
 
@@ -99,6 +110,9 @@ export class McpServerConnection extends Disposable implements IMcpServerConnect
 					logger: this._logger,
 					requestLogLevel: this.definition.devMode ? LogLevel.Info : LogLevel.Debug,
 					taskManager: this._taskManager,
+					transportType: this.launchDefinition.type,
+					negotiationHint: McpServerConnection._negotiationHint(this.definition.protocolVersionHint, hints),
+					defaultServerInfo: { name: this.definition.label, version: '' },
 				}, cts.token).then(
 					handler => {
 						if (!store.isDisposed) {
@@ -111,7 +125,7 @@ export class McpServerConnection extends Disposable implements IMcpServerConnect
 						if (!store.isDisposed && McpConnectionState.isRunning(this._state.read(undefined))) {
 							let message = err.message;
 							if (err instanceof CancellationError) {
-								message = 'Server exited before responding to `initialize` request.';
+								message = localize('mcpServer.handshakeExit', 'Server exited before completing the protocol handshake (server/discover or initialize).');
 								this._logger.error(message);
 							} else {
 								this._logger.error(err);

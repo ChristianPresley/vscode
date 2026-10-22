@@ -412,7 +412,7 @@ export class McpResourceScannerService extends Disposable implements IMcpResourc
 			server = serverOrConfig as IMcpServerConfiguration;
 		}
 
-		if (server.type === undefined || (server.type !== McpServerType.REMOTE && server.type !== McpServerType.LOCAL)) {
+		if (server.type === undefined || (server.type !== McpServerType.REMOTE && server.type !== McpServerType.LOCAL && server.type !== McpServerType.GRPC)) {
 			(<Mutable<ICommonMcpServerConfiguration>>server).type = (<IMcpStdioServerConfiguration>server).command ? McpServerType.LOCAL : McpServerType.REMOTE;
 		}
 		return server;
@@ -490,8 +490,15 @@ function withServerTypeEdits(edits: [string, unknown][], previous: IMcpServerCon
 	return [...edits.filter(([key]) => key !== 'type' && key !== 'transport'), ['type', type], ['transport', transport]];
 }
 
-function getServerKind(config: IMcpServerConfiguration): 'stdio' | 'http' | 'sse' {
-	return config.type === McpServerType.LOCAL ? 'stdio' : config.transport === 'sse' ? 'sse' : 'http';
+function getServerKind(config: IMcpServerConfiguration): 'stdio' | 'http' | 'sse' | 'grpc' {
+	switch (config.type) {
+		case McpServerType.LOCAL:
+			return 'stdio';
+		case McpServerType.GRPC:
+			return 'grpc';
+		default:
+			return config.transport === 'sse' ? 'sse' : 'http';
+	}
 }
 
 /** Properties whose values differ between two server configurations; removed properties map to `undefined`. */

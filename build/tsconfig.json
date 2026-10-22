@@ -22,6 +22,7 @@
 		"node_modules/**",
 		"monaco-editor-playground/**",
 		"builtin/**",
-		"vite/**"
+		"vite/**",
+		"mcp/mcp-schema-2026-07-28.ts"
 	]
 }

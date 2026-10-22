@@ -10,8 +10,8 @@ import { DisposableStore } from '../../../../base/common/lifecycle.js';
 import { autorun, autorunSelfDisposable, IReader } from '../../../../base/common/observable.js';
 import { ILogger } from '../../../../platform/log/common/log.js';
 import { ToolDataSource } from '../../chat/common/tools/languageModelToolsService.js';
-import { IMcpServer, IMcpServerStartOpts, IMcpService, McpConnectionState, McpServerCacheState, McpServerTransportType } from './mcpTypes.js';
-import { MCP } from './modelContextProtocol.js';
+import { IMcpServer, IMcpServerStartOpts, IMcpService, McpConnectionState, McpServerCacheState, McpServerLaunch } from './mcpTypes.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
 
 /**
@@ -110,8 +110,9 @@ export function mcpServerToSourceData(server: IMcpServer, reader?: IReader): Too
 export function canLoadMcpNetworkResourceDirectly(resource: URL, server: IMcpServer | undefined) {
 	let isResourceRequestValid = false;
 	if (resource.protocol === 'http:') {
+		// Plain HTTP is allowed only from the server's own host: by authority for HTTP servers, by host name for gRPC ones.
 		const launch = server?.connection.get()?.launchDefinition;
-		if (launch && launch.type === McpServerTransportType.HTTP && launch.uri.authority.toLowerCase() === resource.host.toLowerCase()) {
+		if (launch && McpServerLaunch.isServerNetworkAuthority(launch, resource.host)) {
 			isResourceRequestValid = true;
 		}
 	} else if (resource.protocol === 'https:') {
@@ -120,8 +121,8 @@ export function canLoadMcpNetworkResourceDirectly(resource: URL, server: IMcpSer
 	return isResourceRequestValid;
 }
 
-export function isTaskResult(obj: MCP.Result | MCP.CreateTaskResult): obj is MCP.CreateTaskResult {
-	return (obj as MCP.CreateTaskResult).task !== undefined;
+export function isTaskResult(obj: MCPLegacy.Result | MCPLegacy.CreateTaskResult): obj is MCPLegacy.CreateTaskResult {
+	return (obj as MCPLegacy.CreateTaskResult).task !== undefined;
 }
 
 export function findMcpServer(mcpService: IMcpService, filter: (s: IMcpServer) => boolean, token?: CancellationToken) {
@@ -150,7 +151,7 @@ export function findMcpServer(mcpService: IMcpService, filter: (s: IMcpServer) =
 	});
 }
 
-export function translateMcpLogMessage(logger: ILogger, params: MCP.LoggingMessageNotificationParams, prefix = '') {
+export function translateMcpLogMessage(logger: ILogger, params: MCPLegacy.LoggingMessageNotificationParams, prefix = '') {
 	let contents = typeof params.data === 'string' ? params.data : JSON.stringify(params.data);
 	if (params.logger) {
 		contents = `${params.logger}: ${contents}`;

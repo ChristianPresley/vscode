@@ -1,0 +1,11 @@
+# Known failures of the scored client scenarios of `--requirements 2026-07-28`.
+# test/mcp-conformance/run.ts passes this file to every scored client run at
+# 2026-07-28; the suite then fails on any other failing (or WARNING) check and on
+# every listed check that passes.
+#
+# Each entry names one check, `<scenario>:<check-id>`. Every scored scenario
+# passes, the authorization ones included (milestone M5: the transport answers
+# the challenges and the conformance OAuth client, built with the product's
+# rule set, registers and authorizes), so the list is empty. Refresh it with
+# `node test/mcp-conformance/run.ts client --requirements 2026-07-28 --update-baseline`.
+client: []

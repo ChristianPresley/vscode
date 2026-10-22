@@ -120,6 +120,7 @@ export class PluginMcpDiscovery extends Disposable implements IMcpDiscovery {
 			defaultCwd,
 			variableReplacement: { target: ConfigurationTarget.USER },
 			cacheNonce: String(hash(launch)),
+			protocolVersionHint: configuration.protocolVersion,
 		};
 	}
 }

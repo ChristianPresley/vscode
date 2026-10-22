@@ -240,6 +240,11 @@ export function toClaudeMcpServers(
 	const skipped: string[] = [];
 	for (const definition of definitions) {
 		const config = definition.configuration;
+		if (config.type === McpServerType.GRPC) {
+			// The Claude SDK has no gRPC transport.
+			skipped.push(definition.name);
+			continue;
+		}
 		if (config.type === McpServerType.REMOTE) {
 			servers[definition.name] = {
 				type: config.transport === 'sse' ? 'sse' : 'http',

@@ -1701,6 +1701,7 @@ export default defineConfig(
 						'fs/promises',
 						'http',
 						'https',
+						'http2',
 						'inspector',
 						'minimist',
 						'node:module',
@@ -2493,6 +2494,34 @@ export default defineConfig(
 						'@parcel/*',
 						'@playwright/*',
 						'@modelcontextprotocol/sdk/**/*',
+						'*' // node modules
+					]
+				},
+				{
+					// The MCP conformance harness drives the official suite with node built-ins only.
+					'target': 'test/mcp-conformance/**',
+					'restrictions': [
+						'test/mcp-conformance/**',
+						'*' // node modules
+					]
+				},
+				{
+					// The MCP end-to-end suite: an extension (against the `vscode` API), node scripts and Playwright.
+					'target': 'test/mcp-e2e/**',
+					'restrictions': [
+						'test/mcp-e2e/**',
+						'*' // node modules (vscode, playwright, node built-ins)
+					]
+				},
+				{
+					// The MCP gRPC interop package runs the transpiled codec from out/ against grpc-js and protobufjs.
+					'target': 'test/mcp-grpc/**',
+					'restrictions': [
+						'test/mcp-grpc/**',
+						'out/vs/base/common/protobuf/**',
+						'out/vs/platform/mcp/common/**',
+						'vs/base/common/protobuf/**', // type-only imports from src/ (the rule strips the src/ prefix)
+						'@grpc/*',
 						'*' // node modules
 					]
 				},

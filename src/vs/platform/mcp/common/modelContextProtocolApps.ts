@@ -4,39 +4,45 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
-type CallToolResult = MCP.CallToolResult;
-type ContentBlock = MCP.ContentBlock;
-type Implementation = MCP.Implementation;
-type RequestId = MCP.RequestId;
-type Tool = MCP.Tool;
+type CallToolResult = MCPLegacy.CallToolResult;
+type ContentBlock = MCPLegacy.ContentBlock;
+type Implementation = MCPLegacy.Implementation;
+type RequestId = MCPLegacy.RequestId;
+type Tool = MCPLegacy.Tool;
 
 export namespace McpApps {
 	export type AppRequest =
-		| MCP.CallToolRequest
-		| MCP.ReadResourceRequest
-		| MCP.CreateMessageRequest
-		| MCP.PingRequest
-		| (McpUiOpenLinkRequest & MCP.JSONRPCRequest)
-		| (McpUiDownloadFileRequest & MCP.JSONRPCRequest)
-		| (McpUiUpdateModelContextRequest & MCP.JSONRPCRequest)
-		| (McpUiMessageRequest & MCP.JSONRPCRequest)
-		| (McpUiRequestDisplayModeRequest & MCP.JSONRPCRequest)
-		| (McpApps.McpUiInitializeRequest & MCP.JSONRPCRequest);
+		| MCPLegacy.CallToolRequest
+		| MCPLegacy.ReadResourceRequest
+		| MCPLegacy.CreateMessageRequest
+		| MCPLegacy.PingRequest
+		| (McpUiOpenLinkRequest & MCPLegacy.JSONRPCRequest)
+		| (McpUiDownloadFileRequest & MCPLegacy.JSONRPCRequest)
+		| (McpUiUpdateModelContextRequest & MCPLegacy.JSONRPCRequest)
+		| (McpUiMessageRequest & MCPLegacy.JSONRPCRequest)
+		| (McpUiRequestDisplayModeRequest & MCPLegacy.JSONRPCRequest)
+		| (McpApps.McpUiInitializeRequest & MCPLegacy.JSONRPCRequest);
 
 	export type AppNotification =
 		| McpUiInitializedNotification
 		| McpUiSizeChangedNotification
-		| MCP.LoggingMessageNotification
+		| MCPLegacy.LoggingMessageNotification
 		| CustomSandboxWheelNotification;
 
 	export type AppMessage = AppRequest | AppNotification;
 
+	/**
+	 * The App protocol (`io.modelcontextprotocol/ui`) is defined on the
+	 * 2025-11-25 shapes, so a result sent to an App has that shape whichever
+	 * revision the server speaks. Server results pass through {@link toAppResult}.
+	 */
 	export type HostResult =
-		| MCP.CallToolResult
-		| MCP.ReadResourceResult
-		| MCP.CreateMessageResult
-		| MCP.EmptyResult
+		| MCPLegacy.CallToolResult
+		| MCPLegacy.ReadResourceResult
+		| MCPLegacy.CreateMessageResult
+		| MCPLegacy.EmptyResult
 		| McpApps.McpUiInitializeResult
 		| McpUiMessageResult
 		| McpUiOpenLinkResult
@@ -54,6 +60,27 @@ export namespace McpApps {
 
 	export type HostMessage = HostResult | HostNotification;
 
+	/** Result fields that only the 2026-07-28 revision defines. */
+	const modernOnlyResultFields: ReadonlySet<string> = new Set(['resultType', 'ttlMs', 'cacheScope']);
+
+	/**
+	 * Turns a `tools/call` or `resources/read` result of a server of either
+	 * revision into the 2025-11-25 shape an App expects. It drops `resultType`,
+	 * `ttlMs` and `cacheScope` and keeps the other fields (`content`,
+	 * `structuredContent`, `isError`, `contents`, `_meta`), leaving out
+	 * fields whose value is `undefined`.
+	 */
+	export function toAppResult(result: MCP.CallToolResult | MCPLegacy.CallToolResult): MCPLegacy.CallToolResult;
+	export function toAppResult(result: MCP.ReadResourceResult | MCPLegacy.ReadResourceResult): MCPLegacy.ReadResourceResult;
+	export function toAppResult(result: MCP.Result | MCPLegacy.Result): MCPLegacy.Result {
+		const appResult: MCPLegacy.Result = {};
+		for (const [key, value] of Object.entries(result)) {
+			if (value !== undefined && !modernOnlyResultFields.has(key)) {
+				appResult[key] = value;
+			}
+		}
+		return appResult;
+	}
 
 	/** Custom notification used for bubbling up sandbox wheel events. */
 	export interface CustomSandboxWheelNotification {
@@ -236,7 +263,7 @@ export namespace McpApps {
 		method: "ui/download-file";
 		params: {
 			/** @description Resources to download, either inline or as links for the host to resolve. */
-			contents: (MCP.EmbeddedResource | MCP.ResourceLink)[];
+			contents: (MCPLegacy.EmbeddedResource | MCPLegacy.ResourceLink)[];
 		};
 	}
 

@@ -11,6 +11,7 @@ import { basename, extname, isEqualOrParent, joinPath, normalizePath, isEqual as
 import { escapeRegExpCharacters } from '../../../base/common/strings.js';
 import { hasKey, Mutable } from '../../../base/common/types.js';
 import { URI } from '../../../base/common/uri.js';
+import { localize } from '../../../nls.js';
 import { IFileService } from '../../files/common/files.js';
 import { parseFrontMatter } from '../../../base/common/yaml.js';
 import { IMcpRemoteServerConfiguration, IMcpServerConfiguration, IMcpStdioServerConfiguration, McpServerType } from '../../mcp/common/mcpPlatformTypes.js';
@@ -531,10 +532,28 @@ export function resolveMcpServersMap(raw: unknown): Record<string, unknown> | un
 }
 
 /**
- * Normalizes a raw JSON value into a typed MCP server configuration.
+ * Explains why a raw MCP server entry of a known but unsupported kind cannot be
+ * used in plugins and the shared configuration formats, or `undefined` when the
+ * entry is of a supported kind (or malformed in a way {@link normalizeMcpServerConfiguration}
+ * reports by returning `undefined`).
+ */
+export function getUnsupportedMcpServerConfigurationMessage(rawConfig: unknown): string | undefined {
+	if (!rawConfig || typeof rawConfig !== 'object') {
+		return undefined;
+	}
+	if ((rawConfig as { type?: unknown }).type === McpServerType.GRPC) {
+		return localize('pluginMcpGrpcUnsupported', "gRPC MCP servers are not supported in plugins and shared MCP configuration files. Configure the server in a VS Code mcp.json file instead.");
+	}
+	return undefined;
+}
+
+/**
+ * Normalizes a raw JSON value into a typed MCP server configuration. Entries of
+ * a kind the shared formats do not support, such as `grpc`, are rejected; see
+ * {@link getUnsupportedMcpServerConfigurationMessage} for the reason.
  */
 export function normalizeMcpServerConfiguration(rawConfig: unknown): IMcpServerConfiguration | undefined {
-	if (!rawConfig || typeof rawConfig !== 'object') {
+	if (!rawConfig || typeof rawConfig !== 'object' || getUnsupportedMcpServerConfigurationMessage(rawConfig) !== undefined) {
 		return undefined;
 	}
 
@@ -677,6 +696,9 @@ export function interpolateMcpPluginRoot(
 			local.envFile = replace(local.envFile);
 		}
 		interpolated = local;
+	} else if (config.type === McpServerType.GRPC) {
+		// Plugins cannot declare gRPC servers (normalizeMcpServerConfiguration rejects them).
+		interpolated = config;
 	} else {
 		const remote: Mutable<IMcpRemoteServerConfiguration> = { ...config };
 		remote.url = replace(remote.url);

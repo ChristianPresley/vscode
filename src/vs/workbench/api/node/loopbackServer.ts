@@ -9,11 +9,23 @@ import { DeferredPromise } from '../../../base/common/async.js';
 import { DEFAULT_AUTH_FLOW_PORT } from '../../../base/common/oauth.js';
 import { escape, htmlAttributeEncodeValue } from '../../../base/common/strings.js';
 import { URI } from '../../../base/common/uri.js';
+import { localize } from '../../../nls.js';
 import { ILogger } from '../../../platform/log/common/log.js';
 
+/**
+ * The parameters of the authorization response that reached the redirect URI
+ * (RFC 6749 section 4.1.2), form-decoded and otherwise unvalidated: the caller
+ * validates `iss` first (RFC 9207), then `state`, then acts on `error`. The
+ * loopback page never shows `error`, `error_description` or `error_uri`: the
+ * server does not know the expected issuer, and on an `iss` mismatch the
+ * client must neither act on nor display them.
+ */
 export interface IOAuthResult {
-	code: string;
-	state: string;
+	readonly code?: string;
+	readonly state?: string;
+	readonly iss?: string;
+	readonly error?: string;
+	readonly errorDescription?: string;
 }
 
 export interface ILoopbackServer {
@@ -21,6 +33,12 @@ export interface ILoopbackServer {
 	 * The state parameter used in the OAuth flow.
 	 */
 	readonly state: string;
+
+	/**
+	 * The redirect URI the server listens on.
+	 * @throws If the server is not started.
+	 */
+	readonly redirectUri: string;
 
 	/**
 	 * Starts the server.
@@ -40,6 +58,21 @@ export interface ILoopbackServer {
 	 * Returns a promise that resolves to the result of the OAuth flow.
 	 */
 	waitForOAuthResponse(): Promise<IOAuthResult>;
+}
+
+/** The query flag of the `/done` page when sign-in did not complete; it carries no text. */
+const FAILED_PARAM = 'error';
+const FAILED_QUERY = `${FAILED_PARAM}=1`;
+
+function parseOAuthResult(params: URLSearchParams): IOAuthResult {
+	const get = (name: string) => params.get(name) ?? undefined;
+	return {
+		code: get('code'),
+		state: get('state'),
+		iss: get('iss'),
+		error: get('error'),
+		errorDescription: get('error_description'),
+	};
 }
 
 export class LoopbackAuthServer implements ILoopbackServer {
@@ -64,34 +97,29 @@ export class LoopbackAuthServer implements ILoopbackServer {
 				const reqUrl = new URL(req.url!, `http://${req.headers.host}`);
 				switch (reqUrl.pathname) {
 					case '/': {
-						const code = reqUrl.searchParams.get('code') ?? undefined;
-						const state = reqUrl.searchParams.get('state') ?? undefined;
-						const error = reqUrl.searchParams.get('error') ?? undefined;
-						if (error) {
-							res.writeHead(302, { location: `/done?error=${reqUrl.searchParams.get('error_description') || error}` });
+						if (deferredPromise.isSettled) {
+							// Only the first authorization response counts.
+							res.writeHead(302, { location: '/done' });
 							res.end();
-							deferredPromise.error(new Error(error));
 							break;
 						}
-						if (!code || !state) {
+						const result = parseOAuthResult(reqUrl.searchParams);
+						if (!result.error && (!result.code || !result.state)) {
 							res.writeHead(400);
 							res.end();
 							break;
 						}
-						if (this.state !== state) {
-							res.writeHead(302, { location: `/done?error=${encodeURIComponent('State does not match.')}` });
-							res.end();
-							deferredPromise.error(new Error('State does not match.'));
-							break;
-						}
-						deferredPromise.complete({ code, state });
-						res.writeHead(302, { location: '/done' });
+						// The page only says whether sign-in went through; it never shows what the authorization
+						// server sent. The caller validates `iss`, then `state`, and only then surfaces an `error`.
+						const failed = result.error !== undefined || result.state !== this.state;
+						res.writeHead(302, { location: failed ? `/done?${FAILED_QUERY}` : '/done' });
 						res.end();
+						deferredPromise.complete(result);
 						break;
 					}
 					// Serve the static files
 					case '/done':
-						this._sendPage(res);
+						this._sendPage(res, reqUrl.searchParams.has(FAILED_PARAM));
 						break;
 					default:
 						res.writeHead(404);
@@ -110,8 +138,8 @@ export class LoopbackAuthServer implements ILoopbackServer {
 		return `http://127.0.0.1:${this._port}/`;
 	}
 
-	private _sendPage(res: http.ServerResponse): void {
-		const html = this.getHtml();
+	private _sendPage(res: http.ServerResponse, failed: boolean): void {
+		const html = this.getHtml(failed);
 		res.writeHead(200, {
 			'Content-Type': 'text/html',
 			'Content-Length': Buffer.byteLength(html, 'utf8')
@@ -186,10 +214,16 @@ export class LoopbackAuthServer implements ILoopbackServer {
 		return this._resultPromise;
 	}
 
-	getHtml(): string {
+	/**
+	 * The page the browser lands on after the redirect. When sign-in did not
+	 * complete it shows one generic message; nothing the authorization server
+	 * sent is ever rendered.
+	 */
+	getHtml(failed = false): string {
 		// Neither value is static; encode each for its context and keep the URI out of the script.
 		const appUri = htmlAttributeEncodeValue(this._appUri.toString(true));
 		const appName = escape(this._appName);
+		const failureMessage = escape(localize('loopbackSignInIncomplete', "Sign-in did not complete. Return to {0} for details.", this._appName));
 		// TODO: Bring this in via mixin. Skipping exploration for now.
 		let backgroundImage = 'url(\'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABAAAAAQABAMAAACNMzawAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAAJ1BMVEUAAAD///9Qm8+ozed8tNsWer+Lvd9trNfF3u9Ck8slgsMzi8eZxeM/Qa6mAAAAAXRSTlMAQObYZgAAAAFiS0dEAf8CLd4AAAAHdElNRQfiCwYULRt0g+ZLAAAJRUlEQVR42u3SUY0CQRREUSy0hSZtBA+wfOwv4wAPYwAJSMAfAthkB6YD79HnKqikzmYjSZIkSZIkSZIkSZIkSZIkSZIkSZIkSZIkSZIkSZIkSZIkSZIkSZIkSZIkSZIkSZIkSZIk6cmKhg4AAASAABAAAkAACAABIAAEgAAQAAJAAAgAAaBvBVAjtV2wfFe1ogcA+0gdFgBoe60IAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAnAjAP/1MkWoAvBvAsUTqBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJAAgAASAABIAAEAACQAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKA7gDlbFwC6AijZagAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQDM2boA0BXAqAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIATARAAAkAAvF7N1hWArgBKthoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAfBrAlK0bAF0BjBoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4EQABIAAEwOtN2boB0BVAyVYDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgE8DqNm6AtAVwKgBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAEwEQAAJAAPzd7xypMwDvBnAskToBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAIAAkAACAABIAAEgAAQAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAkAACAABIAAEgAAQAAJAAAgAASAABIAAEAACQAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIBKBGarsAwK5qRQ8ANGYAACAABIAAEAACQAAIAAEgAASAABAAAkDfCUCSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJC3uDtO80OSql+i8AAAAJXRFWHRkYXRlOmNyZWF0ZQAyMDE4LTExLTA2VDIwOjQ1OjI3KzAwOjAwEjLurQAAACV0RVh0ZGF0ZTptb2RpZnkAMjAxOC0xMS0wNlQyMDo0NToyNyswMDowMGNvVhEAAAAZdEVYdFNvZnR3YXJlAEFkb2JlIEltYWdlUmVhZHlxyWU8AAAAAElFTkSuQmCC\')';
 		if (this._appName === 'Visual Studio Code') {
@@ -261,11 +295,6 @@ export class LoopbackAuthServer implements ILoopbackServer {
 			font-size: 1.3rem;
 		}
 
-		.error-text {
-			color: red;
-			font-size: 1rem;
-		}
-
 		@font-face {
 			font-family: 'Segoe UI';
 			src: url("https://c.s-microsoft.com/static/fonts/segoe-ui/west-european/light/latest.eot"),url("https://c.s-microsoft.com/static/fonts/segoe-ui/west-european/light/latest.eot?#iefix") format("embedded-opentype");
@@ -303,7 +332,7 @@ export class LoopbackAuthServer implements ILoopbackServer {
 	</style>
 </head>
 
-<body>
+<body${failed ? ' class="error"' : ''}>
 	<a class="branding" href="https://code.visualstudio.com/">
 		${appName}
 	</a>
@@ -314,19 +343,11 @@ export class LoopbackAuthServer implements ILoopbackServer {
 			If you're not redirected automatically, <a id="redirect-link" href="${appUri}" style="color: #85CEFF;">click here</a> or close this page.
 		</div>
 		<div class="error-message">
-			An error occurred while signing in:
-			<div class="error-text"></div>
+			${failureMessage}
 		</div>
 	</div>
 	<script>
-		const search = window.location.search;
-		const error = (/[?&^]error=([^&]+)/.exec(search) || [])[1];
-		if (error) {
-			document.querySelector('.error-text')
-				.textContent = decodeURIComponent(error);
-			document.querySelector('body')
-				.classList.add('error');
-		} else {
+		if (!document.body.classList.contains('error')) {
 			// Redirect to the app URI after a 1-second delay to allow page to load
 			setTimeout(function() {
 				window.location.href = document.getElementById('redirect-link').getAttribute('href');

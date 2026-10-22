@@ -8,9 +8,9 @@ import { URI } from '../../../../base/common/uri.js';
 import { IChannel } from '../../../../base/parts/ipc/common/ipc.js';
 import { IMainProcessService } from '../../../../platform/ipc/common/mainProcessService.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
-import { IMcpGatewayServerInfo, McpGatewayChannelName } from '../../../../platform/mcp/common/mcpGateway.js';
+import { IMcpGatewayCreateOptions, IMcpGatewayServerInfo, McpGatewayChannelName } from '../../../../platform/mcp/common/mcpGateway.js';
 import { IRemoteAgentService } from '../../../services/remote/common/remoteAgentService.js';
-import { IMcpGatewayResult, IMcpGatewayResultServer, IWorkbenchMcpGatewayService } from '../common/mcpGatewayService.js';
+import { IMcpGatewayResult, IWorkbenchMcpGatewayService, mcpGatewayCreateArgs, reviveMcpGatewayServers } from '../common/mcpGatewayService.js';
 
 /**
  * Electron workbench implementation of the MCP Gateway Service.
@@ -31,22 +31,22 @@ export class WorkbenchMcpGatewayService implements IWorkbenchMcpGatewayService {
 		this._localChannel = mainProcessService.getChannel(McpGatewayChannelName);
 	}
 
-	async createGateway(inRemote: boolean, chatSessionResource?: URI): Promise<IMcpGatewayResult | undefined> {
-		this._logService.debug(`[McpGateway][Workbench] createGateway requested (inRemote=${inRemote})`);
+	async createGateway(inRemote: boolean, chatSessionResource?: URI, options?: IMcpGatewayCreateOptions): Promise<IMcpGatewayResult | undefined> {
+		this._logService.debug(`[McpGateway][Workbench] createGateway requested (inRemote=${inRemote}, grpc=${options?.grpc === true})`);
 		if (inRemote) {
-			return this._createRemoteGateway(chatSessionResource);
+			return this._createRemoteGateway(chatSessionResource, options);
 		} else {
-			return this._createLocalGateway(chatSessionResource);
+			return this._createLocalGateway(chatSessionResource, options);
 		}
 	}
 
-	private async _createLocalGateway(chatSessionResource?: URI): Promise<IMcpGatewayResult> {
+	private async _createLocalGateway(chatSessionResource: URI | undefined, options: IMcpGatewayCreateOptions | undefined): Promise<IMcpGatewayResult> {
 		this._logService.info('[McpGateway][Workbench] Creating local gateway via main process');
 		const info = await this._localChannel.call<{ gatewayId: string; servers: readonly IMcpGatewayServerInfo[] }>(
 			'createGateway',
-			chatSessionResource ? { chatSessionResource: chatSessionResource.toString() } : undefined
+			mcpGatewayCreateArgs(chatSessionResource, options)
 		);
-		const servers = reviveServers(info.servers);
+		const servers = reviveMcpGatewayServers(info.servers);
 		this._logService.info(`[McpGateway][Workbench] Local gateway created with ${servers.length} server(s)`);
 
 		const onDidChangeServers = Event.map(
@@ -54,7 +54,7 @@ export class WorkbenchMcpGatewayService implements IWorkbenchMcpGatewayService {
 				this._localChannel.listen<{ gatewayId: string; servers: readonly IMcpGatewayServerInfo[] }>('onDidChangeGatewayServers'),
 				e => e.gatewayId === info.gatewayId,
 			),
-			e => reviveServers(e.servers),
+			e => reviveMcpGatewayServers(e.servers),
 		);
 
 		return {
@@ -69,7 +69,7 @@ export class WorkbenchMcpGatewayService implements IWorkbenchMcpGatewayService {
 		};
 	}
 
-	private async _createRemoteGateway(chatSessionResource?: URI): Promise<IMcpGatewayResult | undefined> {
+	private async _createRemoteGateway(chatSessionResource: URI | undefined, options: IMcpGatewayCreateOptions | undefined): Promise<IMcpGatewayResult | undefined> {
 		const connection = this._remoteAgentService.getConnection();
 		if (!connection) {
 			this._logService.info('[McpGateway][Workbench] No remote connection available for remote gateway');
@@ -80,9 +80,9 @@ export class WorkbenchMcpGatewayService implements IWorkbenchMcpGatewayService {
 		return connection.withChannel(McpGatewayChannelName, async channel => {
 			const info = await channel.call<{ gatewayId: string; servers: readonly IMcpGatewayServerInfo[] }>(
 				'createGateway',
-				chatSessionResource ? { chatSessionResource: chatSessionResource.toString() } : undefined
+				mcpGatewayCreateArgs(chatSessionResource, options)
 			);
-			const servers = reviveServers(info.servers);
+			const servers = reviveMcpGatewayServers(info.servers);
 			this._logService.info(`[McpGateway][Workbench] Remote gateway created with ${servers.length} server(s)`);
 
 			const onDidChangeServers = Event.map(
@@ -90,7 +90,7 @@ export class WorkbenchMcpGatewayService implements IWorkbenchMcpGatewayService {
 					channel.listen<{ gatewayId: string; servers: readonly IMcpGatewayServerInfo[] }>('onDidChangeGatewayServers'),
 					e => e.gatewayId === info.gatewayId,
 				),
-				e => reviveServers(e.servers),
+				e => reviveMcpGatewayServers(e.servers),
 			);
 
 			return {
@@ -105,8 +105,4 @@ export class WorkbenchMcpGatewayService implements IWorkbenchMcpGatewayService {
 			};
 		});
 	}
-}
-
-function reviveServers(servers: readonly IMcpGatewayServerInfo[]): IMcpGatewayResultServer[] {
-	return servers.map(s => ({ label: s.label, address: URI.revive(s.address) }));
 }

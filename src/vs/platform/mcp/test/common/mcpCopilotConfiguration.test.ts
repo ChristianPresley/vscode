@@ -7,7 +7,7 @@ import assert from 'assert';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { fromCopilotMcpServerConfiguration, toCopilotMcpServerConfiguration } from '../../common/mcpCopilotConfiguration.js';
-import { getCopilotGlobalMcpConfigurationResource } from '../../common/mcpCopilotGlobalConfiguration.js';
+import { getCopilotGlobalMcpConfigurationError, getCopilotGlobalMcpConfigurationResource } from '../../common/mcpCopilotGlobalConfiguration.js';
 import { McpServerType } from '../../common/mcpPlatformTypes.js';
 
 suite('McpCopilotConfiguration', () => {
@@ -41,6 +41,16 @@ suite('McpCopilotConfiguration', () => {
 			{ type: 'http', transport: 'sse', url: 'https://example.com/sse', oauth: { clientId: 'client' } },
 			null, null,
 		]);
+	});
+
+	test('rejects grpc with a message', () => {
+		const grpc = { type: McpServerType.GRPC, url: 'grpcs://localhost:50051' } as const;
+		assert.throws(() => toCopilotMcpServerConfiguration(grpc), /gRPC MCP servers cannot be written to the Copilot CLI configuration format/);
+		assert.strictEqual(fromCopilotMcpServerConfiguration(grpc), undefined);
+		assert.strictEqual(
+			getCopilotGlobalMcpConfigurationError({ name: 'grpc', config: grpc }),
+			'gRPC servers are not supported in Copilot Global MCP configuration. Use a VS Code mcp.json file instead.',
+		);
 	});
 
 	test('uses the discovery host and Copilot home override', () => {

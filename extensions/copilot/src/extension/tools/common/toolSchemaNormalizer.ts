@@ -3,13 +3,12 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as l10n from '@vscode/l10n';
-import Ajv from 'ajv';
+import Ajv, { ErrorObject, Options as AjvOptions, ValidateFunction } from 'ajv';
+import Ajv2020 from 'ajv/dist/2020';
 import { ArrayJsonSchema, JsonSchema, ObjectJsonSchema } from '../../../platform/configuration/common/jsonSchema';
 import { jsonSchemaDraft7 } from '../../../platform/configuration/common/jsonSchemaDraft7';
-import { OpenAiFunctionDef, OpenAiFunctionTool } from '../../../platform/networking/common/fetch';
 import { isGeminiFamily } from '../../../platform/endpoint/common/chatModelCapabilities';
-import { Iterable } from '../../../util/vs/base/common/iterator';
+import { OpenAiFunctionDef, OpenAiFunctionTool } from '../../../platform/networking/common/fetch';
 import { Lazy } from '../../../util/vs/base/common/lazy';
 import { deepClone } from '../../../util/vs/base/common/objects';
 
@@ -19,8 +18,16 @@ import { deepClone } from '../../../util/vs/base/common/objects';
  * in CAPI returning a blank 400 error. This is a terrible experience in the
  * extensible MCP scenario, so here we _try_ to normalize known cases to
  * avoid that (though there may certainly be unknown cases).
+ *
+ * Tool schemas are validated against the JSON Schema dialect their `$schema`
+ * names: JSON Schema 2020-12 (the default when `$schema` is absent, per MCP
+ * 2026-07-28) or draft-07. A tool whose schema cannot be normalized (it does
+ * not validate against its dialect, names an unsupported dialect, or
+ * references a remote schema) is dropped from the returned list and reported
+ * through `onDrop`; all other tools are kept. Returns `undefined` when no
+ * tools remain.
  */
-export function normalizeToolSchema(family: string, tools: OpenAiFunctionTool[] | undefined, onFix?: (tool: string, rule: string) => void) {
+export function normalizeToolSchema(family: string, tools: OpenAiFunctionTool[] | undefined, onFix?: (tool: string, rule: string) => void, onDrop?: (tool: string, reason: string) => void): OpenAiFunctionTool[] | undefined {
 	if (!tools?.length) {
 		return undefined;
 	}
@@ -29,28 +36,24 @@ export function normalizeToolSchema(family: string, tools: OpenAiFunctionTool[] 
 	for (const tool of tools) {
 		try {
 			const cloned = deepClone(tool);
+			const didFix = (msg: string) => onFix?.(cloned.function.name, msg);
 			for (const rule of fnRules) {
-				rule(family, cloned.function, msg => onFix?.(cloned.function.name, msg));
+				rule(family, cloned.function, didFix);
 			}
 
 			if (cloned.function.parameters) {
 				for (const rule of jsonSchemaRules) {
-					if (cloned.function.parameters) {
-						rule(family, cloned.function.parameters, msg => onFix?.(cloned.function.name, msg));
-					}
+					rule(family, cloned.function.parameters, didFix);
 				}
 			}
 
 			output.push(cloned);
 		} catch (e) {
-			const e2 = new Error(l10n.t`Failed to validate tool ${tool.function.name}: ${e}. Please open an issue for the MCP server or extension which provides this tool`);
-			e2.stack = e.stack;
-			throw e2;
+			onDrop?.(tool.function.name, e instanceof Error ? e.message : String(e));
 		}
 	}
 
-
-	return output;
+	return output.length ? output : undefined;
 }
 
 
@@ -79,29 +82,111 @@ const fnRules: ((family: string, node: OpenAiFunctionDef, didFix: (message: stri
 	},
 ];
 
-const ajvJsonValidator = new Lazy(() => {
-	const ajv = new Ajv({
-		coerceTypes: true,
-		strictTypes: true,
-		allowUnionTypes: true,
-	});
+const enum JsonSchemaDialect {
+	Draft07 = 'draft-07',
+	Draft2020_12 = '2020-12',
+}
+
+const jsonSchema2020_12MetaSchemaId = 'https://json-schema.org/draft/2020-12/schema';
+
+/**
+ * Returns the dialect named by the schema's `$schema`, or `undefined` when
+ * there is none (in which case the caller defaults to 2020-12). Throws for
+ * any dialect we cannot validate.
+ */
+function getDeclaredDialect(schema: JsonSchema): JsonSchemaDialect | undefined {
+	const declared = (schema as { $schema?: unknown }).$schema;
+	if (typeof declared !== 'string' || !declared) {
+		return undefined;
+	}
+
+	// Accept http(s) and an optional trailing `#` on both dialect URIs.
+	switch (declared.trim().replace(/^https?:\/\//, '').replace(/#$/, '')) {
+		case 'json-schema.org/draft/2020-12/schema':
+			return JsonSchemaDialect.Draft2020_12;
+		case 'json-schema.org/draft-07/schema':
+			return JsonSchemaDialect.Draft07;
+		default:
+			throw new Error(`unsupported JSON Schema dialect ${declared}`);
+	}
+}
+
+const ajvOptions: AjvOptions = {
+	coerceTypes: true,
+	strictTypes: true,
+	allowUnionTypes: true,
+};
+
+// Both validators get the same formats the draft-07 meta schema has always
+// needed. Neither Ajv instance sets `loadSchema`: tool schemas are only ever
+// validated as instances of a meta schema, never compiled, so no `$ref` they
+// contain is ever resolved or fetched.
+function addFormats<T extends Ajv>(ajv: T): T {
 	ajv.addFormat('uri', (value) => URL.canParse(value));
 	ajv.addFormat('regex', (value) => typeof value === 'string');
+	return ajv;
+}
 
-	return ajv.compile(jsonSchemaDraft7);
+const draft07Validator = new Lazy<ValidateFunction>(() => addFormats(new Ajv(ajvOptions)).compile(jsonSchemaDraft7));
+
+const draft2020_12Validator = new Lazy<ValidateFunction>(() => {
+	// Ajv2020 bundles the 2020-12 meta schema (and its vocabularies) and
+	// registers it under its canonical `$id`, so no copy needs to ship here.
+	const validate = addFormats(new Ajv2020(ajvOptions)).getSchema(jsonSchema2020_12MetaSchemaId);
+	if (!validate) {
+		throw new Error(`Ajv2020 did not register the ${jsonSchema2020_12MetaSchemaId} meta schema`);
+	}
+	return validate;
 });
+
+function formatAjvErrors(errors: ErrorObject[] | null | undefined): string {
+	return (errors ?? []).map(e => e.instancePath + ' ' + e.message).join('\n');
+}
 
 
 const jsonSchemaRules: ((family: string, node: JsonSchema, didFix: (message: string) => void) => void)[] = [
-	(_family, schema) => {
-		if (!ajvJsonValidator.value(schema)) {
-			throw new Error('tool parameters do not match JSON schema: ' + ajvJsonValidator.value.errors!.map(e => e.instancePath + ' ' + e.message).join('\n'));
+	(_family, schema, didFix) => {
+		const declared = getDeclaredDialect(schema);
+		if (declared === JsonSchemaDialect.Draft07) {
+			if (!draft07Validator.value(schema)) {
+				throw new Error('tool parameters do not match JSON schema (draft-07): ' + formatAjvErrors(draft07Validator.value.errors));
+			}
+			return;
 		}
+
+		if (draft2020_12Validator.value(schema)) {
+			return;
+		}
+		const errors2020 = formatAjvErrors(draft2020_12Validator.value.errors);
+
+		// A schema without `$schema` defaults to 2020-12, but servers written
+		// before that was the default commonly use draft-07 constructs (tuple
+		// `items`, say) without declaring a dialect. Keep those working.
+		if (declared === undefined && draft07Validator.value(schema)) {
+			didFix(`schema is not valid JSON Schema 2020-12 (${errors2020}) but is valid draft-07; treating it as draft-07`);
+			return;
+		}
+
+		throw new Error('tool parameters do not match JSON schema (2020-12): ' + errors2020);
 	},
 	(_family, schema) => {
+		// Meta schema validation only checks that a `$ref` is a string; it is
+		// never resolved. Anything but a local pointer would need a network
+		// fetch to mean anything to us or the model, so refuse it outright.
 		forEachSchemaNode(schema, n => {
-			if (n && 'type' in n && n.type === 'array' && !(n as ArrayJsonSchema).items) {
-				throw new Error('tool parameters array type must have items');
+			for (const keyword of ['$ref', '$dynamicRef'] as const) {
+				const ref = (n as SchemaRecord)[keyword];
+				if (typeof ref === 'string' && !ref.startsWith('#')) {
+					throw new Error(`tool parameters contain a remote ${keyword} '${ref}', which is not supported`);
+				}
+			}
+		});
+	},
+	(_family, schema, didFix) => {
+		forEachSchemaNode(schema, n => {
+			if ('type' in n && n.type === 'array' && (n as ArrayJsonSchema).items === undefined) {
+				(n as ArrayJsonSchema).items = {};
+				didFix('array schema has no items; defaulting to any');
 			}
 		});
 	},
@@ -109,7 +194,7 @@ const jsonSchemaRules: ((family: string, node: JsonSchema, didFix: (message: str
 		if (!isGpt4ish(family)) { return; }
 
 		forEachSchemaNode(schema, n => {
-			if (n && 'description' in n && n.description && n.description.length > gpt4oMaxStringLength) {
+			if ('description' in n && n.description && n.description.length > gpt4oMaxStringLength) {
 				n.description = n.description.substring(0, gpt4oMaxStringLength);
 				onFix(`object description is too long (truncated to ${gpt4oMaxStringLength} chars)`);
 			}
@@ -121,7 +206,7 @@ const jsonSchemaRules: ((family: string, node: JsonSchema, didFix: (message: str
 		forEachSchemaNode(schema, n => {
 			for (const key of Object.keys(n)) {
 				if (gpt4oUnsupportedSchemaKeywords.has(key)) {
-					delete (n as any)[key];
+					delete (n as SchemaRecord)[key];
 					onFix(`object has unsupported schema keyword '${key}'`);
 				}
 			}
@@ -133,13 +218,13 @@ const jsonSchemaRules: ((family: string, node: JsonSchema, didFix: (message: str
 		for (const key of unsupported) {
 			if (schema.hasOwnProperty(key)) {
 				onFix(`object has unsupported top-level schema keyword '${key}'`);
-				delete (schema as any)[key];
+				delete (schema as SchemaRecord)[key];
 			}
 		}
 	},
 	(_family, schema, onFix) => {
 		forEachSchemaNode(schema, n => {
-			if (n && typeof n === 'object' && (n as ObjectJsonSchema).type === 'object') {
+			if ((n as ObjectJsonSchema).type === 'object') {
 				const obj = n as ObjectJsonSchema;
 				if (obj.properties && typeof obj.properties === 'object' && obj.required && Array.isArray(obj.required)) {
 					obj.required = obj.required.filter(key => {
@@ -159,7 +244,7 @@ const jsonSchemaRules: ((family: string, node: JsonSchema, didFix: (message: str
 			return;
 		}
 		forEachSchemaNode(schema, n => {
-			if (n && typeof n === 'object' && (n as ArrayJsonSchema).type === 'array') {
+			if ((n as ArrayJsonSchema).type === 'array') {
 				const obj = n as ArrayJsonSchema;
 				if (obj.items && Array.isArray(obj.items)) {
 					onFix(`array schema has items as an array, which is not supported in Draft 2020-12`);
@@ -174,21 +259,22 @@ const jsonSchemaRules: ((family: string, node: JsonSchema, didFix: (message: str
 			return;
 		}
 		forEachSchemaNode(schema, n => {
-			if (n && typeof n === 'object' && 'type' in n && Array.isArray(n.type)) {
-				const types = n.type as string[];
+			const node = n as SchemaRecord;
+			if (Array.isArray(node.type)) {
+				const types = node.type as string[];
 				const hasNull = types.includes('null');
 				const nonNullTypes = types.filter(t => t !== 'null');
 
 				if (hasNull && nonNullTypes.length === 1) {
 					// Convert ["string", "null"] to { type: "string", nullable: true }
-					(n as any).type = nonNullTypes[0];
-					(n as any).nullable = true;
+					node.type = nonNullTypes[0];
+					node.nullable = true;
 					onFix(`converted nullable type array to OpenAPI nullable keyword for Gemini compatibility`);
 				} else if (hasNull && nonNullTypes.length > 1) {
 					// For multiple non-null types with null, we can't easily convert, so we remove null.
 					// This changes the schema semantics: the field is no longer nullable and values of `null`
 					// will fail validation. This is a limitation, but better than a blank 400 error from the model.
-					(n as any).type = nonNullTypes;
+					node.type = nonNullTypes;
 					onFix(`removed null from multi-type union for Gemini compatibility; this makes the field non-nullable and may cause validation errors for callers that pass null`);
 				}
 			}
@@ -196,42 +282,53 @@ const jsonSchemaRules: ((family: string, node: JsonSchema, didFix: (message: str
 	},
 ];
 
+/** A schema node viewed as a plain record, for keywords `JsonSchema` does not model (2020-12 ones in particular). */
+type SchemaRecord = { [keyword: string]: unknown };
 
-function forEachSchemaNode<T>(input: JsonSchema, fn: (node: JsonSchema) => undefined | T): T | undefined {
-	if (!input || typeof input !== 'object') {
+/**
+ * Calls `fn` on the schema and then on every sub-schema reachable through
+ * draft-07 and 2020-12 applicator keywords (depth first; `fn` runs on a node
+ * before its children are collected, so keywords `fn` deletes are not
+ * traversed). Booleans and non-schema values (e.g. the string arrays
+ * `dependencies` may hold) are skipped.
+ */
+function forEachSchemaNode(input: unknown, fn: (node: JsonSchema) => void): void {
+	if (!input || typeof input !== 'object' || Array.isArray(input)) {
 		return;
 	}
 
-	const r = fn(input);
-	if (r !== undefined) {
-		return r;
+	fn(input as JsonSchema);
+
+	for (const child of getSubSchemas(input as SchemaRecord)) {
+		forEachSchemaNode(child, fn);
 	}
+}
 
-	const children: (JsonSchema | JsonSchema[] | undefined)[] = [
-		'properties' in input ? Object.values((input as ObjectJsonSchema).properties || {}) : undefined,
-		'items' in input ? (Array.isArray(input.items) ? input.items : [input.items]) : undefined,
-		'dependencies' in input ? Object.values((input as ObjectJsonSchema).dependencies || {}) : undefined,
-		'patternProperties' in input ? Object.values((input as ObjectJsonSchema).patternProperties || {}) : undefined,
-		'additionalProperties' in input ? [(input as ObjectJsonSchema).additionalProperties] : undefined,
-		'anyOf' in input ? input.anyOf : undefined,
-		'allOf' in input ? input.allOf : undefined,
-		'oneOf' in input ? input.oneOf : undefined,
-		'not' in input ? input.not : undefined,
-		'if' in input ? input.if : undefined,
-		'then' in input ? input.then : undefined,
-		'else' in input ? input.else : undefined,
-		'contains' in input ? (input as ArrayJsonSchema).contains : undefined,
-	];
-
-	for (const child of children) {
-		for (const value of (Array.isArray(child) ? child : Iterable.single(child))) {
-			const r = forEachSchemaNode(value, fn);
-
-			if (r !== undefined) {
-				return r;
-			}
+function getSubSchemas(schema: SchemaRecord): unknown[] {
+	const children: unknown[] = [];
+	// Keywords whose value maps names to schemas.
+	for (const keyword of ['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas', 'dependencies']) {
+		const map = schema[keyword];
+		if (map && typeof map === 'object' && !Array.isArray(map)) {
+			children.push(...Object.values(map));
 		}
 	}
+	// Keywords whose value is a schema or (draft-07 `items`) a list of schemas.
+	for (const keyword of ['items', 'prefixItems', 'anyOf', 'allOf', 'oneOf']) {
+		const value = schema[keyword];
+		if (Array.isArray(value)) {
+			children.push(...value);
+		} else if (value !== undefined) {
+			children.push(value);
+		}
+	}
+	// Keywords whose value is a single schema.
+	for (const keyword of ['additionalProperties', 'additionalItems', 'unevaluatedProperties', 'unevaluatedItems', 'propertyNames', 'contains', 'not', 'if', 'then', 'else']) {
+		if (schema[keyword] !== undefined) {
+			children.push(schema[keyword]);
+		}
+	}
+	return children;
 }
 
 // Whether the model is a GPT-4 family model.

@@ -1,0 +1,59 @@
+{
+	"name": "mcp-e2e",
+	"publisher": "vscode-e2e",
+	"displayName": "MCP end-to-end (llama.cpp)",
+	"description": "Drives VS Code's MCP client with a llama.cpp model in the end-to-end tests of test/mcp-e2e.",
+	"version": "0.0.1",
+	"private": true,
+	"license": "MIT",
+	"engines": {
+		"vscode": "^1.100.0"
+	},
+	"main": "./out/extension.js",
+	"activationEvents": [
+		"onStartupFinished",
+		"onLanguageModelChatProvider:llamacpp"
+	],
+	"enabledApiProposals": [
+		"chatParticipantAdditions",
+		"chatParticipantPrivate",
+		"mcpGrpcServerDefinition",
+		"mcpServerDefinitions"
+	],
+	"contributes": {
+		"languageModelChatProviders": [
+			{
+				"vendor": "llamacpp",
+				"displayName": "llama.cpp (E2E)"
+			}
+		],
+		"mcpServerDefinitionProviders": [
+			{
+				"id": "e2e-grpc",
+				"label": "E2E gRPC provider"
+			}
+		],
+		"chatParticipants": [
+			{
+				"id": "mcp-e2e.e2e",
+				"name": "e2e",
+				"fullName": "MCP E2E",
+				"description": "Calls MCP tools for the end-to-end tests: /call one tool directly, or /ask the llama.cpp model",
+				"commands": [
+					{
+						"name": "call",
+						"description": "Call one MCP tool directly (no model): /call <server> <tool> [<JSON object>]"
+					},
+					{
+						"name": "ask",
+						"description": "Let the llama.cpp model call MCP tools: /ask [<server>] <task> (the #-referenced tools, or else those of <server>)"
+					},
+					{
+						"name": "tools",
+						"description": "List the MCP tools of a server: /tools <server>"
+					}
+				]
+			}
+		]
+	}
+}

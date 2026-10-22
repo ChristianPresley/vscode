@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import type * as http from 'http';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { URI } from '../../../../base/common/uri.js';
 import { NullLogger } from '../../../../platform/log/common/log.js';
@@ -78,6 +79,82 @@ function appUriForAuthority(authority: string): URI {
 		query: 'nonce=NONCE123'
 	});
 }
+
+suite('LoopbackAuthServer - authorization response', () => {
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	/**
+	 * GETs a URL without following a redirect, as the browser's request reaches the server. Node's http rather
+	 * than fetch: in the Electron unit-test renderer a manual-redirect fetch hides the status and the headers.
+	 */
+	async function get(url: string): Promise<{ status: number; location: string | null; body: string }> {
+		const { get: httpGet } = await import('http');
+		return new Promise((resolve, reject) => {
+			// A fresh connection each time: a kept-alive one may belong to a server an earlier test stopped.
+			httpGet(url, { agent: false }, (res: http.IncomingMessage) => {
+				let body = '';
+				res.setEncoding('utf8');
+				res.on('data', chunk => body += chunk);
+				res.on('end', () => resolve({ status: res.statusCode ?? 0, location: res.headers.location ?? null, body }));
+			}).on('error', reject);
+		});
+	}
+
+	/** Starts a server, sends it one redirect and reports the browser's answer and what the caller would receive. */
+	async function respond(query: (state: string) => string): Promise<{ status: number; location: string | null; result: unknown; state: string }> {
+		const server = new LoopbackAuthServer(new NullLogger(), URI.parse('vscode://dynamicauthprovider/as.example/redirect'), 'Test');
+		await server.start();
+		try {
+			const response = await get(`${server.redirectUri}?${query(server.state)}`);
+			const result = await Promise.race([server.waitForOAuthResponse(), new Promise(resolve => setTimeout(() => resolve('pending'), 50))]);
+			return { status: response.status, location: response.location, result, state: server.state };
+		} finally {
+			await server.stop();
+		}
+	}
+
+	test('resolves the form-decoded code, state, iss and error for the caller to validate', async () => {
+		const ok = await respond(state => `code=the%2Bcode&state=${encodeURIComponent(state)}&iss=${encodeURIComponent('https://as.example/')}`);
+		const denied = await respond(state => `error=access_denied&error_description=Nope+not+today&state=${encodeURIComponent(state)}&iss=${encodeURIComponent('https://as.example')}`);
+		const forged = await respond(() => 'code=the-code&state=someone-elses');
+		assert.deepStrictEqual([ok, denied, forged].map(r => ({ status: r.status, location: r.location, result: r.result })), [
+			{ status: 302, location: '/done', result: { code: 'the+code', state: ok.state, iss: 'https://as.example/', error: undefined, errorDescription: undefined } },
+			// The browser learns only that sign-in did not complete: the issuer is not validated yet.
+			{ status: 302, location: '/done?error=1', result: { code: undefined, state: denied.state, iss: 'https://as.example', error: 'access_denied', errorDescription: 'Nope not today' } },
+			// The caller rejects the mismatching state.
+			{ status: 302, location: '/done?error=1', result: { code: 'the-code', state: 'someone-elses', iss: undefined, error: undefined, errorDescription: undefined } },
+		]);
+	});
+
+	test('the page never shows what the authorization server sent, only a generic failure message', async () => {
+		const server = new LoopbackAuthServer(new NullLogger(), URI.parse('vscode://dynamicauthprovider/as.example/redirect'), 'Test');
+		await server.start();
+		try {
+			const origin = server.redirectUri.replace(/\/$/, '');
+			const redirect = await get(`${server.redirectUri}?error=access_denied&error_description=${encodeURIComponent('<b>Call 555-0100 to unlock</b>')}&error_uri=${encodeURIComponent('https://evil.example/help')}&state=${encodeURIComponent(server.state)}&iss=${encodeURIComponent('https://evil.example')}`);
+			const failedPage = (await get(`${origin}${redirect.location}`)).body;
+			// A crafted page URL cannot inject text either.
+			const craftedPage = (await get(`${origin}/done?error=${encodeURIComponent('Call 555-0100 to unlock')}`)).body;
+			const successPage = (await get(`${origin}/done`)).body;
+			const shows = (html: string) => ({
+				authorizationServerText: ['555-0100', 'access_denied', 'evil.example'].some(text => html.includes(text)),
+				genericFailure: html.includes('Sign-in did not complete. Return to Test for details.') && html.includes('<body class="error">'),
+			});
+			assert.deepStrictEqual([shows(failedPage), shows(craftedPage), shows(successPage)], [
+				{ authorizationServerText: false, genericFailure: true },
+				{ authorizationServerText: false, genericFailure: true },
+				{ authorizationServerText: false, genericFailure: false },
+			]);
+		} finally {
+			await server.stop();
+		}
+	});
+
+	test('ignores a request that is neither a code nor an error', async () => {
+		const empty = await respond(() => 'foo=bar');
+		assert.deepStrictEqual({ status: empty.status, result: empty.result }, { status: 400, result: 'pending' });
+	});
+});
 
 suite('LoopbackAuthServer - getHtml', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();

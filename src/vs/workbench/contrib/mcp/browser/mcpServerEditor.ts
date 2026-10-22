@@ -757,13 +757,38 @@ export class McpServerEditor extends EditorPane {
 				const envFileValue = append(envFileSection, $('code.config-value'));
 				envFileValue.textContent = config.envFile;
 			}
-		} else if (config.type === McpServerType.REMOTE) {
+		} else {
 			// URL
 			const urlSection = append(container, $('.config-section'));
 			const urlLabel = append(urlSection, $('.config-label'));
 			urlLabel.textContent = localize('url', "URL:");
 			const urlValue = append(urlSection, $('code.config-value'));
 			urlValue.textContent = config.url;
+
+			if (config.type === McpServerType.GRPC) {
+				// Transport and binding
+				const transportSection = append(container, $('.config-section'));
+				const transportLabel = append(transportSection, $('.config-label'));
+				transportLabel.textContent = localize('transport', "Transport:");
+				const transportValue = append(transportSection, $('.config-value'));
+				transportValue.textContent = localize('transportGrpc', "gRPC");
+
+				const bindingSection = append(container, $('.config-section'));
+				const bindingLabel = append(bindingSection, $('.config-label'));
+				bindingLabel.textContent = localize('grpcBinding', "Binding:");
+				const bindingValue = append(bindingSection, $('code.config-value'));
+				bindingValue.textContent = config.binding ?? 'auto';
+
+				if (config.tls) {
+					const tlsSection = append(container, $('.config-section'));
+					const tlsLabel = append(tlsSection, $('.config-label'));
+					tlsLabel.textContent = localize('grpcTls', "TLS:");
+					const tlsValue = append(tlsSection, $('.config-value'));
+					for (const [key, value] of Object.entries(config.tls)) {
+						append(tlsValue, $('code.env-entry', undefined, `${key}: ${value ?? ''}`));
+					}
+				}
+			}
 
 			// Headers (if present)
 			if (config.headers && Object.keys(config.headers).length > 0) {

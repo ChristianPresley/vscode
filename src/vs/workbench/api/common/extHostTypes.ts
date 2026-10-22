@@ -4328,6 +4328,30 @@ export class McpHttpServerDefinition implements vscode.McpHttpServerDefinition {
 		public authentication?: { providerId: string; scopes: string[] },
 	) { }
 }
+
+export enum McpGrpcBinding {
+	/** The default: the JSON-RPC tunnel. The editor never switches to the typed service on its own. */
+	Auto = 1,
+	/** The JSON-RPC tunnel `/mcp.zig.transport.v1.Mcp/Call`. */
+	Tunnel = 2,
+	/** Google's typed `model_context_protocol.Mcp` service, only when it is asked for. */
+	Typed = 3,
+}
+
+export class McpGrpcServerDefinition extends McpHttpServerDefinition implements vscode.McpGrpcServerDefinition {
+	keepAliveMs?: number;
+
+	constructor(
+		label: string,
+		uri: URI,
+		headers: Record<string, string> = {},
+		version?: string,
+		public readonly tls?: { ca?: string; insecure?: boolean; serverName?: string },
+		public readonly binding?: McpGrpcBinding,
+	) {
+		super(label, uri, headers, version);
+	}
+}
 //#endregion
 
 //#region Chat Prompt Files

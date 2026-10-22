@@ -1,0 +1,269 @@
+name: MCP Conformance
+
+# Runs the official MCP conformance suite against VS Code's MCP client and the
+# MCP gateway fixture (the client and server legs of test/mcp-conformance/run.ts),
+# and the static checks of the MCP code. pr.yml calls it once per OS with
+# `affected` from the `mcp` rule of .github/actions/detect-changes/detect.ts;
+# the push paths below are the same list (test/mcp-conformance/run.test.ts
+# checks that they agree).
+
+on:
+  workflow_call:
+    inputs:
+      job_name:
+        description: Names the uploaded results of the conformance job
+        type: string
+        required: false
+        default: mcp-conformance
+      os:
+        description: Runner image of the conformance job
+        type: string
+        required: false
+        default: ubuntu-latest
+      affected:
+        description: Whether the pull request can affect the MCP code; the jobs are skipped when false
+        type: boolean
+        required: false
+        default: true
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/vs/platform/mcp/**'
+      - 'src/vs/workbench/contrib/mcp/**'
+      - 'src/vs/workbench/api/common/extHostMcp.ts'
+      - 'src/vs/workbench/api/node/extHostMcpNode.ts'
+      - 'src/vs/workbench/api/node/extHostMcpGrpc.ts'
+      - 'src/vs/workbench/api/node/mcpConformance*.ts'
+      - 'src/vs/workbench/api/common/mcpOAuthClientFactory.ts'
+      - 'src/vs/workbench/api/browser/mainThreadMcp.ts'
+      - 'src/vs/base/common/oauth.ts'
+      - 'src/vs/base/common/oauthClient.ts'
+      - 'src/vs/base/common/jsonRpcProtocol.ts'
+      - 'src/vs/base/common/jsonSchemaValidator/**'
+      - 'src/vs/base/common/protobuf/**'
+      - 'src/vs/base/common/grpc/**'
+      - 'src/vs/base/common/sseParser.ts'
+      - 'src/vs/base/common/envfile.ts'
+      - 'src/vs/base/node/grpcChannel.ts'
+      - 'src/vs/base/node/grpcServer.ts'
+      - 'build/mcp/**'
+      - 'test/mcp-conformance/**'
+      - 'test/mcp-grpc/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/mcp-conformance.yml'
+      - '.github/workflows/mcp-grpc-interop.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mcp-conformance:
+    # GitHub does not evaluate expressions in the name of a skipped job, so the
+    # name stays fixed and the check reports as "<caller> / Conformance".
+    name: Conformance
+    # Skip this job rather than the calling job: a skipped job still reports
+    # "<caller> / <job name>". Pushes and manual runs have no inputs and always run.
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || inputs.affected }}
+    runs-on: ${{ inputs.os || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout microsoft/vscode
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install build dependencies
+        working-directory: build
+        run: |
+          set -e
+
+          for i in {1..5}; do # try 5 times
+            npm ci && break
+            if [ $i -eq 5 ]; then
+              echo "Npm install failed too many times" >&2
+              exit 1
+            fi
+            echo "Npm install failed $i, trying again..."
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          set -e
+
+          for i in {1..5}; do # try 5 times
+            npm ci --ignore-scripts --no-workspaces && break
+            if [ $i -eq 5 ]; then
+              echo "Npm install failed too many times" >&2
+              exit 1
+            fi
+            echo "Npm install failed $i, trying again..."
+          done
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Transpile client
+        run: npm run transpile-client
+
+      - name: Install the MCP conformance suite
+        run: npm ci --prefix test/mcp-conformance --no-audit --no-fund
+
+      - name: 🧪 Test the conformance harness
+        run: node --test test/mcp-conformance/run.test.ts
+
+      - name: 🧪 Run the MCP conformance suite
+        run: node test/mcp-conformance/run.ts all --out .build/conformance-results
+
+      - name: Check the requirement matrix
+        if: ${{ !cancelled() }}
+        run: node test/mcp-conformance/run.ts check-matrix
+
+      - name: Publish conformance results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
+        with:
+          name: ${{ inputs.job_name || 'mcp-conformance' }}-results-${{ runner.os }}-${{ github.run_attempt }}
+          path: .build/conformance-results
+          if-no-files-found: ignore
+
+  mcp-static-checks:
+    name: Static Checks
+    # The checks do not depend on the OS: when pr.yml calls this workflow for
+    # several runners, only the Ubuntu call runs them.
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (inputs.affected && startsWith(inputs.os || 'ubuntu-latest', 'ubuntu')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout microsoft/vscode
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A pull request is checked out as its merge commit; the ESLint step
+          # diffs it against its first parent, the base branch.
+          fetch-depth: 2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install build dependencies
+        working-directory: build
+        run: |
+          set -e
+
+          for i in {1..5}; do # try 5 times
+            npm ci && break
+            if [ $i -eq 5 ]; then
+              echo "Npm install failed too many times" >&2
+              exit 1
+            fi
+            echo "Npm install failed $i, trying again..."
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          set -e
+
+          for i in {1..5}; do # try 5 times
+            npm ci --ignore-scripts --no-workspaces && break
+            if [ $i -eq 5 ]; then
+              echo "Npm install failed too many times" >&2
+              exit 1
+            fi
+            echo "Npm install failed $i, trying again..."
+          done
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare Electron types
+        run: node build/npm/electronTypes.ts
+
+      - name: Type check
+        run: npm run typecheck-client
+
+      - name: Check layers
+        if: ${{ !cancelled() }}
+        run: npm run valid-layers-check
+
+      - name: Check the MCP schema
+        if: ${{ !cancelled() }}
+        run: npm run mcp:check-schema
+
+      - name: ESLint
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -e
+
+          # The TypeScript of the push paths above, the tests of the OAuth helpers and
+          # of the loopback server, and the end-to-end harness.
+          targets=(
+            src/vs/platform/mcp
+            src/vs/workbench/contrib/mcp
+            src/vs/workbench/api/common/extHostMcp.ts
+            src/vs/workbench/api/common/mcpOAuthClientFactory.ts
+            src/vs/workbench/api/browser/mainThreadMcp.ts
+            src/vs/workbench/api/node/extHostMcpNode.ts
+            src/vs/workbench/api/node/extHostMcpGrpc.ts
+            'src/vs/workbench/api/node/mcpConformance*.ts'
+            src/vs/workbench/api/test/node/loopbackServer.test.ts
+            src/vs/base/common/oauth.ts
+            src/vs/base/common/oauthClient.ts
+            src/vs/base/test/common/oauthProtocolHelpers.test.ts
+            src/vs/base/common/jsonRpcProtocol.ts
+            src/vs/base/common/jsonSchemaValidator
+            src/vs/base/common/protobuf
+            src/vs/base/common/grpc
+            src/vs/base/common/sseParser.ts
+            src/vs/base/common/envfile.ts
+            src/vs/base/node/grpcChannel.ts
+            src/vs/base/node/grpcServer.ts
+            build/mcp
+            test/mcp-conformance
+            test/mcp-grpc
+            test/mcp-e2e
+          )
+
+          # A pull request also lints every TypeScript file it changes: the diff of
+          # its merge commit against the base branch, as `git diff main...HEAD` lists
+          # them. Files that ESLint ignores (the vendored schema) are left out, since
+          # naming one is a warning.
+          if [ "$EVENT_NAME" = pull_request ] && git rev-parse --verify --quiet HEAD^2 > /dev/null; then
+            changed=$(git diff --name-only --diff-filter=d HEAD^1 HEAD -- '*.ts')
+            if [ -n "$changed" ]; then
+              mapfile -t changed_files <<< "$changed"
+              lintable=$(node --input-type=module -e "import { ESLint } from 'eslint'; const eslint = new ESLint(); for (const file of process.argv.slice(1)) { if (!(await eslint.isPathIgnored(file))) { console.log(file); } }" -- "${changed_files[@]}")
+              if [ -n "$lintable" ]; then
+                mapfile -t lintable_files <<< "$lintable"
+                echo "Also linting the ${#lintable_files[@]} TypeScript files the pull request changes."
+                targets+=("${lintable_files[@]}")
+              fi
+            fi
+          fi
+
+          npm run eslint -- "${targets[@]}"
+
+      - name: Hygiene
+        if: ${{ !cancelled() }}
+        run: npm run hygiene
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

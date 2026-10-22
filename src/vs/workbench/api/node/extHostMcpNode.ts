@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
+import { JsonRpcId } from '../../../base/common/jsonRpcProtocol.js';
 import { readFile } from 'fs/promises';
 import { homedir } from 'os';
 import type { RequestInit as UndiciRequestInit } from 'undici';
@@ -18,20 +19,24 @@ import { StreamSplitter } from '../../../base/node/nodeStreams.js';
 import { findExecutable } from '../../../base/node/processes.js';
 import { LogLevel } from '../../../platform/log/common/log.js';
 import { expandEnvironmentVariablesInLaunch } from '../../contrib/mcp/common/mcpEnvironmentVariableExpansion.js';
-import { McpConnectionState, McpServerEnvironmentVariableExpansion, McpServerLaunch, McpServerTransportStdio, McpServerTransportType } from '../../contrib/mcp/common/mcpTypes.js';
+import { IMcpMessageEnvelope, McpConnectionState, McpServerEnvironmentVariableExpansion, McpServerLaunch, McpServerTransportStdio, McpServerTransportType } from '../../contrib/mcp/common/mcpTypes.js';
 import { McpStdioStateHandler } from '../../contrib/mcp/node/mcpStdioStateHandler.js';
 import { CommonRequestInit, CommonResponse, ExtHostMcpService, McpHTTPHandle } from '../common/extHostMcp.js';
+import { McpGrpcHandle } from './extHostMcpGrpc.js';
 
 export class NodeExtHostMpcService extends ExtHostMcpService {
 	private nodeServers = this._register(new DisposableMap<number, McpStdioStateHandler>());
 
-	protected override _startMcp(id: number, launch: McpServerLaunch, defaultCwd?: URI, errorOnUserInteraction?: boolean): void {
+	protected override _startMcp(id: number, launch: McpServerLaunch, defaultCwd?: URI, errorOnUserInteraction?: boolean): void | Promise<void> {
 		if (launch.type === McpServerTransportType.Stdio) {
-			this.startNodeMpc(id, launch, defaultCwd);
+			// A rejection reaches `$startMcp`, which reports the Error state.
+			return this.startNodeMpc(id, launch, defaultCwd);
 		} else if (launch.type === McpServerTransportType.HTTP) {
 			this._sseEventSources.set(id, new McpHTTPHandleNode(id, launch, this._proxy, this._logService, errorOnUserInteraction));
+		} else if (launch.type === McpServerTransportType.Grpc) {
+			this._sseEventSources.set(id, new McpGrpcHandle(id, launch, this._proxy, this._logService, errorOnUserInteraction));
 		} else {
-			super._startMcp(id, launch, defaultCwd, errorOnUserInteraction);
+			return super._startMcp(id, launch, defaultCwd, errorOnUserInteraction);
 		}
 	}
 
@@ -51,12 +56,20 @@ export class NodeExtHostMpcService extends ExtHostMcpService {
 		}
 	}
 
-	override $sendMessage(id: number, message: string): void {
+	override $sendMessage(id: number, message: string, envelope?: IMcpMessageEnvelope): void {
 		const nodeServer = this.nodeServers.get(id);
 		if (nodeServer) {
+			// stdio frames carry no envelope: the era shows in the message itself.
 			nodeServer.write(message);
 		} else {
-			super.$sendMessage(id, message);
+			super.$sendMessage(id, message, envelope);
+		}
+	}
+
+	override $cancelRequest(id: number, requestId: JsonRpcId): void {
+		if (!this.nodeServers.has(id)) {
+			// stdio has no per-request stream to abort; the engine sends notifications/cancelled instead.
+			super.$cancelRequest(id, requestId);
 		}
 	}
 

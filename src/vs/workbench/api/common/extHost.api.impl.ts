@@ -1972,9 +1972,9 @@ export function createApiFactoryAndRegisterActors(accessor: ServicesAccessor): I
 				checkProposedApiEnabled(extension, 'mcpServerDefinitions');
 				return extHostMcp.mcpServerDefinitions;
 			},
-			startMcpGateway(chatSessionResource?: URI) {
+			startMcpGateway(chatSessionResource?: URI, options?: vscode.McpGatewayStartOptions) {
 				checkProposedApiEnabled(extension, 'mcpServerDefinitions');
-				return extHostMcp.startMcpGateway(chatSessionResource);
+				return extHostMcp.startMcpGateway(chatSessionResource, options);
 			},
 			onDidChangeChatRequestTools(...args) {
 				checkProposedApiEnabled(extension, 'chatParticipantAdditions');
@@ -2341,6 +2341,8 @@ export function createApiFactoryAndRegisterActors(accessor: ServicesAccessor): I
 			ChatInputNotificationSeverity: extHostTypes.ChatInputNotificationSeverity,
 			McpHttpServerDefinition: extHostTypes.McpHttpServerDefinition,
 			McpHttpServerDefinition2: extHostTypes.McpHttpServerDefinition,
+			McpGrpcServerDefinition: extHostTypes.McpGrpcServerDefinition,
+			McpGrpcBinding: extHostTypes.McpGrpcBinding,
 			McpStdioServerDefinition: extHostTypes.McpStdioServerDefinition,
 			McpStdioServerDefinition2: extHostTypes.McpStdioServerDefinition,
 			McpToolAvailability: extHostTypes.McpToolAvailability,

@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { fetchAuthorizationServerMetadata, IAuthorizationServerMetadata } from '../../../base/common/oauth.js';
+import { fetchAuthorizationServerMetadata, IAuthorizationServerMetadata, issuerToleranceForIdentifier } from '../../../base/common/oauth.js';
 import { CancellationToken } from '../../../base/common/cancellation.js';
 import { createDecorator } from '../../instantiation/common/instantiation.js';
 import { asText, IRequestService } from '../../request/common/request.js';
@@ -30,8 +30,17 @@ export class AgentHostMcpOAuthMetadataService implements IAgentHostMcpOAuthMetad
 		@IRequestService private readonly requestService: IRequestService,
 	) { }
 
+	/**
+	 * The metadata of `authorizationServer`, whose `issuer` must be that
+	 * identifier (RFC 8414 section 3.3; for a bare origin with or without its
+	 * trailing slash): a document naming another issuer is skipped, as the MCP
+	 * transport's discovery does, and the discovery fails with an
+	 * `OAuthIssuerMismatchError` when no other document matches.
+	 */
 	async fetch(authorizationServer: string): Promise<IAgentHostMcpOAuthMetadata> {
 		const { metadata, discoveryUrl } = await fetchAuthorizationServerMetadata(authorizationServer, {
+			validateIssuer: true,
+			issuerTolerance: issuerToleranceForIdentifier(authorizationServer),
 			fetch: async (url, init) => {
 				const context = await this.requestService.request({
 					url,

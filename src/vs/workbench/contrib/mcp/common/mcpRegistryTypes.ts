@@ -13,8 +13,8 @@ import { StorageScope } from '../../../../platform/storage/common/storage.js';
 import { IWorkspaceFolderData } from '../../../../platform/workspace/common/workspace.js';
 import { IResolvedValue } from '../../../services/configurationResolver/common/configurationResolverExpression.js';
 import { McpTaskManager } from './mcpTaskManager.js';
-import { IMcpServerConnection, LazyCollectionState, McpCollectionDefinition, McpCollectionReference, McpConnectionState, McpDefinitionReference, McpServerDefinition, McpServerLaunch, McpStartServerInteraction } from './mcpTypes.js';
-import { MCP } from './modelContextProtocol.js';
+import { JsonRpcId, JsonRpcMessage } from '../../../../base/common/jsonRpcProtocol.js';
+import { IMcpMessageEnvelope, IMcpRequestAbort, IMcpServerConnection, LazyCollectionState, McpCollectionDefinition, McpCollectionReference, McpConnectionState, McpDefinitionReference, McpServerDefinition, McpServerLaunch, McpStartServerInteraction } from './mcpTypes.js';
 
 export const IMcpRegistry = createDecorator<IMcpRegistry>('mcpRegistry');
 
@@ -22,8 +22,19 @@ export const IMcpRegistry = createDecorator<IMcpRegistry>('mcpRegistry');
 export interface IMcpMessageTransport extends IDisposable {
 	readonly state: IObservable<McpConnectionState>;
 	readonly onDidLog: Event<{ level: LogLevel; message: string }>;
-	readonly onDidReceiveMessage: Event<MCP.JSONRPCMessage>;
-	send(message: MCP.JSONRPCMessage): void;
+	readonly onDidReceiveMessage: Event<JsonRpcMessage>;
+	/**
+	 * Fired when the transport can no longer deliver a response for a request
+	 * it sent (see {@link IMcpRequestAbort}). Optional: stdio never aborts.
+	 */
+	readonly onDidAbortRequest?: Event<IMcpRequestAbort>;
+	/**
+	 * Sends a message. The envelope carries the protocol era and the mirrored
+	 * headers; without one the message goes out exactly as legacy traffic.
+	 */
+	send(message: JsonRpcMessage, envelope?: IMcpMessageEnvelope): void;
+	/** Cancels a request at the transport level (aborts its HTTP request or gRPC stream). Optional. */
+	cancelRequest?(requestId: JsonRpcId): void;
 	stop(): void;
 }
 

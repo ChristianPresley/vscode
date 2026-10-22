@@ -146,7 +146,7 @@ import { ICSSDevelopmentService, CSSDevelopmentService } from '../../platform/cs
 import { INativeMcpDiscoveryHelperService, NativeMcpDiscoveryHelperChannelName } from '../../platform/mcp/common/nativeMcpDiscoveryHelper.js';
 import { NativeMcpDiscoveryHelperService } from '../../platform/mcp/node/nativeMcpDiscoveryHelperService.js';
 import { IMcpGatewayService, McpGatewayChannelName } from '../../platform/mcp/common/mcpGateway.js';
-import { McpGatewayService } from '../../platform/mcp/node/mcpGatewayService.js';
+import { mcpGatewayServiceDescriptor } from '../../platform/mcp/node/mcpGatewayService.js';
 import { McpGatewayChannel } from '../../platform/mcp/node/mcpGatewayChannel.js';
 import { IWebContentExtractorService } from '../../platform/webContentExtractor/common/webContentExtractor.js';
 import { NativeWebContentExtractorService } from '../../platform/webContentExtractor/electron-main/webContentExtractorService.js';
@@ -1359,7 +1359,9 @@ export class CodeApplication extends Disposable {
 			process.env,
 			() => this.resolveShellEnvironment(this.environmentMainService.args, process.env, false),
 		]));
-		services.set(IMcpGatewayService, new SyncDescriptor(McpGatewayService));
+		// HTTP, and gRPC for the gateways that ask for it (no gRPC port until one does);
+		// both on loopback: every call names its (random) route id.
+		services.set(IMcpGatewayService, mcpGatewayServiceDescriptor({ grpc: true }));
 
 		// Dev Only: CSS service (for ESM)
 		services.set(ICSSDevelopmentService, new SyncDescriptor(CSSDevelopmentService, undefined, true));

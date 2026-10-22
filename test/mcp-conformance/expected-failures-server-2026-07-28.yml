@@ -1,0 +1,6 @@
+# Known failures of the scored server scenarios of `--requirements 2026-07-28`,
+# run against the MCP gateway fixture
+# (out/vs/platform/mcp/node/mcpGatewayConformanceMain.js, milestone M6), which
+# run.ts starts for the server leg. Every scored server scenario passes, so the
+# list is empty; an entry names one check, `<scenario>:<check-id>`.
+server: []

@@ -18,18 +18,43 @@ import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { ChatConfiguration } from '../../chat/common/constants.js';
-import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessagePart, ILanguageModelsService } from '../../chat/common/languageModels.js';
+import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessagePart, IChatMessageToolResultPart, IChatResponsePart, ILanguageModelChatRequestOptions, ILanguageModelsService } from '../../chat/common/languageModels.js';
 import { McpCommandIds } from './mcpCommandIds.js';
 import { IMcpServerSamplingConfiguration, mcpServerSamplingSection } from './mcpConfiguration.js';
 import { McpSamplingLog } from './mcpSamplingLog.js';
 import { IMcpSamplingService, IMcpServer, ISamplingOptions, ISamplingResult, McpError } from './mcpTypes.js';
-import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
 const enum ModelMatch {
 	UnsureAllowedDuringChat,
 	UnsureAllowedOutsideChat,
 	NotAllowed,
 	NoMatchingModel,
+}
+
+/**
+ * Tool-selection modes of the language model API. This mirrors
+ * `vscode.LanguageModelChatToolMode`: the request options are forwarded to the
+ * model provider as-is, so the numeric values must stay in sync with it. The
+ * enum lives in the extension host types, which a workbench contribution
+ * cannot import.
+ */
+const enum LanguageModelChatToolMode {
+	Auto = 1,
+	Required = 2,
+}
+
+/** A tool offered to the language model, in the shape of `vscode.LanguageModelChatTool`. */
+interface ILanguageModelChatToolDefinition {
+	readonly name: string;
+	readonly description: string;
+	readonly inputSchema?: object;
+}
+
+/** A sampling request translated for the language model API. */
+interface ISamplingLanguageModelRequest {
+	readonly messages: IChatMessage[];
+	readonly options: ILanguageModelChatRequestOptions;
 }
 
 export class McpSamplingService extends Disposable implements IMcpSamplingService {
@@ -57,61 +82,47 @@ export class McpSamplingService extends Disposable implements IMcpSamplingServic
 	}
 
 	async sample(opts: ISamplingOptions, token = CancellationToken.None): Promise<ISamplingResult> {
-		const messages = opts.params.messages.map((message): IChatMessage | undefined => {
-			const content: IChatMessagePart[] = asArray(message.content).map((part): IChatMessagePart | undefined => part.type === 'text'
-				? { type: 'text', value: part.text }
-				: part.type === 'image' || part.type === 'audio'
-					? { type: 'image_url', value: { mimeType: part.mimeType as ChatImageMimeType, data: decodeBase64(part.data) } }
-					: undefined
-			).filter(isDefined);
-
-			if (!content.length) {
-				return undefined;
-			}
-			return {
-				role: message.role === 'assistant' ? ChatMessageRole.Assistant : ChatMessageRole.User,
-				content,
-			};
-		}).filter(isDefined);
-
-		if (opts.params.systemPrompt) {
-			messages.unshift({ role: ChatMessageRole.System, content: [{ type: 'text', value: opts.params.systemPrompt }] });
-		}
+		// Translate (and validate) the request before any model is selected, so
+		// that a malformed request is rejected without prompting the user.
+		const { messages, options } = buildLanguageModelRequest(opts.params);
 
 		const model = await this._modelSequencer.queue(() => this._getMatchingModel(opts));
-		const response = await this._languageModelsService.sendChatRequest(model, undefined, messages, {}, token);
+		const response = await this._languageModelsService.sendChatRequest(model, undefined, messages, options, token);
 
-		let responseText = '';
-
-		// MCP doesn't have a notion of a multi-part sampling response, so we only preserve text
-		// Ref https://github.com/modelcontextprotocol/modelcontextprotocol/issues/91
+		// Text and tool calls are the only response parts with a sampling
+		// representation; other parts (data, thinking) are dropped.
+		const blocks: MCPLegacy.SamplingMessageContentBlock[] = [];
 		const streaming = (async () => {
 			for await (const part of response.stream) {
-				if (Array.isArray(part)) {
-					for (const p of part) {
-						if (p.type === 'text') {
-							responseText += p.value;
-						}
-					}
-				} else if (part.type === 'text') {
-					responseText += part.value;
+				for (const p of asArray(part)) {
+					appendResponsePart(blocks, p);
 				}
 			}
 		})();
 
 		try {
 			await Promise.all([response.result, streaming]);
-			this._logs.add(opts.server, opts.params.messages, responseText, model);
-			return {
-				sample: {
-					model,
-					content: { type: 'text', text: responseText },
-					role: 'assistant', // it came from the model!
-				},
-			};
 		} catch (err) {
 			throw McpError.unknown(err);
 		}
+
+		const responseText = blocks.map(b => b.type === 'text' ? b.text : '').join('');
+		this._logs.add(opts.server, opts.params.messages, responseText, model);
+
+		const hasToolUse = blocks.some(b => b.type === 'tool_use');
+		return {
+			sample: {
+				model,
+				// A single block keeps the non-array shape so that servers which
+				// do not use tools see the same wire format as before.
+				content: blocks.length === 1 ? blocks[0] : blocks.length === 0 ? { type: 'text', text: '' } : blocks,
+				role: 'assistant', // it came from the model!
+				// The language model API does not report why generation ended, so
+				// a response without tool calls is reported as a natural end of
+				// turn; `maxTokens` and `stopSequence` cannot be distinguished.
+				stopReason: hasToolUse ? 'toolUse' : 'endTurn',
+			},
+		};
 	}
 
 	hasLogs(server: IMcpServer): boolean {
@@ -232,7 +243,7 @@ export class McpSamplingService extends Disposable implements IMcpSamplingServic
 	 * Gets the matching model for the MCP server in this context, or
 	 * a reason why no model could be selected.
 	 */
-	private async _getMatchingModelInner(server: IMcpServer, isDuringToolCall: boolean, preferences: MCP.ModelPreferences | undefined): Promise<ModelMatch | string> {
+	private async _getMatchingModelInner(server: IMcpServer, isDuringToolCall: boolean, preferences: MCPLegacy.ModelPreferences | undefined): Promise<ModelMatch | string> {
 		const config = this.getConfig(server);
 		// 1. Ensure the server is allowed to sample in this context
 		if (isDuringToolCall && !config.allowedDuringChat && !this._sessionSets.allowedDuringChat.has(server.definition.id)) {
@@ -242,6 +253,13 @@ export class McpSamplingService extends Disposable implements IMcpSamplingServic
 		}
 
 		// 2. Get the configured models, or the default free model(s)
+		// The models are looked up among the resolved ones; a vendor whose models nobody has asked
+		// for since startup (no chat opened yet) is resolved first, so that a configured model of it
+		// is found instead of asking the user to pick models again.
+		const unresolvedVendors = new Set(config.allowedModels?.filter(m => !this._languageModelsService.lookupLanguageModel(m) && m.includes('/')).map(m => m.slice(0, m.indexOf('/'))));
+		if (unresolvedVendors.size) {
+			await Promise.all([...unresolvedVendors].map(vendor => this._languageModelsService.selectLanguageModels({ vendor }).catch(() => undefined)));
+		}
 		const foundModelIds = config.allowedModels?.filter(m => !!this._languageModelsService.lookupLanguageModel(m)) || this._getDefaultModels();
 		if (!foundModelIds.length) {
 			return ModelMatch.NoMatchingModel;
@@ -323,4 +341,209 @@ export class McpSamplingService extends Disposable implements IMcpSamplingServic
 		);
 		return newConfig;
 	}
+}
+
+function invalidParams(message: string): McpError {
+	return new McpError(MCPLegacy.INVALID_PARAMS, message);
+}
+
+/**
+ * Translates a `sampling/createMessage` request into messages and options for
+ * the language model API, validating the tool-use rules of the sampling
+ * specification along the way. A violation rejects the request with
+ * `INVALID_PARAMS`; the request handler turns that into the JSON-RPC error
+ * (legacy servers) or a failed input round (modern servers).
+ */
+function buildLanguageModelRequest(params: MCPLegacy.CreateMessageRequestParams): ISamplingLanguageModelRequest {
+	const messages: IChatMessage[] = [];
+	/** Every `tool_use` id issued so far, to tell a stale reference from an unknown one. */
+	const issuedToolUses = new Set<string>();
+	/** The `tool_use` ids of the latest assistant message that still await a `tool_result`. */
+	const pendingToolUses = new Set<string>();
+
+	params.messages.forEach((message, index) => {
+		const blocks = asArray(message.content);
+		const toolResults = blocks.filter(b => b.type === 'tool_result');
+		const toolUses = blocks.filter(b => b.type === 'tool_use');
+
+		// A message carrying tool results must consist only of tool results, and
+		// tool results (resp. tool uses) belong to the user (resp. assistant) role.
+		if (toolResults.length && toolResults.length !== blocks.length) {
+			throw invalidParams(`messages[${index}] mixes tool_result blocks with other content; a message with tool results must contain only tool results`);
+		}
+		if (toolResults.length && message.role !== 'user') {
+			throw invalidParams(`messages[${index}] has role "${message.role}" but contains tool_result blocks, which must be sent in a user message`);
+		}
+		if (toolUses.length && message.role !== 'assistant') {
+			throw invalidParams(`messages[${index}] has role "${message.role}" but contains tool_use blocks, which must be sent in an assistant message`);
+		}
+
+		// An assistant message with tool uses must be followed, before any other
+		// message, by a user message answering each of them exactly once.
+		if (pendingToolUses.size && !toolResults.length) {
+			throw invalidParams(`messages[${index}] must contain the tool_result blocks for the preceding tool_use ${describeIds(pendingToolUses)}`);
+		}
+		for (const result of toolResults) {
+			if (pendingToolUses.has(result.toolUseId)) {
+				pendingToolUses.delete(result.toolUseId);
+			} else if (issuedToolUses.has(result.toolUseId)) {
+				throw invalidParams(`messages[${index}] contains a tool_result for "${result.toolUseId}", which was already answered`);
+			} else {
+				throw invalidParams(`messages[${index}] contains a tool_result for "${result.toolUseId}", which does not match a tool_use in an earlier assistant message`);
+			}
+		}
+		if (toolResults.length && pendingToolUses.size) {
+			throw invalidParams(`messages[${index}] is missing the tool_result blocks for tool_use ${describeIds(pendingToolUses)}`);
+		}
+		for (const use of toolUses) {
+			if (issuedToolUses.has(use.id)) {
+				throw invalidParams(`messages[${index}] reuses the tool_use id "${use.id}"`);
+			}
+			issuedToolUses.add(use.id);
+			pendingToolUses.add(use.id);
+		}
+
+		const content = blocks.map(samplingBlockToMessagePart).filter(isDefined);
+		if (content.length) {
+			messages.push({
+				role: message.role === 'assistant' ? ChatMessageRole.Assistant : ChatMessageRole.User,
+				content,
+			});
+		}
+	});
+
+	if (pendingToolUses.size) {
+		throw invalidParams(`The last assistant message contains tool_use ${describeIds(pendingToolUses)} without a following user message with the tool results`);
+	}
+
+	if (params.systemPrompt) {
+		messages.unshift({ role: ChatMessageRole.System, content: [{ type: 'text', value: params.systemPrompt }] });
+	}
+
+	return { messages, options: { ...buildModelOptions(params), ...buildToolOptions(params) } };
+}
+
+/**
+ * Maps `maxTokens` to the `max_tokens` model option, the output token limit
+ * that language model providers read from the request's `modelOptions` (the
+ * Copilot provider forwards it to the model endpoint). sampling.mdx: "The
+ * client MUST respect the `maxTokens` parameter." `temperature`,
+ * `stopSequences` and `metadata` may be ignored and are.
+ */
+function buildModelOptions(params: MCPLegacy.CreateMessageRequestParams): ILanguageModelChatRequestOptions {
+	// `maxTokens` is required; a request without a usable one is still served, without a limit.
+	if (typeof params.maxTokens !== 'number' || !Number.isFinite(params.maxTokens)) {
+		return {};
+	}
+	return { modelOptions: { max_tokens: params.maxTokens } };
+}
+
+function describeIds(ids: ReadonlySet<string>): string {
+	return Array.from(ids, id => `"${id}"`).join(', ');
+}
+
+/**
+ * Maps `tools` and `toolChoice` to the language model request options.
+ *
+ * The language model API knows the modes "auto" and "required" only. A
+ * `toolChoice` of `none` is approximated by not offering any tools at all,
+ * which is equivalent for the model: it cannot call a tool it was not given.
+ * Without tools there are no tool options, as before tools existed.
+ */
+function buildToolOptions(params: MCPLegacy.CreateMessageRequestParams): ILanguageModelChatRequestOptions {
+	const mode = params.toolChoice?.mode ?? 'auto';
+	const tools = params.tools ?? [];
+	if (mode === 'required' && !tools.length) {
+		throw invalidParams('toolChoice.mode "required" needs at least one tool in "tools"');
+	}
+	if (mode === 'none' || !tools.length) {
+		return {};
+	}
+
+	const definitions: ILanguageModelChatToolDefinition[] = tools.map(tool => ({
+		name: tool.name,
+		description: tool.description ?? '',
+		inputSchema: tool.inputSchema,
+	}));
+	return {
+		tools: definitions,
+		toolMode: mode === 'required' ? LanguageModelChatToolMode.Required : LanguageModelChatToolMode.Auto,
+	};
+}
+
+function samplingBlockToMessagePart(block: MCPLegacy.SamplingMessageContentBlock): IChatMessagePart | undefined {
+	switch (block.type) {
+		case 'text':
+			return { type: 'text', value: block.text };
+		case 'image':
+		case 'audio':
+			return { type: 'image_url', value: { mimeType: block.mimeType as ChatImageMimeType, data: decodeBase64(block.data) } };
+		case 'tool_use':
+			return { type: 'tool_use', toolCallId: block.id, name: block.name, parameters: block.input };
+		case 'tool_result': {
+			const part: IChatMessageToolResultPart = {
+				type: 'tool_result',
+				toolCallId: block.toolUseId,
+				value: block.content.map(toolResultBlockToPart).filter(isDefined),
+			};
+			if (block.isError) {
+				part.isError = true;
+			}
+			return part;
+		}
+		default:
+			return undefined;
+	}
+}
+
+function toolResultBlockToPart(block: MCPLegacy.ContentBlock): IChatMessageToolResultPart['value'][number] | undefined {
+	switch (block.type) {
+		case 'text':
+			return { type: 'text', value: block.text };
+		case 'image':
+		case 'audio':
+			return { type: 'data', mimeType: block.mimeType, data: decodeBase64(block.data) };
+		case 'resource': {
+			const resource: Partial<MCPLegacy.TextResourceContents & MCPLegacy.BlobResourceContents> = block.resource;
+			if (typeof resource.text === 'string') {
+				return { type: 'text', value: resource.text };
+			}
+			if (typeof resource.blob === 'string') {
+				return { type: 'data', mimeType: resource.mimeType ?? 'application/octet-stream', data: decodeBase64(resource.blob) };
+			}
+			return undefined;
+		}
+		case 'resource_link':
+			return { type: 'text', value: block.uri };
+		default:
+			return undefined;
+	}
+}
+
+/** Appends a streamed response part to the sampling content, merging adjacent text. */
+function appendResponsePart(blocks: MCPLegacy.SamplingMessageContentBlock[], part: IChatResponsePart): void {
+	if (part.type === 'text') {
+		const last = blocks.at(-1);
+		if (last?.type === 'text') {
+			last.text += part.value;
+		} else {
+			blocks.push({ type: 'text', text: part.value });
+		}
+	} else if (part.type === 'tool_use') {
+		blocks.push({ type: 'tool_use', id: part.toolCallId, name: part.name, input: toToolInput(part.parameters) });
+	}
+}
+
+/** Tool-call arguments arrive as a parsed object, or occasionally as their JSON text. */
+function toToolInput(parameters: unknown): { [key: string]: unknown } {
+	if (typeof parameters === 'string') {
+		try {
+			parameters = JSON.parse(parameters);
+		} catch {
+			return {};
+		}
+	}
+	return typeof parameters === 'object' && parameters !== null && !Array.isArray(parameters)
+		? parameters as { [key: string]: unknown }
+		: {};
 }

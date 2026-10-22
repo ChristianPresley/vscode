@@ -56,6 +56,7 @@ import * as chatProvider from '../../contrib/chat/common/languageModels.js';
 import { IChatMessageDataPart, IChatResponseDataPart, IChatResponsePromptTsxPart, IChatResponseTextPart } from '../../contrib/chat/common/languageModels.js';
 import { DebugTreeItemCollapsibleState, IDebugVisualizationTreeItem } from '../../contrib/debug/common/debug.js';
 import { McpServerDefinition as McpServerDefinitionType, McpServerLaunch, McpServerTransportType } from '../../contrib/mcp/common/mcpTypes.js';
+import { McpGrpcBinding as McpGrpcBindingType } from '../../../platform/mcp/common/mcpPlatformTypes.js';
 import * as notebooks from '../../contrib/notebook/common/notebookCommon.js';
 import { CellEditType } from '../../contrib/notebook/common/notebookCommon.js';
 import { ICellRange } from '../../contrib/notebook/common/notebookRange.js';
@@ -4184,12 +4185,43 @@ export namespace AiSettingsSearch {
 	}
 }
 
+export namespace McpGrpcBinding {
+	export function from(binding: vscode.McpGrpcBinding | undefined): McpGrpcBindingType | undefined {
+		switch (binding) {
+			case types.McpGrpcBinding.Auto: return 'auto';
+			case types.McpGrpcBinding.Tunnel: return 'tunnel';
+			case types.McpGrpcBinding.Typed: return 'typed';
+			default: return undefined;
+		}
+	}
+
+	export function to(binding: McpGrpcBindingType | undefined): vscode.McpGrpcBinding | undefined {
+		switch (binding) {
+			case 'auto': return types.McpGrpcBinding.Auto;
+			case 'tunnel': return types.McpGrpcBinding.Tunnel;
+			case 'typed': return types.McpGrpcBinding.Typed;
+			default: return undefined;
+		}
+	}
+}
+
 export namespace McpServerDefinition {
 	function isHttpConfig(candidate: vscode.McpServerDefinition): candidate is vscode.McpHttpServerDefinition {
 		return !!(candidate as vscode.McpHttpServerDefinition).uri;
 	}
 
 	export function from(item: vscode.McpServerDefinition): McpServerLaunch.Serialized {
+		// A gRPC definition extends the HTTP one, so it must be recognized before the HTTP shape.
+		if (item instanceof types.McpGrpcServerDefinition) {
+			return McpServerLaunch.toSerialized({
+				type: McpServerTransportType.Grpc,
+				uri: item.uri,
+				headers: Object.entries(item.headers),
+				tls: item.tls,
+				binding: McpGrpcBinding.from(item.binding),
+				...(typeof item.keepAliveMs === 'number' ? { keepAliveMs: item.keepAliveMs } : {}),
+			});
+		}
 		return McpServerLaunch.toSerialized(
 			isHttpConfig(item)
 				? {
@@ -4216,7 +4248,20 @@ export namespace McpServerDefinition {
 	/** Converts from the IPC DTO to the API type. */
 	export function to(dto: McpServerDefinitionType.Serialized): vscode.McpServerDefinition {
 		const launch = McpServerLaunch.fromSerialized(dto.launch);
-		if (launch.type === McpServerTransportType.HTTP) {
+		if (launch.type === McpServerTransportType.Grpc) {
+			const result = new types.McpGrpcServerDefinition(
+				dto.label,
+				launch.uri,
+				Object.fromEntries(launch.headers),
+				dto.cacheNonce === '$$NONE' ? undefined : dto.cacheNonce,
+				launch.tls,
+				McpGrpcBinding.to(launch.binding),
+			);
+			if (launch.keepAliveMs !== undefined) {
+				result.keepAliveMs = launch.keepAliveMs;
+			}
+			return result;
+		} else if (launch.type === McpServerTransportType.HTTP) {
 			return new types.McpHttpServerDefinition(
 				dto.label,
 				launch.uri,

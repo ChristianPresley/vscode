@@ -75,6 +75,8 @@ export const enum AgentHostMcpSupportReason {
 	EnvironmentFileIgnored = 'environmentFileIgnored',
 	WorkingDirectoryNotPortable = 'workingDirectoryNotPortable',
 	SseTransportNotPortable = 'sseTransportNotPortable',
+	/** The server is reached over gRPC, which no agent host transport speaks; VS Code keeps serving it through the MCP gateway. */
+	GrpcTransportNotPortable = 'grpcTransportNotPortable',
 	SandboxConfigurationIgnored = 'sandboxConfigurationIgnored',
 	DevelopmentModeIgnored = 'developmentModeIgnored',
 	OAuthClientConfigurationIgnored = 'oauthClientConfigurationIgnored',
@@ -256,6 +258,11 @@ async function resolveMcpServerForAgentHostDelivery(
 
 	if (!definition?.launch) {
 		return createResolution(server, definition, source, applicability, AgentHostMcpServerDelivery.Unknown, unknown([AgentHostMcpSupportReason.DefinitionNotLoaded]));
+	}
+
+	if (definition.launch.type === McpServerTransportType.Grpc) {
+		// No agent host speaks gRPC; the server stays available through VS Code's MCP gateway.
+		return createResolution(server, definition, source, applicability, AgentHostMcpServerDelivery.NotDelivered, unsupported([AgentHostMcpSupportReason.GrpcTransportNotPortable]));
 	}
 
 	if (source.kind === AgentHostMcpServerSourceKind.WorkspaceDotMcp) {
@@ -592,6 +599,9 @@ async function assessInstalledMcpServerConfiguration(
 	if (!launch) {
 		return { compatibility: unsupported([AgentHostMcpSupportReason.LaunchNotRepresentable]) };
 	}
+	if (launch.type === McpServerTransportType.Grpc) {
+		return { compatibility: unsupported([AgentHostMcpSupportReason.GrpcTransportNotPortable]) };
+	}
 	let projectedConfiguration = projectMcpServerConfiguration(launch);
 	if (!projectedConfiguration) {
 		return { compatibility: unsupported([AgentHostMcpSupportReason.LaunchNotRepresentable]) };
@@ -680,6 +690,9 @@ function projectMcpServerConfiguration(launch: McpServerLaunch): IMcpServerConfi
 				url: launch.uri.toString(),
 				headers: launch.headers.length > 0 ? Object.fromEntries(launch.headers) : undefined,
 			};
+		case McpServerTransportType.Grpc:
+			// Agent hosts have no gRPC transport; callers report GrpcTransportNotPortable before projecting.
+			return undefined;
 	}
 }
 
@@ -733,7 +746,7 @@ function getPartialSupportReasons(launch: McpServerLaunch, sandboxEnabled: boole
 		if (launch.sandbox || sandboxEnabled) {
 			reasons.push(AgentHostMcpSupportReason.SandboxConfigurationIgnored);
 		}
-	} else {
+	} else if (launch.type === McpServerTransportType.HTTP) {
 		if (launch.oauth) {
 			reasons.push(AgentHostMcpSupportReason.OAuthClientConfigurationIgnored);
 		}

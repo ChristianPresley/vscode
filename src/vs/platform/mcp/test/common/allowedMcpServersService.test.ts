@@ -232,6 +232,26 @@ suite('AllowedMcpServersService', () => {
 		assert.notStrictEqual(service.isAllowed(blocked), true);
 	});
 
+	test('isAllowed matches an installable grpc server by its URL', () => {
+		const allowedByUrl = createService({ [mcpAllowedServersConfig]: [{ serverUrl: 'grpcs://mcp.example.com:50051' }] });
+		const deniedByUrl = createService({ [mcpDeniedServersConfig]: [{ serverUrl: 'grpcs://mcp.example.com:50051' }] });
+		const allowedByCommand = createService({ [mcpAllowedServersConfig]: [{ serverCommand: ['grpcs://mcp.example.com:50051'] }] });
+		const server: IInstallableMcpServer = { name: 'anything', config: { type: McpServerType.GRPC, url: 'grpcs://mcp.example.com:50051' } };
+		const other: IInstallableMcpServer = { name: 'anything', config: { type: McpServerType.GRPC, url: 'grpcs://other.example.org:50051' } };
+
+		assert.deepStrictEqual({
+			allowed: allowedByUrl.isAllowed(server) === true,
+			otherAllowed: allowedByUrl.isAllowed(other) === true,
+			denied: deniedByUrl.isAllowed(server) === true,
+			allowedByCommand: allowedByCommand.isAllowed(server) === true,
+		}, {
+			allowed: true,
+			otherAllowed: false,
+			denied: false,
+			allowedByCommand: false,
+		});
+	});
+
 	test('isAllowed defers URL policies for installable remote servers with unresolved inputs', () => {
 		const server: IInstallableMcpServer = {
 			name: 'templated',

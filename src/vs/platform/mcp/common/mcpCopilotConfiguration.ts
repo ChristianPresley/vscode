@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { localize } from '../../../nls.js';
 import { normalizeMcpServerConfiguration } from '../../agentPlugins/common/pluginParsers.js';
 import { IMcpServerConfiguration, McpServerType } from './mcpPlatformTypes.js';
 
@@ -27,7 +28,15 @@ export interface ICopilotRemoteMcpServerConfiguration {
 /** The server format shared by Copilot CLI configuration and the SDK. */
 export type ICopilotMcpServerConfiguration = ICopilotLocalMcpServerConfiguration | ICopilotRemoteMcpServerConfiguration;
 
+/**
+ * Converts a configuration to the Copilot CLI format. Throws for gRPC servers,
+ * which the format cannot express; callers that tolerate unsupported servers
+ * check {@link McpServerType.GRPC} first.
+ */
 export function toCopilotMcpServerConfiguration(config: IMcpServerConfiguration, cwd = config.type === McpServerType.LOCAL ? config.cwd : undefined): ICopilotMcpServerConfiguration {
+	if (config.type === McpServerType.GRPC) {
+		throw new Error(localize('mcpCopilotGrpcUnsupported', "gRPC MCP servers cannot be written to the Copilot CLI configuration format."));
+	}
 	if (config.type === McpServerType.LOCAL) {
 		return {
 			type: 'stdio',

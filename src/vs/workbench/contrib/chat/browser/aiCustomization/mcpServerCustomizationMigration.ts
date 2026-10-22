@@ -810,6 +810,14 @@ function canonicalizeConfiguration(configuration: IMcpServerConfiguration): IMcp
 			...(configuration.cwd !== undefined ? { cwd: configuration.cwd } : {}),
 		};
 	}
+	if (configuration.type === McpServerType.GRPC) {
+		// Never migrated (see isConfigurationRepresentable), but kept comparable like the other kinds.
+		return {
+			type: configuration.type,
+			url: configuration.url,
+			...(configuration.headers && Object.keys(configuration.headers).length > 0 ? { headers: { ...configuration.headers } } : {}),
+		};
+	}
 	return {
 		type: configuration.type,
 		...(configuration.transport === 'sse' ? { transport: 'sse' } : {}),
@@ -827,6 +835,10 @@ function isConfigurationRepresentable(configuration: IMcpServerConfiguration): b
 			&& configuration.cwd === undefined
 			&& configuration.sandboxEnabled !== true
 			&& (!configuration.env || Object.values(configuration.env).every(value => value !== null));
+	}
+	if (configuration.type === McpServerType.GRPC) {
+		// The Copilot CLI configuration format has no gRPC transport.
+		return false;
 	}
 	return configuration.transport !== 'sse';
 }

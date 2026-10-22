@@ -551,7 +551,8 @@ suite('EmbeddedMcpServerDetail', () => {
 				formVisible: form.style.display !== 'none',
 				editorVisible: snapshot().editorVisible,
 				heading: detail.element.querySelector<HTMLElement>('.mcp-detail-section-title')!.style.display !== 'none',
-				types: [...form.querySelectorAll('.monaco-custom-radio .monaco-button')].map(button => button.textContent),
+				// The first radio is the server type; the gRPC binding radio follows it.
+				types: [...form.querySelector('.monaco-custom-radio')!.querySelectorAll('.monaco-button')].map(button => button.textContent),
 				addVariable: form.querySelector('.mcp-config-form-kv-add .monaco-button')!.textContent,
 				envFile: field('Environment File').style.display !== 'none',
 				workingDirectory: field('Working Directory').style.display !== 'none',

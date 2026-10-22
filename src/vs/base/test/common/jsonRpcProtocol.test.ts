@@ -239,4 +239,87 @@ suite('JsonRpcProtocol', () => {
 		assert.deepStrictEqual(sequence, ['request:start', 'request:end', 'notification']);
 		assert.deepStrictEqual(replies, [{ jsonrpc: '2.0', id: 1, result: true }]);
 	});
+
+	test('sendRequestWithId exposes the outgoing id and resolves like sendRequest', async () => {
+		const { protocol, sentMessages } = createProtocol();
+
+		const { id, result } = protocol.sendRequestWithId<string>({ method: 'echo' });
+		assert.strictEqual((sentMessages[0] as IJsonRpcRequest).id, id);
+		assert.strictEqual(protocol.hasPendingRequest(id), true);
+
+		await protocol.handleMessage({ jsonrpc: '2.0', id, result: 'done' });
+		assert.strictEqual(await result, 'done');
+		assert.strictEqual(protocol.hasPendingRequest(id), false);
+	});
+
+	test('failPendingRequest rejects the pending request and ignores a later response', async () => {
+		const { protocol, sentMessages } = createProtocol();
+
+		const { id, result } = protocol.sendRequestWithId({ method: 'slow' });
+		const error = new Error('transport closed');
+		assert.strictEqual(protocol.failPendingRequest(id, error), true);
+		assert.strictEqual(protocol.failPendingRequest(id, error), false, 'already failed');
+		await assert.rejects(result, (err: unknown) => err === error);
+
+		const replies = await protocol.handleMessage({ jsonrpc: '2.0', id, result: 'late' });
+		assert.deepStrictEqual(replies, []);
+		assert.strictEqual(sentMessages.length, 1, 'no further messages sent');
+	});
+
+	test('cancelIncomingRequest cancels the handler token and suppresses the response', async () => {
+		const gate = new DeferredPromise<void>();
+		let observedCancellation = false;
+		const { protocol, sentMessages } = createProtocol({
+			handleRequest: async (_request, token) => {
+				store.add(token.onCancellationRequested(() => { observedCancellation = true; gate.complete(); }));
+				await gate.p;
+				throw new CancellationError();
+			},
+		});
+
+		const handling = protocol.handleMessage({ jsonrpc: '2.0', id: 'req-1', method: 'work' });
+		assert.strictEqual(protocol.cancelIncomingRequest('req-1'), true);
+		assert.strictEqual(protocol.cancelIncomingRequest('req-1'), true, 'still in flight until the handler returns');
+		const replies = await handling;
+
+		assert.strictEqual(observedCancellation, true);
+		assert.deepStrictEqual(replies, [], 'a cancelled request gets no response');
+		assert.deepStrictEqual(sentMessages, []);
+		assert.strictEqual(protocol.cancelIncomingRequest('req-1'), false, 'finished requests are forgotten');
+		assert.strictEqual(protocol.cancelIncomingRequest('unknown'), false);
+	});
+
+	test('incoming and outgoing requests with the same id are independent', async () => {
+		const gate = new DeferredPromise<string>();
+		const { protocol, sentMessages } = createProtocol({ handleRequest: () => gate.p });
+
+		const { id, result } = protocol.sendRequestWithId<string>({ method: 'out' });
+		const handling = protocol.handleMessage({ jsonrpc: '2.0', id, method: 'in' });
+
+		assert.strictEqual(protocol.cancelIncomingRequest(id), true);
+		assert.strictEqual(protocol.hasPendingRequest(id), true, 'the outgoing request is untouched');
+		gate.complete('ignored');
+		assert.deepStrictEqual(await handling, []);
+
+		await protocol.handleMessage({ jsonrpc: '2.0', id, result: 'ok' });
+		assert.strictEqual(await result, 'ok');
+		assert.strictEqual(sentMessages.length, 1);
+	});
+
+	test('cancelAllRequests also cancels in-flight incoming requests', async () => {
+		const gate = new DeferredPromise<void>();
+		let cancelled = false;
+		const { protocol } = createProtocol({
+			handleRequest: async (_request, token) => {
+				store.add(token.onCancellationRequested(() => { cancelled = true; gate.complete(); }));
+				await gate.p;
+				return 'late';
+			},
+		});
+
+		const handling = protocol.handleMessage({ jsonrpc: '2.0', id: 9, method: 'work' });
+		protocol.cancelAllRequests();
+		assert.deepStrictEqual(await handling, []);
+		assert.strictEqual(cancelled, true);
+	});
 });

@@ -1,0 +1,15 @@
+{
+	"name": "code-oss-dev-mcp-e2e-tools",
+	"version": "0.1.0",
+	"description": "What the end-to-end test container installs into /work/e2e-tools: Playwright for the visual checks and a 2025-11-25 MCP server for the legacy scenarios.",
+	"license": "MIT",
+	"private": true,
+	"dependencies": {
+		"@modelcontextprotocol/sdk": "1.25.2",
+		"@modelcontextprotocol/server-everything": "2026.1.26",
+		"playwright": "1.61.1"
+	},
+	"overrides": {
+		"@modelcontextprotocol/sdk": "1.25.2"
+	}
+}

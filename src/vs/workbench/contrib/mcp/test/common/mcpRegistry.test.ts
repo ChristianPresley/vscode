@@ -554,7 +554,7 @@ suite('Workbench - MCP - Registry', () => {
 			connection.dispose();
 			return {
 				expansions: expand.callCount,
-				launch: launch.type === McpServerTransportType.HTTP
+				launch: launch.type !== McpServerTransportType.Stdio
 					? { url: launch.uri.toString(true), headers: launch.headers }
 					: { command: launch.command, args: launch.args, env: launch.env },
 			};

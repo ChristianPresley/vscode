@@ -31,6 +31,7 @@ import { IAgentHostActiveClientService } from './agentHostActiveClientService.js
 import { IAgentHostCustomizationService } from './agentHostCustomizationService.js';
 import { AgentHostMcpServerApplicability, AgentHostMcpServerDelivery, AgentHostMcpServerEnablementState, AgentHostMcpServerSourceKind, IAgentHostMcpServerSupport, IAgentHostMcpServerSupportSnapshot } from './agentHostMcpServerSupport.js';
 import { getMcpCompatibilityDetail, IAgentHostMcpServerSupportScope } from './agentHostMcpServerSupportScope.js';
+import { AGENT_HOST_COPILOT_CLI_SESSION_TYPE } from './agentHostToolSetEnablementService.js';
 
 export class AgentHostMcpServerMigrationProvider extends Disposable implements ICustomizationMcpServerMigrationProvider {
 	private readonly mcpServerMigration: McpServerCustomizationMigrator;
@@ -284,7 +285,8 @@ export class AgentHostMcpServerMigrationProvider extends Disposable implements I
 		// For a server the planner analyzed, its compatibility and delivery are not why it was excluded.
 		const analyzed = server !== undefined && isMcpServerMigrationDeliverable(server);
 		if (server && !analyzed && server.compatibility.kind !== 'supported') {
-			return server.compatibility.reasons.map(getMcpCompatibilityDetail);
+			// Migration targets the Copilot CLI, so reasons are explained for that harness.
+			return server.compatibility.reasons.map(reason => getMcpCompatibilityDetail(reason, AGENT_HOST_COPILOT_CLI_SESSION_TYPE));
 		}
 		if (server && !analyzed && server.delivery !== AgentHostMcpServerDelivery.ClientForwarded) {
 			return [localize('mcpMigrationServerNotForwarded', "This server is not forwarded from its current configuration to the active agent.")];

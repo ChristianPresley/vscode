@@ -20,6 +20,7 @@ import { ICustomizationMcpServerCompatibility, ICustomizationMcpServerCompatibil
 import { IMcpService, IMcpWorkbenchService } from '../../../../mcp/common/mcpTypes.js';
 import { IConfigurationResolverService } from '../../../../../services/configurationResolver/common/configurationResolver.js';
 import { AgentHostMcpServerApplicability, AgentHostMcpSupportReason, assessMcpServersForCopilotAgentHost, IAgentHostInstalledMcpServer, IAgentHostMcpServerSupportSnapshot, mergeInstalledMcpServersIntoAgentHostSupportAssessment } from './agentHostMcpServerSupport.js';
+import { isCopilotCliSessionType } from './agentHostToolSetEnablementService.js';
 
 const MCP_SUPPORT_UPDATE_DEBOUNCE_DELAY = 50;
 
@@ -33,6 +34,11 @@ function createEmptySupportSnapshot(coverage: IAgentHostMcpServerSupportSnapshot
 
 /** A refcounted reactive view of MCP support for one Agent Host working-directory scope. */
 export interface IAgentHostMcpServerSupportScope extends IDisposable {
+	/**
+	 * The session type the support was assessed for, which decides how agent-dependent reasons
+	 * are explained. When unset, reasons are explained for an agent other than the Copilot CLI.
+	 */
+	readonly sessionType?: string;
 	/** The latest settled support snapshot. */
 	readonly support: IObservable<IAgentHostMcpServerSupportSnapshot>;
 	/** Whether the latest scheduled support assessment has settled. */
@@ -70,7 +76,7 @@ export function createCustomizationMcpServerCompatibilityScope(
 				.map(server => ({
 					id: server.id,
 					kind: server.compatibility.kind,
-					details: server.compatibility.kind === 'supported' ? undefined : server.compatibility.reasons.map(getMcpCompatibilityDetail),
+					details: server.compatibility.kind === 'supported' ? undefined : server.compatibility.reasons.map(reason => getMcpCompatibilityDetail(reason, scope.sessionType)),
 				}));
 			const resolved = scope.isResolved.read(reader);
 			transaction(tx => {
@@ -86,8 +92,17 @@ export function createCustomizationMcpServerCompatibilityScope(
 	};
 }
 
-export function getMcpCompatibilityDetail(reason: AgentHostMcpSupportReason): string {
+/**
+ * Explains a support reason to the user. {@link sessionType} selects the wording
+ * for reasons that depend on the agent, such as gRPC servers, which Copilot CLI
+ * sessions still reach through the MCP gateway while other agents cannot use them.
+ */
+export function getMcpCompatibilityDetail(reason: AgentHostMcpSupportReason, sessionType?: string): string {
 	switch (reason) {
+		case AgentHostMcpSupportReason.GrpcTransportNotPortable:
+			return sessionType !== undefined && isCopilotCliSessionType(sessionType)
+				? localize('mcpCompatibilityGrpcTransportGateway', "gRPC servers are not forwarded to the Copilot CLI, but this server remains reachable through the MCP gateway.")
+				: localize('mcpCompatibilityGrpcTransportNotSupported', "gRPC servers are not supported by this agent.\nTo use this server with the agent, configure it with an HTTP or stdio transport.");
 		case AgentHostMcpSupportReason.UnsupportedSourceLocation:
 			return localize('mcpCompatibilityUnsupportedSourceLocation', "The current configuration location for this server is not supported by the Copilot harness.\nTo migrate this server, move its configuration to the workspace root .mcp.json file.");
 		case AgentHostMcpSupportReason.CopilotHomeNotForwarded:
@@ -234,6 +249,7 @@ export class AgentHostMcpServerSupportScope extends Disposable {
 		this._refCount++;
 		let released = false;
 		return {
+			sessionType: this._sessionType,
 			support: this._support,
 			isResolved: this._isResolved,
 			whenResolved: () => this._whenResolved(),

@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { JsonRpcId, JsonRpcMessage } from '../../../base/common/jsonRpcProtocol.js';
 import { mapFindFirst } from '../../../base/common/arraysFind.js';
 import { disposableTimeout, RunOnceScheduler } from '../../../base/common/async.js';
 import { CancellationError } from '../../../base/common/errors.js';
@@ -18,24 +19,112 @@ import { IConfigurationService } from '../../../platform/configuration/common/co
 import { IDialogService, IPromptButton } from '../../../platform/dialogs/common/dialogs.js';
 import { ExtensionIdentifier } from '../../../platform/extensions/common/extensions.js';
 import { LogLevel } from '../../../platform/log/common/log.js';
-import { IAllowedMcpServersService } from '../../../platform/mcp/common/mcpManagement.js';
+import { getMcpServerMatchers, IMcpServerMatcher } from '../../../platform/mcp/common/allowedMcpServers.js';
+import { IAllowedMcpServersService, mcpAllowedServersConfig } from '../../../platform/mcp/common/mcpManagement.js';
 import { ITelemetryService } from '../../../platform/telemetry/common/telemetry.js';
 import { ISecretStorageService } from '../../../platform/secrets/common/secrets.js';
-import { IWorkbenchMcpGatewayService } from '../../contrib/mcp/common/mcpGatewayService.js';
+import { IMcpGatewayResultServer, IWorkbenchMcpGatewayService } from '../../contrib/mcp/common/mcpGatewayService.js';
 import { IMcpMessageTransport, IMcpRegistry } from '../../contrib/mcp/common/mcpRegistryTypes.js';
-import { extensionPrefixedIdentifier, McpCollectionDefinition, McpCollectionProvenance, McpCollectionSortOrder, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, McpServerTrust, mcpOAuthClientSecretStorageKey, UserInteractionRequiredError } from '../../contrib/mcp/common/mcpTypes.js';
+import { IMcpMessageEnvelope, IMcpRequestAbort, extensionPrefixedIdentifier, McpCollectionDefinition, McpCollectionProvenance, McpCollectionSortOrder, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportType, McpServerTrust, mcpOAuthClientSecretStorageKey, UserInteractionRequiredError } from '../../contrib/mcp/common/mcpTypes.js';
 import { IMcpEnterpriseManagedAuthIdpConfig, mcpEnterpriseManagedAuthIdpSection } from '../../contrib/mcp/common/mcpConfiguration.js';
-import { MCP } from '../../contrib/mcp/common/modelContextProtocol.js';
 import { IAuthenticationMcpAccessService } from '../../services/authentication/browser/authenticationMcpAccessService.js';
 import { IAuthenticationMcpService } from '../../services/authentication/browser/authenticationMcpService.js';
 import { IAuthenticationMcpUsageService } from '../../services/authentication/browser/authenticationMcpUsageService.js';
-import { AuthenticationSession, AuthenticationSessionAccount, IAuthenticationService } from '../../services/authentication/common/authentication.js';
+import { AuthenticationSession, AuthenticationSessionAccount, getDynamicAuthenticationProviderId, IAuthenticationProviderSessionOptions, IAuthenticationService } from '../../services/authentication/common/authentication.js';
 import { IDynamicAuthenticationProviderStorageService } from '../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
+import { canonicalResourceUri, OAuthClientError } from '../../../base/common/oauth.js';
+import { IMcpRemoteServerOAuthConfiguration } from '../../../platform/mcp/common/mcpPlatformTypes.js';
+import { parseStoredClientSecret, serializeStoredClientSecret } from '../../contrib/mcp/common/mcpOAuthClientSecret.js';
+import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION, MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION, previousMcpAuthorizationFallbackScopes, resolveMcpOAuthPolicy, selectMcpAuthorizationScopes } from '../common/mcpOAuthClientFactory.js';
 import { ExtensionHostKind, extensionHostKindToString } from '../../services/extensions/common/extensionHostKind.js';
 import { IExtensionService } from '../../services/extensions/common/extensions.js';
 import { IExtHostContext, extHostNamedCustomer } from '../../services/extensions/common/extHostCustomers.js';
 import { Proxied } from '../../services/extensions/common/proxyIdentifier.js';
-import { ExtHostContext, ExtHostMcpShape, IMcpAuthenticationDetails, IMcpAuthenticationOptions, IAuthMetadataSource, MainContext, MainThreadMcpShape } from '../common/extHost.protocol.js';
+import { ExtHostContext, ExtHostMcpShape, IMcpAuthenticationDetails, IMcpAuthenticationOptions, IAuthMetadataSource, IMcpGatewayServerDto, IMcpGatewayStartOptionsDto, IMcpRegisteredAuthorizationServer, MainContext, MainThreadMcpShape } from '../common/extHost.protocol.js';
+
+/** A gateway server for the extension host; `grpcAddress` only when the gateway serves gRPC. */
+function gatewayServerDto(server: IMcpGatewayResultServer): IMcpGatewayServerDto {
+	return server.grpcAddress
+		? { label: server.label, address: server.address, grpcAddress: server.grpcAddress }
+		: { label: server.label, address: server.address };
+}
+
+/** Pre-registered credentials met an authorization server other than their own: nothing is sent. */
+function issuerMismatchError(clientId: string, serverLabel: string, expectedIssuer: string, discoveredIssuer: string): OAuthClientError {
+	return new OAuthClientError('issuer_not_registered', nls.localize('mcp.oauth.issuerMismatch', "The OAuth client '{0}' of the MCP server '{1}' is registered with the authorization server '{2}', but the server now names '{3}'. No credentials were sent. Update `oauth.clientId` (and `oauth.authorizationServer`) in the server's configuration to sign in with the new authorization server.", clientId, serverLabel, expectedIssuer, discoveredIssuer));
+}
+
+/** The protected resource of a dynamic provider, whose id is `<authorization server> <resource>`; `undefined` for one without. */
+function dynamicProviderResource(provider: { readonly providerId: string; readonly authorizationServer: string }): string | undefined {
+	const prefix = `${provider.authorizationServer} `;
+	return provider.providerId.startsWith(prefix) ? provider.providerId.slice(prefix.length) : undefined;
+}
+
+function canonicalOrSelf(resource: string): string {
+	try {
+		return canonicalResourceUri(resource);
+	} catch {
+		return resource;
+	}
+}
+
+/**
+ * The HTTP identity of a resource URL: for a `unix://` or `pipe://` socket URL (the socket path
+ * as its path, the HTTP route as its fragment) the `http://localhost/<route>` URL its requests
+ * go to, as the extension host's Node transport rewrites them; any other URL itself.
+ */
+function httpIdentityOf(url: string): string {
+	const uri = URI.parse(url);
+	if (uri.scheme !== 'unix' && uri.scheme !== 'pipe') {
+		return url;
+	}
+	const route = uri.fragment.startsWith('/') ? uri.fragment : `/${uri.fragment}`;
+	return URI.from({ scheme: 'http', authority: 'localhost', path: route, query: uri.query }).toString(true);
+}
+
+/**
+ * The protected resource (canonical) a launch discovers authorization metadata for: an HTTP
+ * server's URL (a socket server's HTTP identity, {@link httpIdentityOf}), or a gRPC server's
+ * HTTPS identity (`https://<host>:<port>/`, as the extension host's gRPC transport derives it);
+ * `undefined` for stdio.
+ */
+function launchResource(launch: McpServerLaunch): string | undefined {
+	try {
+		if (launch.type === McpServerTransportType.HTTP) {
+			return canonicalResourceUri(httpIdentityOf(launch.uri.toString(true)));
+		}
+		if (launch.type === McpServerTransportType.Grpc) {
+			const authority = launch.uri.authority;
+			return canonicalResourceUri(`https://${authority.slice(authority.lastIndexOf('@') + 1)}/`);
+		}
+	} catch {
+		// Not a URL: the server has no resource of its own.
+	}
+	return undefined;
+}
+
+/**
+ * The URL of an HTTP launch whose HTTP identity ({@link httpIdentityOf}) other launches can
+ * share: every `unix://` or `pipe://` socket server with the same route maps to
+ * `http://localhost/<route>`, and so does an HTTP server at `http://localhost` (port 80). Their
+ * registrations, stored by that identity, cannot tell the servers apart. `undefined` for any
+ * other launch, whose resource is its own.
+ */
+function sharedHttpIdentityOwner(launch: McpServerLaunch): string | undefined {
+	if (launch.type !== McpServerTransportType.HTTP) {
+		return undefined;
+	}
+	const url = launch.uri.toString(true);
+	try {
+		const identity = httpIdentityOf(url);
+		if (identity !== url || new URL(identity).origin === 'http://localhost') {
+			return url;
+		}
+	} catch {
+		// Not a URL: the server has no resource of its own.
+	}
+	return undefined;
+}
 
 @extHostNamedCustomer(MainContext.MainThreadMcp)
 export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
@@ -45,6 +134,22 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 	private readonly _servers = new Map<number, ExtHostMcpServerLaunch>();
 	private readonly _serverDefinitions = new Map<number, McpServerDefinition>();
 	private readonly _serverRequestUrls = new Map<number, Set<string>>();
+	/**
+	 * The protected resources (canonical) each running server may look up registrations for: its
+	 * URL, a gRPC server's HTTPS identity, and those its protected resource metadata named.
+	 */
+	private readonly _serverResources = new Map<number, Set<string>>();
+	/** Running servers whose HTTP identity others can share ({@link sharedHttpIdentityOwner}), with their own URL. */
+	private readonly _sharedIdentityServers = new Map<number, string>();
+	/**
+	 * The dynamic providers each such URL obtained a token through in this window: the only
+	 * registrations it learns of, since the stored ones are keyed by the shared identity.
+	 */
+	private readonly _sharedIdentityRegistrations = new Map<string, Set<string>>();
+	/** Running gRPC servers whose launch sets `tls.insecure`. */
+	private readonly _insecureGrpcServers = new Set<number>();
+	/** Server definitions already warned about `tls.insecure` in this window. */
+	private readonly _warnedInsecureGrpcDefinitions = new Set<string>();
 	private readonly _serverAuthTracking = new McpServerAuthTracker();
 	private readonly _proxy: Proxied<ExtHostMcpShape>;
 	private readonly _collectionDefinitions = this._register(new DisposableMap<string, {
@@ -102,6 +207,10 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 				if (serverDefinition.launch.type === McpServerTransportType.Stdio && _extHostContext.extensionHostKind === ExtensionHostKind.LocalWebWorker) {
 					return false;
 				}
+				// gRPC needs Node.js `http2`, which the web worker extension host does not have.
+				if (serverDefinition.launch.type === McpServerTransportType.Grpc && _extHostContext.extensionHostKind === ExtensionHostKind.LocalWebWorker) {
+					return false;
+				}
 				return true;
 			},
 			async substituteVariables(serverDefinition, launch) {
@@ -120,12 +229,27 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 				const launch = new ExtHostMcpServerLaunch(
 					_extHostContext.extensionHostKind,
 					() => proxy.$stopMcp(id),
-					msg => proxy.$sendMessage(id, JSON.stringify(msg)),
+					(msg, envelope) => proxy.$sendMessage(id, JSON.stringify(msg), envelope),
+					requestId => proxy.$cancelRequest(id, requestId),
 				);
 				this._servers.set(id, launch);
 				this._serverDefinitions.set(id, serverDefiniton);
+				const ownResource = launchResource(resolveLaunch);
+				if (ownResource !== undefined) {
+					this._serverResources.set(id, new Set([ownResource]));
+				}
+				const sharedIdentityOwner = sharedHttpIdentityOwner(resolveLaunch);
+				if (sharedIdentityOwner !== undefined) {
+					this._sharedIdentityServers.set(id, sharedIdentityOwner);
+				}
 				if (resolveLaunch.type === McpServerTransportType.HTTP) {
 					this._serverRequestUrls.set(id, new Set([resolveLaunch.uri.toString(true)]));
+				} else if (resolveLaunch.type === McpServerTransportType.Grpc) {
+					// The allow list governs gRPC destinations by their grpc:// or grpcs:// URL, as HTTP ones by theirs.
+					this._serverRequestUrls.set(id, new Set([resolveLaunch.uri.toString(true)]));
+					if (resolveLaunch.tls?.insecure) {
+						this._insecureGrpcServers.add(id);
+					}
 				}
 				proxy.$startMcp(id, {
 					launch: resolveLaunch,
@@ -238,7 +362,30 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 			return allowed.value;
 		}
 
+		if (this._insecureGrpcServers.has(id)) {
+			const denied = this._checkInsecureGrpc(id, definition);
+			if (denied !== undefined) {
+				return denied;
+			}
+		}
+
 		urls.add(url);
+		return undefined;
+	}
+
+	/**
+	 * `tls.insecure` turns off the verification of the server certificate. Under an allow list
+	 * defined by policy it is denied; otherwise the server's log gets a warning once per window.
+	 */
+	private _checkInsecureGrpc(id: number, definition: McpServerDefinition): string | undefined {
+		const policyAllowList = getMcpServerMatchers(this._configurationService.inspect<readonly IMcpServerMatcher[]>(mcpAllowedServersConfig).policyValue);
+		if (policyAllowList !== undefined) {
+			return nls.localize('mcp.grpc.insecureDenied', "The MCP server '{0}' turns off TLS certificate verification (`tls.insecure`), which is not allowed while your organization manages the allowed MCP servers.", definition.label);
+		}
+		if (!this._warnedInsecureGrpcDefinitions.has(definition.id)) {
+			this._warnedInsecureGrpcDefinitions.add(definition.id);
+			this._servers.get(id)?.pushLog(LogLevel.Warning, nls.localize('mcp.grpc.insecureWarning', "TLS certificate verification is turned off for the MCP server '{0}' (`tls.insecure`). Only use this for local development.", definition.label));
+		}
 		return undefined;
 	}
 
@@ -254,6 +401,9 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 			this._servers.delete(id);
 			this._serverDefinitions.delete(id);
 			this._serverRequestUrls.delete(id);
+			this._serverResources.delete(id);
+			this._sharedIdentityServers.delete(id);
+			this._insecureGrpcServers.delete(id);
 			this._serverAuthTracking.untrack(id);
 		}
 	}
@@ -271,6 +421,10 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		this._servers.get(id)?.pushMessage(message);
 	}
 
+	$onDidAbortRequest(id: number, abort: IMcpRequestAbort): void {
+		this._servers.get(id)?.pushAbort(abort);
+	}
+
 	async $getTokenForProviderId(id: number, providerId: string, scopes: string[], options: IMcpAuthenticationOptions = {}): Promise<string | undefined> {
 		const server = this._serverDefinitions.get(id);
 		if (!server) {
@@ -279,14 +433,29 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		return this._getSessionForProvider(id, server, providerId, scopes, { clientId: options.clientId }, options.errorOnUserInteraction);
 	}
 
-	async $getTokenFromServerMetadata(id: number, authDetails: IMcpAuthenticationDetails, { errorOnUserInteraction, forceNewRegistration, clientId }: IMcpAuthenticationOptions = {}): Promise<string | undefined> {
+	async $getTokenFromServerMetadata(id: number, authDetails: IMcpAuthenticationDetails, { errorOnUserInteraction, forceNewRegistration, clientId, rejectedToken }: IMcpAuthenticationOptions = {}): Promise<string | undefined> {
 		const server = this._serverDefinitions.get(id);
 		if (!server) {
 			return undefined;
 		}
 		const authorizationServer = URI.revive(authDetails.authorizationServer);
 		const resourceServer = authDetails.resourceMetadata?.resource ? URI.parse(authDetails.resourceMetadata.resource) : undefined;
-		const resolvedScopes = authDetails.scopes ?? authDetails.resourceMetadata?.scopes_supported ?? authDetails.authorizationServerMetadata.scopes_supported ?? [];
+		if (authDetails.resourceMetadata?.resource) {
+			// Its registrations may be looked up from now on ($getRegisteredAuthorizationServers).
+			let resources = this._serverResources.get(id);
+			if (!resources) {
+				resources = new Set();
+				this._serverResources.set(id, resources);
+			}
+			resources.add(canonicalOrSelf(authDetails.resourceMetadata.resource));
+		}
+		const scopesInput = { challengeScopes: authDetails.scopes, resourceMetadata: authDetails.resourceMetadata, serverMetadata: authDetails.authorizationServerMetadata };
+		// The challenge's scopes, else the resource's; only a server without protected resource metadata falls back to the authorization server's.
+		const resolvedScopes = selectMcpAuthorizationScopes(scopesInput);
+		const launchOAuth = server.launch.type === McpServerTransportType.HTTP || server.launch.type === McpServerTransportType.Grpc ? server.launch.oauth as IMcpRemoteServerOAuthConfiguration | undefined : undefined;
+		// The authorization server pre-registered credentials are configured for (`oauth.authorizationServer`).
+		const policy = resolveMcpOAuthPolicy(launchOAuth);
+		const configuredIssuer = policy.authorizationServer;
 
 		// Enterprise-managed servers route through an XAA / ID-JAG provider keyed by the user-configured
 		// SSO issuer instead of doing a per-server DCR against the resource's authorization server.
@@ -295,13 +464,8 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 			if (!resource) {
 				throw new Error(nls.localize('mcp.enterpriseManaged.missingResource', "The enterprise-managed MCP server '{0}' did not advertise a protected-resource metadata document with a 'resource' identifier.", server.label));
 			}
-			// Per ID-JAG (draft-ietf-oauth-identity-assertion-authz-grant), the token exchange
-			// `audience` is the *authorization server* of the resource — i.e. the issuer that will
-			// redeem the ID-JAG assertion. We pick the first server advertised by the resource's
-			// oauth-protected-resource metadata.
 			const resourceAuthServers = authDetails.resourceMetadata?.authorization_servers ?? [];
-			const audience = resourceAuthServers[0];
-			if (!audience) {
+			if (resourceAuthServers.length === 0) {
 				throw new Error(nls.localize('mcp.enterpriseManaged.missingAS', "The enterprise-managed MCP server '{0}' did not advertise an `authorization_servers` entry in its protected-resource metadata.", server.label));
 			}
 			// For XAA the scopes sent to the IdP token-exchange step are the *resource* scopes
@@ -310,42 +474,82 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 			// which is the IdP's metadata — wrong for this step. Use only the scopes derived from the
 			// WWW-Authenticate challenge or the resource's own metadata.
 			const xaaScopes = authDetails.scopes ?? authDetails.resourceMetadata?.scopes_supported ?? [];
+			const resourceClientId = clientId ?? authDetails.clientId;
+			let clientSecretStorageKey: string | undefined;
+			let resourceClientSecret: string | undefined;
+			let boundIssuer: string | undefined;
+			if (resourceClientId) {
+				// Match the resource-scoped key used by $promptForResourceClientSecret.
+				clientSecretStorageKey = mcpOAuthClientSecretStorageKey(resource, resourceClientId);
+				try {
+					const stored = parseStoredClientSecret(await this._secretStorageService.get(clientSecretStorageKey));
+					resourceClientSecret = stored?.clientSecret;
+					boundIssuer = stored?.issuer;
+				} catch {
+					// Best-effort lookup; fall through.
+				}
+			}
+			// Per ID-JAG (draft-ietf-oauth-identity-assertion-authz-grant), the token exchange
+			// `audience` is the *authorization server* of the resource — the issuer that redeems the
+			// ID-JAG assertion with the resource client's credentials. Those belong to one authorization
+			// server: the configured one (`oauth.authorizationServer`) or the one they were first used
+			// with. It is the audience when the resource lists it; otherwise the one discovery selected,
+			// else the first listed one. Nothing is sent to another than the credentials' own.
+			const expectedIssuer = configuredIssuer ?? boundIssuer;
+			const discoveredIssuer = authDetails.authorizationServerMetadata.issuer;
+			const audience = expectedIssuer !== undefined && resourceAuthServers.includes(expectedIssuer)
+				? expectedIssuer
+				: resourceAuthServers.includes(discoveredIssuer) ? discoveredIssuer : resourceAuthServers[0];
+			if (resourceClientId && expectedIssuer !== undefined && expectedIssuer !== audience) {
+				throw issuerMismatchError(resourceClientId, server.label, expectedIssuer, audience);
+			}
 			const issuer = this._ensureXaaIssuer();
 			const xaaProviderId = await this._authenticationService.createOrGetXaaProvider(issuer);
 			if (!xaaProviderId) {
 				return undefined;
 			}
-			const resourceClientId = clientId ?? authDetails.clientId;
-			let clientSecretStorageKey: string | undefined;
-			let resourceClientSecret: string | undefined;
-			if (resourceClientId) {
-				// Match the resource-scoped key used by $promptForResourceClientSecret.
-				clientSecretStorageKey = mcpOAuthClientSecretStorageKey(resource, resourceClientId);
-				try {
-					resourceClientSecret = await this._secretStorageService.get(clientSecretStorageKey);
-				} catch {
-					// Best-effort lookup; fall through.
-				}
+			if (rejectedToken) {
+				await this._removeRejectedSession(xaaProviderId, rejectedToken);
 			}
-			return this._getSessionForProvider(id, server, xaaProviderId, xaaScopes, {
-				authorizationServer: issuer, clientId: resourceClientId, resource, audience, clientSecretStorageKey
+			const xaaToken = await this._getSessionForProvider(id, server, xaaProviderId, xaaScopes, {
+				authorizationServer: issuer, clientId: resourceClientId, resource, audience, clientSecretStorageKey,
+				// The resource authorization server's endpoints follow the transport's rule, `oauth.allowInsecureHttp` included.
+				allowInsecureHttp: policy.allowInsecureHttp || undefined,
 			}, errorOnUserInteraction, resourceClientSecret);
+			if (xaaToken && clientSecretStorageKey && boundIssuer === undefined) {
+				// First successful use: bind the resource client's secret (looked up, or prompted for by the provider) to the audience.
+				await this._bindClientSecret(clientSecretStorageKey, audience, resourceClientSecret);
+			}
+			return xaaToken;
 		}
 
 		let providerId = await this._authenticationService.getOrActivateProviderIdForServer(authorizationServer, resourceServer);
 
 		const resolvedClientId = clientId ?? authDetails.clientId;
-		const mcpServerUrl = server.launch.type === McpServerTransportType.HTTP ? server.launch.uri.toString(true) : undefined;
+		const mcpServerUrl = server.launch.type === McpServerTransportType.HTTP || server.launch.type === McpServerTransportType.Grpc ? server.launch.uri.toString(true) : undefined;
 		let clientSecretStorageKey: string | undefined;
 		let clientSecret: string | undefined;
+		let boundIssuer: string | undefined;
 		let didLookupClientSecret = false;
 		if (resolvedClientId && mcpServerUrl) {
 			clientSecretStorageKey = mcpOAuthClientSecretStorageKey(mcpServerUrl, resolvedClientId);
 			try {
-				clientSecret = await this._secretStorageService.get(clientSecretStorageKey);
+				const stored = parseStoredClientSecret(await this._secretStorageService.get(clientSecretStorageKey));
+				clientSecret = stored?.clientSecret;
+				boundIssuer = stored?.issuer;
 				didLookupClientSecret = true;
 			} catch {
 				// Best-effort lookup; proceed without a client secret.
+			}
+		}
+
+		// Pre-registered credentials belong to one authorization server: the one configured
+		// (`oauth.authorizationServer`) or the one they were first used with. Nothing is sent to another.
+		if (resolvedClientId) {
+			const expectedIssuer = configuredIssuer ?? boundIssuer;
+			const discoveredIssuer = authDetails.authorizationServerMetadata.issuer;
+			if (expectedIssuer !== undefined && expectedIssuer !== discoveredIssuer) {
+				throw issuerMismatchError(resolvedClientId, server.label, expectedIssuer, discoveredIssuer);
 			}
 		}
 
@@ -372,16 +576,154 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		}
 
 		if (!providerId) {
-			const provider = await this._authenticationService.createDynamicAuthenticationProvider(authorizationServer, authDetails.authorizationServerMetadata, authDetails.resourceMetadata, resolvedClientId, clientSecret);
+			// The resource may have moved to another authorization server: the providers registered with
+			// one it no longer lists must not be used again (SEP-2352).
+			await this._removeStaleDynamicProviders(authorizationServer, authDetails.resourceMetadata);
+			// The metadata comes from the MCP transport, which applied `oauth.pkce`: PKCE S256 must be advertised.
+			// Its dynamic registration follows the transport's endpoint rule, `oauth.allowInsecureHttp` included.
+			const provider = await this._authenticationService.createDynamicAuthenticationProvider(authorizationServer, authDetails.authorizationServerMetadata, authDetails.resourceMetadata, resolvedClientId, clientSecret, { requireAdvertisedPkce: true, ...(policy.allowInsecureHttp ? { allowInsecureHttp: true } : {}) });
 			if (!provider) {
 				return undefined;
 			}
 			providerId = provider.id;
+		} else if (rejectedToken) {
+			await this._removeRejectedSession(providerId, rejectedToken);
 		}
 
-		return this._getSessionForProvider(id, server, providerId, resolvedScopes, {
-			authorizationServer, clientId: resolvedClientId, resource: authDetails.resourceMetadata?.resource, clientSecretStorageKey
-		}, errorOnUserInteraction, clientSecret);
+		const token = await this._getSessionForProvider(id, server, providerId, resolvedScopes, {
+			// The RFC 8707 resource: the one the metadata publishes, else the MCP server URL (the transport's canonical URI).
+			authorizationServer, clientId: resolvedClientId, resource: authDetails.resourceMetadata?.resource ?? authDetails.resource, clientSecretStorageKey,
+			// The provider may be shared with callers whose rules differ (the agent host): this server's rules go with each request.
+			allowInsecureHttp: policy.allowInsecureHttp || undefined, requireAdvertisedPkce: true,
+		}, errorOnUserInteraction, clientSecret, previousMcpAuthorizationFallbackScopes(scopesInput));
+		if (token && clientSecretStorageKey && clientSecret !== undefined && boundIssuer === undefined) {
+			// First successful use: bind the pre-registered credentials to this issuer.
+			await this._bindClientSecret(clientSecretStorageKey, authDetails.authorizationServerMetadata.issuer, clientSecret);
+		}
+		const sharedIdentityOwner = this._sharedIdentityServers.get(id);
+		if (token && sharedIdentityOwner !== undefined) {
+			let own = this._sharedIdentityRegistrations.get(sharedIdentityOwner);
+			if (!own) {
+				own = new Set();
+				this._sharedIdentityRegistrations.set(sharedIdentityOwner, own);
+			}
+			own.add(providerId);
+		}
+		return token;
+	}
+
+	/**
+	 * Records the issuer pre-registered credentials were first used with (best
+	 * effort). Without `clientSecret` the stored secret is bound, if it is still
+	 * unbound: an enterprise-managed sign-in may just have prompted for it.
+	 */
+	private async _bindClientSecret(key: string, issuer: string, clientSecret?: string): Promise<void> {
+		try {
+			if (clientSecret === undefined) {
+				const stored = parseStoredClientSecret(await this._secretStorageService.get(key));
+				if (stored?.clientSecret === undefined || stored.issuer !== undefined) {
+					return;
+				}
+				clientSecret = stored.clientSecret;
+			}
+			await this._secretStorageService.set(key, serializeStoredClientSecret({ clientSecret, issuer }));
+		} catch {
+			// Best effort: the credentials stay unbound and are bound on their next use.
+		}
+	}
+
+	/**
+	 * The authorization servers with a client registration (a dynamic
+	 * authentication provider) for the protected resource at `resource`, the
+	 * MCP server URL, or for its origin (a root protected resource metadata
+	 * document may name the origin). The extension host's discovery prefers the
+	 * first `authorization_servers` entry among them, so the choice of
+	 * authorization server survives restarts.
+	 *
+	 * Only the server's own resource is answered: its URL, a gRPC server's
+	 * HTTPS identity, or a resource its protected resource metadata named
+	 * (seen in {@link $getTokenFromServerMetadata}); any other is `[]`, so a
+	 * server learns nothing about the registrations of others. A server whose
+	 * HTTP identity others can share (socket servers with the same route, an
+	 * HTTP server at `http://localhost`) only learns of the registrations it
+	 * obtained a token through itself in this window.
+	 */
+	async $getRegisteredAuthorizationServers(id: number, resource: string): Promise<IMcpRegisteredAuthorizationServer[]> {
+		if (!this._serverDefinitions.has(id)) {
+			return [];
+		}
+		const sharedIdentityOwner = this._sharedIdentityServers.get(id);
+		const own = sharedIdentityOwner === undefined ? undefined : this._sharedIdentityRegistrations.get(sharedIdentityOwner) ?? new Set<string>();
+		let candidates: string[];
+		try {
+			// A socket server's resource is its HTTP identity: its socket URL has no origin.
+			const canonical = canonicalResourceUri(httpIdentityOf(resource));
+			if (!this._serverResources.get(id)?.has(canonical)) {
+				return [];
+			}
+			const origin = new URL(canonical).origin;
+			candidates = origin === 'null' ? [canonical] : [canonical, canonicalResourceUri(origin)];
+		} catch {
+			return [];
+		}
+		const registered: IMcpRegisteredAuthorizationServer[] = [];
+		for (const provider of this._dynamicAuthenticationProviderStorageService.getInteractedProviders()) {
+			const providerResource = dynamicProviderResource(provider);
+			if (providerResource !== undefined && candidates.includes(canonicalOrSelf(providerResource)) && (own === undefined || own.has(provider.providerId))) {
+				registered.push({ authorizationServer: provider.authorizationServer, resource: providerResource });
+			}
+		}
+		return registered;
+	}
+
+	/**
+	 * Removes the session whose access token the MCP server rejected, so the
+	 * provider cannot hand it out again. Sessions are looked up without a scope
+	 * filter because the rejected token may have been issued for other scopes.
+	 * Only per-resource (dynamic) providers are touched: a rejection by one MCP
+	 * server must not sign the user out of a shared provider.
+	 */
+	private async _removeRejectedSession(providerId: string, rejectedToken: string): Promise<void> {
+		if (!this._authenticationService.isDynamicAuthenticationProvider(providerId)) {
+			return;
+		}
+		try {
+			const sessions = await this._authenticationService.getSessions(providerId);
+			const rejected = sessions.find(session => session.accessToken === rejectedToken);
+			if (rejected) {
+				await this._authenticationService.removeSession(providerId, rejected.id);
+			}
+		} catch {
+			// The provider may be gone already; the new token request proceeds regardless.
+		}
+	}
+
+	/**
+	 * Unregisters the dynamic providers of this resource whose authorization
+	 * server the resource no longer lists: their registration and tokens must
+	 * not be reused once the resource names another one. The providers of an
+	 * authorization server it still lists stay, so a restart (or switching back
+	 * to it) reuses their registration.
+	 */
+	private async _removeStaleDynamicProviders(authorizationServer: URI, resourceMetadata: IMcpAuthenticationDetails['resourceMetadata']): Promise<void> {
+		if (!resourceMetadata?.resource) {
+			return;
+		}
+		try {
+			const currentId = getDynamicAuthenticationProviderId(authorizationServer, resourceMetadata);
+			const listed = new Set((resourceMetadata.authorization_servers ?? []).map(server => URI.parse(server).toString(true)));
+			for (const stale of this._dynamicAuthenticationProviderStorageService.getInteractedProviders()) {
+				if (stale.providerId === currentId || dynamicProviderResource(stale) !== resourceMetadata.resource || listed.has(stale.authorizationServer)) {
+					continue;
+				}
+				if (this._authenticationService.isDynamicAuthenticationProvider(stale.providerId)) {
+					this._authenticationService.unregisterAuthenticationProvider(stale.providerId);
+				}
+				await this._dynamicAuthenticationProviderStorageService.removeDynamicProvider(stale.providerId);
+			}
+		} catch {
+			// Best effort: a stale provider only lingers in the accounts list.
+		}
 	}
 
 	private _ensureXaaIssuer(): URI {
@@ -402,22 +744,43 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		return parsed;
 	}
 
+	/**
+	 * @param previousScopes The scopes earlier versions requested for this server
+	 * (see {@link previousMcpAuthorizationFallbackScopes}): when no session has
+	 * exactly `requestedScopes`, a session of the same provider with these is
+	 * used instead of signing in again.
+	 */
 	private async _getSessionForProvider(
 		serverId: number,
 		server: McpServerDefinition,
 		providerId: string,
-		scopes: string[],
+		requestedScopes: string[],
 		authContext: IMcpServerAuthContext,
 		errorOnUserInteraction: boolean = false,
 		clientSecret?: string,
+		previousScopes?: string[],
 	): Promise<string | undefined> {
-		const { authorizationServer, clientId, resource, audience } = authContext;
-		const providerOptions = { authorizationServer, clientId, clientSecret, resource, audience };
-		const sessions = await this._authenticationService.getSessions(providerId, scopes, { ...providerOptions, silent: errorOnUserInteraction }, true);
-		// Only HTTP servers authenticate, so the server URL is always known here. A token is only released
-		// to a server whose current URL matches the one the user consented to, so changing the URL while
-		// keeping the same id requires re-consent.
-		if (server.launch.type !== McpServerTransportType.HTTP) {
+		const { authorizationServer, clientId, resource, audience, allowInsecureHttp, requireAdvertisedPkce } = authContext;
+		const providerOptions: IAuthenticationProviderSessionOptions = { authorizationServer, clientId, clientSecret, resource, audience };
+		if (allowInsecureHttp) {
+			providerOptions[MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION] = true;
+		}
+		if (requireAdvertisedPkce) {
+			providerOptions[MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION] = true;
+		}
+		let scopes = requestedScopes;
+		let sessions = await this._authenticationService.getSessions(providerId, scopes, { ...providerOptions, silent: errorOnUserInteraction }, true);
+		if (!sessions.length && previousScopes?.length) {
+			const previous = await this._authenticationService.getSessions(providerId, previousScopes, { ...providerOptions, silent: errorOnUserInteraction }, true);
+			if (previous.length) {
+				scopes = previousScopes;
+				sessions = previous;
+			}
+		}
+		// Only HTTP and gRPC servers authenticate, so the server URL is always known here. A token is only
+		// released to a server whose current URL matches the one the user consented to, so changing the URL
+		// while keeping the same id requires re-consent.
+		if (server.launch.type !== McpServerTransportType.HTTP && server.launch.type !== McpServerTransportType.Grpc) {
 			return undefined;
 		}
 		const mcpServerUrl = server.launch.uri.toString(true);
@@ -536,7 +899,7 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 			try {
 				// Replay the original context, but resolve the current secret so rotation takes effect.
 				const clientSecret = context.clientSecretStorageKey
-					? await this._secretStorageService.get(context.clientSecretStorageKey)
+					? parseStoredClientSecret(await this._secretStorageService.get(context.clientSecretStorageKey))?.clientSecret
 					: undefined;
 				await this._getSessionForProvider(serverId, serverDefinition, providerId, scopes, context, true, clientSecret);
 			} catch (e) {
@@ -561,10 +924,12 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		this._telemetryService.publicLog2<IAuthMetadataSource, McpAuthSetupClassification>('mcp/authSetup', data);
 	}
 
-	async $startMcpGateway(chatSessionResource?: UriComponents): Promise<{ servers: { label: string; address: URI }[]; gatewayId: string } | undefined> {
+	async $startMcpGateway(chatSessionResource?: UriComponents, options?: IMcpGatewayStartOptionsDto): Promise<{ servers: IMcpGatewayServerDto[]; gatewayId: string } | undefined> {
 		const result = await this._mcpGatewayService.createGateway(
 			this._extHostContext.extensionHostKind === ExtensionHostKind.Remote,
 			chatSessionResource ? URI.revive(chatSessionResource) : undefined,
+			// Only an explicit opt-in opens the gateway's gRPC listener.
+			options?.grpc === true ? { grpc: true } : undefined,
 		);
 		if (!result) {
 			return undefined;
@@ -579,12 +944,12 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		const store = new DisposableStore();
 		store.add(result);
 		store.add(result.onDidChangeServers(servers => {
-			this._proxy.$onDidChangeGatewayServers(gatewayId, servers.map(s => ({ label: s.label, address: s.address })));
+			this._proxy.$onDidChangeGatewayServers(gatewayId, servers.map(gatewayServerDto));
 		}));
 		this._gateways.set(gatewayId, store);
 
 		return {
-			servers: result.servers.map(s => ({ label: s.label, address: s.address })),
+			servers: result.servers.map(gatewayServerDto),
 			gatewayId,
 		};
 	}
@@ -623,6 +988,10 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		this._servers.clear();
 		this._serverDefinitions.clear();
 		this._serverRequestUrls.clear();
+		this._serverResources.clear();
+		this._sharedIdentityServers.clear();
+		this._sharedIdentityRegistrations.clear();
+		this._insecureGrpcServers.clear();
 		this._serverAuthTracking.clear();
 		super.dispose();
 	}
@@ -635,15 +1004,22 @@ class ExtHostMcpServerLaunch extends Disposable implements IMcpMessageTransport 
 	private readonly _onDidLog = this._register(new Emitter<{ level: LogLevel; message: string }>());
 	public readonly onDidLog = this._onDidLog.event;
 
-	private readonly _onDidReceiveMessage = this._register(new Emitter<MCP.JSONRPCMessage>());
+	private readonly _onDidReceiveMessage = this._register(new Emitter<JsonRpcMessage>());
 	public readonly onDidReceiveMessage = this._onDidReceiveMessage.event;
+
+	private readonly _onDidAbortRequest = this._register(new Emitter<IMcpRequestAbort>());
+	public readonly onDidAbortRequest = this._onDidAbortRequest.event;
 
 	pushLog(level: LogLevel, message: string): void {
 		this._onDidLog.fire({ message, level });
 	}
 
+	pushAbort(abort: IMcpRequestAbort): void {
+		this._onDidAbortRequest.fire(abort);
+	}
+
 	pushMessage(message: string): void {
-		let parsed: MCP.JSONRPCMessage | undefined;
+		let parsed: JsonRpcMessage | JsonRpcMessage[] | undefined;
 		try {
 			parsed = JSON.parse(message);
 		} catch (e) {
@@ -662,7 +1038,8 @@ class ExtHostMcpServerLaunch extends Disposable implements IMcpMessageTransport 
 	constructor(
 		extHostKind: ExtensionHostKind,
 		public readonly stop: () => void,
-		public readonly send: (message: MCP.JSONRPCMessage) => void,
+		public readonly send: (message: JsonRpcMessage, envelope?: IMcpMessageEnvelope) => void,
+		public readonly cancelRequest: (requestId: JsonRpcId) => void,
 	) {
 		super();
 
@@ -701,6 +1078,10 @@ export interface IMcpServerAuthContext {
 	readonly clientId?: string;
 	readonly resource?: string;
 	readonly audience?: string;
+	/** The server's `oauth.allowInsecureHttp`, handed to the enterprise-managed or dynamic provider with each request. */
+	readonly allowInsecureHttp?: boolean;
+	/** Whether the dynamic provider refuses, for this server's requests, an authorization server that does not advertise PKCE `S256`. */
+	readonly requireAdvertisedPkce?: boolean;
 	/** Secret-storage reference; the secret itself is never retained here. */
 	readonly clientSecretStorageKey?: string;
 }

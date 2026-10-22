@@ -28,6 +28,7 @@ import {
 	parseHooksJson,
 	resolveComponentDirs,
 	normalizeMcpServerConfiguration,
+	getUnsupportedMcpServerConfigurationMessage,
 	shellQuotePluginRootInCommand,
 	interpolateMcpPluginRoot,
 	convertBareEnvVarsToVsCodeSyntax,
@@ -239,6 +240,14 @@ suite('pluginParsers', () => {
 			const result = normalizeMcpServerConfiguration({ url: 'https://example.com' });
 			assert.ok(result);
 			assert.strictEqual(result!.type, McpServerType.REMOTE);
+		});
+
+		test('rejects grpc with a message', () => {
+			const grpc = { type: 'grpc', url: 'grpcs://localhost:50051', binding: 'tunnel' };
+			assert.strictEqual(normalizeMcpServerConfiguration(grpc), undefined);
+			assert.ok(getUnsupportedMcpServerConfigurationMessage(grpc)?.includes('gRPC'));
+			assert.strictEqual(getUnsupportedMcpServerConfigurationMessage({ type: 'http', url: 'https://example.com' }), undefined);
+			assert.strictEqual(getUnsupportedMcpServerConfigurationMessage({ command: 'node' }), undefined);
 		});
 
 		test('rejects ws type', () => {

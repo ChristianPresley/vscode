@@ -13,6 +13,7 @@ import { Location } from '../../../../../editor/common/languages.js';
 import { ITextModelService } from '../../../../../editor/common/services/resolverService.js';
 import { ConfigurationTarget } from '../../../../../platform/configuration/common/configuration.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
+import { McpServerType } from '../../../../../platform/mcp/common/mcpPlatformTypes.js';
 import { StorageScope } from '../../../../../platform/storage/common/storage.js';
 import { IWorkbenchLocalMcpServer } from '../../../../services/mcp/common/mcpWorkbenchManagementService.js';
 import { getMcpServerMapping } from '../mcpConfigFileUtils.js';
@@ -90,15 +91,17 @@ export class InstalledMcpServersDiscovery extends Disposable implements IMcpDisc
 					this.logService.warn(`Skipping invalid MCP server configuration: ${server.name}`);
 					continue;
 				}
-				const defaultCwd = config.type === 'http' ? undefined : mcpConfigPath?.workspaceFolder?.uri;
+				const isStdio = config.type === McpServerType.LOCAL;
+				const defaultCwd = isStdio ? mcpConfigPath?.workspaceFolder?.uri : undefined;
 
 				definitions[1].push({
 					id: `${collectionId}.${server.name}`,
 					label: server.name,
 					launch,
-					sandboxEnabled: config.type === 'http' ? undefined : config.sandboxEnabled,
+					sandboxEnabled: isStdio ? config.sandboxEnabled : undefined,
 					defaultCwd,
 					cacheNonce: await McpServerLaunch.hash(launch),
+					protocolVersionHint: config.protocolVersion,
 					roots: mcpConfigPath?.workspaceFolder ? [mcpConfigPath.workspaceFolder.uri] : undefined,
 					variableReplacement: {
 						folder: mcpConfigPath?.workspaceFolder,

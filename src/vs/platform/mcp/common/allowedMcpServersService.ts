@@ -113,7 +113,7 @@ export class AllowedMcpServersService extends Disposable implements IAllowedMcpS
 	private toIdentity(mcpServer: IGalleryMcpServer | ILocalMcpServer | IInstallableMcpServer): IMcpServerIdentity {
 		if (hasKey(mcpServer, { config: true })) {
 			const config = mcpServer.config;
-			if (config.type === McpServerType.REMOTE) {
+			if (config.type === McpServerType.REMOTE || config.type === McpServerType.GRPC) {
 				return { name: mcpServer.name, url: config.url };
 			}
 			return { name: mcpServer.name, command: [config.command, ...(config.args ?? [])] };

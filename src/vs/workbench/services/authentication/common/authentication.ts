@@ -119,10 +119,28 @@ export interface AllowedExtension {
 	trusted?: boolean;
 }
 
+/** How a dynamic authentication provider is set up. */
+export interface IDynamicAuthenticationProviderOptions {
+	/**
+	 * Refuse to sign in when the authorization server does not advertise PKCE
+	 * `S256`: the rule for MCP servers, whose metadata the MCP transport
+	 * produced (`oauth.pkce` in `mcp.json` is its escape hatch). Other providers
+	 * still send an `S256` challenge but only log the omission.
+	 */
+	readonly requireAdvertisedPkce?: boolean;
+	/**
+	 * Dynamic client registration may use a plain-HTTP registration endpoint
+	 * on a non-loopback host: an MCP server's `oauth.allowInsecureHttp`, the
+	 * rule its transport discovered the metadata with. Otherwise the provider
+	 * registers only at an HTTPS or loopback endpoint.
+	 */
+	readonly allowInsecureHttp?: boolean;
+}
+
 export interface IAuthenticationProviderHostDelegate {
 	/** Priority for this delegate, delegates are tested in descending priority order */
 	readonly priority: number;
-	create(authorizationServer: URI, serverMetadata: IAuthorizationServerMetadata, resource: IAuthorizationProtectedResourceMetadata | undefined, clientId?: string, clientSecret?: string): Promise<string>;
+	create(authorizationServer: URI, serverMetadata: IAuthorizationServerMetadata, resource: IAuthorizationProtectedResourceMetadata | undefined, clientId?: string, clientSecret?: string, options?: IDynamicAuthenticationProviderOptions): Promise<string>;
 	/**
 	 * Creates an XAA (enterprise-managed, ID-JAG) authentication provider for the given SSO issuer.
 	 * The returned string is the provider id.
@@ -259,8 +277,9 @@ export interface IAuthenticationService {
 	/**
 	 * Creates a dynamic authentication provider for the given server metadata
 	 * @param serverMetadata The metadata for the server that is being authenticated against
+	 * @param options How the provider is set up (PKCE policy)
 	 */
-	createDynamicAuthenticationProvider(authorizationServer: URI, serverMetadata: IAuthorizationServerMetadata, resourceMetadata: IAuthorizationProtectedResourceMetadata | undefined, clientId?: string, clientSecret?: string): Promise<IAuthenticationProvider | undefined>;
+	createDynamicAuthenticationProvider(authorizationServer: URI, serverMetadata: IAuthorizationServerMetadata, resourceMetadata: IAuthorizationProtectedResourceMetadata | undefined, clientId?: string, clientSecret?: string, options?: IDynamicAuthenticationProviderOptions): Promise<IAuthenticationProvider | undefined>;
 
 	/**
 	 * Gets or creates a built-in XAA (enterprise-managed, ID-JAG) authentication provider for the given

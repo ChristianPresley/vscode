@@ -6,7 +6,7 @@
 import * as nls from '../../../nls.js';
 import type * as vscode from 'vscode';
 import { URL } from 'url';
-import { ExtHostAuthentication, DynamicAuthProvider, IExtHostAuthentication } from '../common/extHostAuthentication.js';
+import { ExtHostAuthentication, DynamicAuthProvider, IExtHostAuthentication, assertSecureAuthEndpoint } from '../common/extHostAuthentication.js';
 import { XaaifyAuthProvider } from '../common/extHostXaaAuthProvider.js';
 import { IExtHostRpcService } from '../common/extHostRpcService.js';
 import { IExtHostInitDataService } from '../common/extHostInitDataService.js';
@@ -15,14 +15,14 @@ import { IExtHostUrlsService } from '../common/extHostUrls.js';
 import { ILoggerService, ILogService } from '../../../platform/log/common/log.js';
 import { MainThreadAuthenticationShape } from '../common/extHost.protocol.js';
 import { Proxied } from '../../services/extensions/common/proxyIdentifier.js';
-import { IAuthorizationServerMetadata, IAuthorizationProtectedResourceMetadata, IAuthorizationTokenResponse, IAuthorizationDeviceResponse, isAuthorizationDeviceResponse, isAuthorizationTokenResponse, IAuthorizationDeviceTokenErrorResponse, AuthorizationErrorType, AuthorizationDeviceCodeErrorType } from '../../../base/common/oauth.js';
+import { IAuthorizationServerMetadata, IAuthorizationProtectedResourceMetadata, IAuthorizationTokenResponse, IAuthorizationDeviceResponse, isAuthorizationDeviceResponse, IAuthorizationDeviceTokenErrorResponse, AuthorizationErrorType, AuthorizationDeviceCodeErrorType, OAuthClientError } from '../../../base/common/oauth.js';
 import { Emitter } from '../../../base/common/event.js';
 import { raceCancellationError } from '../../../base/common/async.js';
 import { IExtHostProgress } from '../common/extHostProgress.js';
 import { IProgressStep } from '../../../platform/progress/common/progress.js';
 import { CancellationError, isCancellationError } from '../../../base/common/errors.js';
 import { URI } from '../../../base/common/uri.js';
-import { LoopbackAuthServer } from './loopbackServer.js';
+import { ILoopbackServer, IOAuthResult, LoopbackAuthServer } from './loopbackServer.js';
 
 export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 
@@ -82,10 +82,10 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		if (!this._serverMetadata.token_endpoint) {
 			throw new Error('Token endpoint not available in server metadata');
 		}
+		this._assertPkceSupported();
 
 		// Generate PKCE code verifier (random string) and code challenge (SHA-256 hash of verifier)
-		const codeVerifier = this.generateRandomString(64);
-		const codeChallenge = await this.generateCodeChallenge(codeVerifier);
+		const { verifier: codeVerifier, challenge: codeChallenge } = await this._createPkcePair();
 
 		// Generate a random state value to prevent CSRF
 		const nonce = this.generateRandomString(32);
@@ -115,11 +115,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		}
 
 		// Create and start the loopback server
-		const server = new LoopbackAuthServer(
-			this._logger,
-			appUri,
-			this._initData.environment.appName
-		);
+		const server = this._createLoopbackServer(appUri);
 		try {
 			await server.start();
 		} catch (err) {
@@ -146,11 +142,10 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 				message: nls.localize('completeAuth', "Complete the authentication in the browser window that has opened."),
 			});
 
-			// Wait for the authorization code via the loopback server
-			let code: string | undefined;
+			// Wait for the authorization response via the loopback server
+			let response: IOAuthResult;
 			try {
-				const response = await raceCancellationError(promise, token);
-				code = response.code;
+				response = await raceCancellationError(promise, token);
 			} catch (err) {
 				if (isCancellationError(err)) {
 					this._logger.info('Authorization code request was cancelled by the user.');
@@ -159,6 +154,10 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 				this._logger.error(`Failed to receive authorization code: ${err}`);
 				throw new Error(`Failed to receive authorization code: ${err}`);
 			}
+			// RFC 9207: the issuer first, then the state, then an error; only then is the code used. The
+			// loopback page showed none of the response, so what the authorization server said is only
+			// surfaced here, once the issuer is validated.
+			const code = this._validateAuthorizationResponse(response, server.state);
 			this._logger.info(`Authorization code received for scopes: ${scopeString}`);
 
 			// Exchange the authorization code for tokens
@@ -172,6 +171,11 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		}
 	}
 
+	/** The loopback server that receives the authorization response at `http://127.0.0.1:<port>/`. */
+	protected _createLoopbackServer(appUri: URI): ILoopbackServer {
+		return new LoopbackAuthServer(this._logger, appUri, this._initData.environment.appName);
+	}
+
 	private async _createWithDeviceCode(scopes: string[], progress: vscode.Progress<IProgressStep>, token: vscode.CancellationToken): Promise<IAuthorizationTokenResponse> {
 		if (!this._serverMetadata.token_endpoint) {
 			throw new Error('Token endpoint not available in server metadata');
@@ -181,6 +185,10 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		}
 
 		const deviceAuthUrl = this._serverMetadata.device_authorization_endpoint;
+		// The rule of the authorization and token endpoints (the OAuth client's metadata validation, which
+		// does not use this endpoint): HTTPS or loopback, unless the MCP server's `oauth.allowInsecureHttp`
+		// allows plain HTTP. The user's code would otherwise be issued, and polled for, in cleartext.
+		assertSecureAuthEndpoint(deviceAuthUrl, 'deviceAuthorization', this._allowsInsecureHttp);
 		const scopeString = scopes.join(' ');
 		this._logger.info(`Starting device code flow for scopes: ${scopeString}`);
 
@@ -255,29 +263,28 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 			}
 
 			// Poll the token endpoint
-			const tokenRequest = new URLSearchParams();
-			tokenRequest.append('grant_type', 'urn:ietf:params:oauth:grant-type:device_code');
-			tokenRequest.append('device_code', deviceCodeData.device_code);
-			tokenRequest.append('client_id', this._clientId);
+			const tokenParams: Record<string, string> = {
+				grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+				device_code: deviceCodeData.device_code,
+			};
 
 			// Add resource indicator if available (RFC 8707)
 			if (resource) {
-				tokenRequest.append('resource', resource);
+				tokenParams.resource = resource;
 			}
+			const tokenRequest = this._buildTokenRequest(tokenParams);
 
 			try {
 				const tokenResponse = await fetch(this._serverMetadata.token_endpoint, {
 					method: 'POST',
-					headers: {
-						'Content-Type': 'application/x-www-form-urlencoded',
-						'Accept': 'application/json'
-					},
-					body: tokenRequest.toString()
+					headers: tokenRequest.headers,
+					body: tokenRequest.body
 				});
 
 				if (tokenResponse.ok) {
-					const tokenData: IAuthorizationTokenResponse = await tokenResponse.json();
-					if (!isAuthorizationTokenResponse(tokenData)) {
+					// The rules of the code grant and of a refresh: HTTP 200 with a usable bearer token.
+					const tokenData = this._acceptTokenResponse(tokenResponse, await tokenResponse.json());
+					if (!tokenData) {
 						this._logger.error('Invalid token response received from server');
 						throw new Error('Invalid token response received from server');
 					}
@@ -313,7 +320,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 					}
 				}
 			} catch (error) {
-				if (isCancellationError(error)) {
+				if (isCancellationError(error) || error instanceof OAuthClientError) {
 					throw error;
 				}
 				throw new Error(`Error polling for token: ${error}`);

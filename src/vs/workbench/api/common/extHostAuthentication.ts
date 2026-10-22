@@ -6,7 +6,7 @@
 import type * as vscode from 'vscode';
 import * as nls from '../../../nls.js';
 import { Emitter, Event } from '../../../base/common/event.js';
-import { MainContext, MainThreadAuthenticationShape, ExtHostAuthenticationShape } from './extHost.protocol.js';
+import { MainContext, MainThreadAuthenticationShape, ExtHostAuthenticationShape, IRegisterDynamicAuthProviderOptions } from './extHost.protocol.js';
 import { Proxied } from '../../services/extensions/common/proxyIdentifier.js';
 import { Disposable, ProgressLocation } from './extHostTypes.js';
 import { IExtensionDescription, ExtensionIdentifier } from '../../../platform/extensions/common/extensions.js';
@@ -14,7 +14,9 @@ import { getAuthenticationSessionRequestKey, IAuthenticationGetSessionsOptions, 
 import { createDecorator } from '../../../platform/instantiation/common/instantiation.js';
 import { IExtHostRpcService } from './extHostRpcService.js';
 import { URI, UriComponents } from '../../../base/common/uri.js';
-import { AuthorizationErrorType, fetchDynamicRegistration, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationErrorResponse, isAuthorizationTokenResponse } from '../../../base/common/oauth.js';
+import { AuthorizationErrorType, buildClientAuthentication, canonicalResourceUri, createPkcePair, fetchDynamicRegistration, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationProtectedResourceMetadata, IAuthorizationRedirectParams, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationErrorResponse, isAuthorizationTokenResponse, isValidClientMetadataUrl, OAuthClientError, OAuthTokenEndpointAuthMethod, parseAuthorizationRedirect, pkceSupported, selectRegistrationAuthMethod, selectTokenEndpointAuthMethod, validateIssuerParameter } from '../../../base/common/oauth.js';
+import { isSecureOAuthEndpoint, redact, resourceIndicatorFor } from '../../../base/common/oauthClient.js';
+import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION, MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION } from './mcpOAuthClientFactory.js';
 import { IExtHostWindow } from './extHostWindow.js';
 import { IExtHostInitDataService } from './extHostInitDataService.js';
 import { ILogger, ILoggerService, ILogService } from '../../../platform/log/common/log.js';
@@ -22,7 +24,6 @@ import { autorun, derivedOpts, IObservable, ISettableObservable, observableValue
 import { stringHash } from '../../../base/common/hash.js';
 import { DisposableStore, IDisposable } from '../../../base/common/lifecycle.js';
 import { IExtHostUrlsService } from './extHostUrls.js';
-import { encodeBase64, VSBuffer } from '../../../base/common/buffer.js';
 import { equals as arraysEqual } from '../../../base/common/arrays.js';
 import { IExtHostProgress } from './extHostProgress.js';
 import { NotificationTelemetryId } from '../../../platform/notification/common/notificationTelemetry.js';
@@ -47,6 +48,21 @@ interface ProviderWithMetadata {
  */
 export function reviveAccountIcon<T extends { readonly icon?: vscode.Uri | UriComponents }>(account: T): T & { readonly icon?: vscode.Uri } {
 	return { ...account, icon: URI.revive(account.icon) };
+}
+
+/**
+ * The rule of the OAuth client's metadata validation for the authorization and token endpoints,
+ * applied to the endpoints the providers here call themselves: HTTPS or loopback, unless the MCP
+ * server's `oauth.allowInsecureHttp` allows plain HTTP. Anything else is a terminal
+ * `insecure_endpoint` {@link OAuthClientError}, with a message the user may see.
+ */
+export function assertSecureAuthEndpoint(url: string, endpoint: 'registration' | 'deviceAuthorization', allowInsecureHttp: boolean | undefined): void {
+	if (isSecureOAuthEndpoint(url, allowInsecureHttp)) {
+		return;
+	}
+	throw new OAuthClientError('insecure_endpoint', endpoint === 'registration'
+		? nls.localize('insecureRegistrationEndpoint', "The registration endpoint '{0}' is not served over HTTPS, so no client is registered there.", url)
+		: nls.localize('insecureDeviceAuthorizationEndpoint', "The device authorization endpoint '{0}' is not served over HTTPS, so no device code is requested there.", url));
 }
 
 function getInteractiveOptionsForRequestKey(options: boolean | vscode.AuthenticationGetSessionPresentationOptions | undefined) {
@@ -279,17 +295,25 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 		resourceMetadata: IAuthorizationProtectedResourceMetadata | undefined,
 		clientId: string | undefined,
 		clientSecret: string | undefined,
-		initialTokens: IAuthorizationToken[] | undefined
+		initialTokens: IAuthorizationToken[] | undefined,
+		tokenEndpointAuthMethod?: OAuthTokenEndpointAuthMethod,
+		options?: IRegisterDynamicAuthProviderOptions,
 	): Promise<string> {
 		if (!clientId) {
 			const authorizationServer = URI.revive(authorizationServerComponents);
+			tokenEndpointAuthMethod = undefined;
 			if (serverMetadata.registration_endpoint) {
 				try {
-					const registration = await fetchDynamicRegistration(serverMetadata, this._initData.environment.appName, resourceMetadata?.scopes_supported);
+					// Client metadata is posted there and the response carries the client secret.
+					assertSecureAuthEndpoint(serverMetadata.registration_endpoint, 'registration', options?.allowInsecureHttp);
+					const registration = await fetchDynamicRegistration(serverMetadata, this._initData.environment.appName, resourceMetadata?.scopes_supported, {
+						tokenEndpointAuthMethod: selectRegistrationAuthMethod(serverMetadata.token_endpoint_auth_methods_supported),
+					});
 					clientId = registration.client_id;
 					clientSecret = registration.client_secret;
+					tokenEndpointAuthMethod = selectTokenEndpointAuthMethod(registration.token_endpoint_auth_method, serverMetadata.token_endpoint_auth_methods_supported, registration.client_secret !== undefined);
 				} catch (err) {
-					this._logService.warn(`Dynamic registration failed for ${authorizationServer.toString()}: ${err.message}. Prompting user for client ID and client secret...`);
+					this._logService.warn(`Dynamic registration failed for ${authorizationServer.toString()}: ${redact(err.message)}. Prompting user for client ID and client secret...`);
 				}
 			}
 			// Still no client id so dynamic client registration was either not supported or failed
@@ -324,6 +348,14 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 			this._onDidDynamicAuthProviderTokensChange,
 			initialTokens || []
 		);
+		if (tokenEndpointAuthMethod) {
+			provider.setTokenEndpointAuthMethod(tokenEndpointAuthMethod);
+		}
+		if (options?.requireAdvertisedPkce) {
+			provider.requireAdvertisedPkce();
+		}
+		// `options.allowInsecureHttp` was the creator's rule for the registration above only: the provider is
+		// shared with callers whose rule may differ, so it reads each caller's rule from its requests.
 
 		// Use the sequencer to ensure dynamic provider registration is serialized
 		await this._providerOperations.queue(provider.id, async () => {
@@ -338,7 +370,8 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 						provider.onDidChangeClientId(() => this._proxy.$sendDidChangeDynamicProviderInfo({
 							providerId: provider.id,
 							clientId: provider.clientId,
-							clientSecret: provider.clientSecret
+							clientSecret: provider.clientSecret,
+							tokenEndpointAuthMethod: provider.tokenEndpointAuthMethod,
 						}))
 					),
 					options: { supportsMultipleAccounts: true }
@@ -352,7 +385,8 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 				authorizationServer: authorizationServerComponents,
 				resourceServer: resourceMetadata ? URI.parse(resourceMetadata.resource) : undefined,
 				clientId: provider.clientId,
-				clientSecret: provider.clientSecret
+				clientSecret: provider.clientSecret,
+				tokenEndpointAuthMethod: provider.tokenEndpointAuthMethod,
 			});
 		});
 
@@ -463,6 +497,34 @@ const MICROSOFT_AUTH_HOSTS = [
 	'sts.windows.net',
 ];
 
+/** The `nonce` parameter of a query string. */
+function nonceOfQuery(query: string): string | undefined {
+	return new URLSearchParams(query.startsWith('?') ? query.substring(1) : query).get('nonce') ?? undefined;
+}
+
+/**
+ * The `nonce` of the callback URI a forwarded `state` names; `undefined` when it names none.
+ *
+ * On desktop the state is the app URI itself (`vscode://dynamicauthprovider/…?nonce=…`). On the web
+ * and in remote-in-browser setups (Codespaces), `createAppUri` returns the workbench's callback page,
+ * which carries the app URI's own query encoded in its `vscode-query` parameter
+ * (`https://<host>/callback?vscode-reqid=…&vscode-scheme=…&vscode-query=nonce%3D…`; the page decodes
+ * it and hands the URI handler the app URI): the nonce is read from there when it is present. The
+ * state may arrive as sent (`URI.toString()` encodes the whole query once more) or decoded.
+ */
+function nonceOfCallbackUri(uri: string): string | undefined {
+	let query: string;
+	try {
+		// `URI.parse` decodes the query once.
+		query = URI.parse(uri).query;
+	} catch {
+		return undefined;
+	}
+	const params = new URLSearchParams(query);
+	const appQuery = params.get('vscode-query');
+	return appQuery !== null ? nonceOfQuery(appQuery) : params.get('nonce') ?? undefined;
+}
+
 function isMicrosoftAuthUrl(url: string | undefined): boolean {
 	if (!url) {
 		return false;
@@ -496,6 +558,26 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	protected readonly _logger: ILogger;
 	protected readonly _isMicrosoftAuth: boolean;
 	private readonly _disposable: DisposableStore;
+	/** How the client authenticates at the token endpoint (RFC 6749 section 2.3). */
+	protected _tokenEndpointAuthMethod: OAuthTokenEndpointAuthMethod;
+	/** Whether the creator of the provider (an MCP server) refuses an authorization server that does not advertise PKCE `S256`. */
+	private _requireAdvertisedPkce = false;
+	/**
+	 * The `resource` the request being served names (`options.resource` of {@link getSessions} and
+	 * {@link createSession}): the MCP server URL when the server publishes no protected resource
+	 * metadata. The extension host serializes the requests to a provider, so it belongs to one request.
+	 */
+	private _requestedResource: string | undefined;
+	/**
+	 * The endpoint policy of the request being served, read like {@link _requestedResource}: a
+	 * provider is shared by every caller with the same authorization server and resource (servers
+	 * in mcp.json, the agent host), so the policy of the caller applies, not the creator's. The
+	 * workbench passes an MCP server's `oauth.allowInsecureHttp` and its PKCE rule as workbench-only
+	 * session options ({@link MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION},
+	 * {@link MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION}); any other request gets the strict
+	 * endpoint rule.
+	 */
+	private _requestPolicy: { readonly allowInsecureHttp: boolean; readonly requireAdvertisedPkce: boolean } = { allowInsecureHttp: false, requireAdvertisedPkce: false };
 
 	constructor(
 		@IExtHostWindow protected readonly _extHostWindow: IExtHostWindow,
@@ -511,7 +593,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		protected _clientSecret: string | undefined,
 		onDidDynamicAuthProviderTokensChange: Emitter<{ authProviderId: string; clientId: string; tokens: IAuthorizationToken[] }>,
 		initialTokens: IAuthorizationToken[],
-		private readonly _fetch: typeof fetch = fetch,
+		// Not `fetch` itself: called as a method, a browser's `fetch` throws "Illegal invocation".
+		protected readonly _fetch: typeof fetch = (input, init) => fetch(input, init),
 	) {
 		const stringifiedServer = authorizationServer.toString(true);
 		// Auth Provider Id is a combination of the authorization server and the resource, if provided.
@@ -523,6 +606,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		// Metadata is untrusted, so the token endpoint must also be Microsoft to earn Microsoft-specific treatment.
 		this._isMicrosoftAuth = (isMicrosoftAuthUrl(stringifiedServer) || isMicrosoftAuthUrl(_serverMetadata.authorization_endpoint))
 			&& isMicrosoftAuthUrl(_serverMetadata.token_endpoint);
+		// A client without a recorded method is public without a secret, and uses the method the server supports with one.
+		this._tokenEndpointAuthMethod = selectTokenEndpointAuthMethod(undefined, _serverMetadata.token_endpoint_auth_methods_supported, _clientSecret !== undefined);
 
 		this._logger = loggerService.createLogger(this.id, { name: `Auth: ${this.label}` });
 		this._disposable = new DisposableStore();
@@ -559,11 +644,173 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		return this._clientSecret;
 	}
 
+	get tokenEndpointAuthMethod(): OAuthTokenEndpointAuthMethod {
+		return this._tokenEndpointAuthMethod;
+	}
+
+	/** Records the token endpoint authentication method the registration was made with. */
+	setTokenEndpointAuthMethod(method: OAuthTokenEndpointAuthMethod): void {
+		this._tokenEndpointAuthMethod = method;
+	}
+
 	/**
-	 * The RFC 8707 resource indicator to send in requests. Omitted for Microsoft auth.
+	 * Makes the authorization code flows refuse an authorization server that
+	 * does not advertise PKCE `S256`: the rule for MCP servers, whose metadata
+	 * the MCP transport produced (`oauth.pkce: "assume-supported"` in
+	 * `mcp.json` makes it hand on metadata that advertises it). It applies to
+	 * every request; a request can also ask for it on its own
+	 * ({@link MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION}).
+	 */
+	requireAdvertisedPkce(): void {
+		this._requireAdvertisedPkce = true;
+	}
+
+	/** Reads the resource and the endpoint policy of the request being served (see {@link _requestPolicy}). */
+	private _beginRequest(options: { readonly resource?: unknown }): void {
+		this._requestedResource = typeof options.resource === 'string' ? options.resource : undefined;
+		const record = options as Record<string, unknown>;
+		this._requestPolicy = {
+			allowInsecureHttp: record[MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION] === true,
+			requireAdvertisedPkce: record[MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION] === true,
+		};
+	}
+
+	/**
+	 * Whether the request being served may use a plain-HTTP endpoint on a non-loopback host for
+	 * credentials (a new registration, the device authorization endpoint): an MCP server's
+	 * `oauth.allowInsecureHttp`, passed by the workbench with each of its requests. Otherwise only
+	 * HTTPS or loopback endpoints are used.
+	 */
+	protected get _allowsInsecureHttp(): boolean {
+		return this._requestPolicy.allowInsecureHttp;
+	}
+
+	/**
+	 * The authorization code flows always send an `S256` challenge. Only a
+	 * provider for an MCP server ({@link requireAdvertisedPkce}), or a request
+	 * for one, refuses an authorization server that does not advertise it;
+	 * others (an identity provider such as Entra ID, which does not advertise
+	 * `code_challenge_methods_supported`) only log the omission.
+	 */
+	protected _assertPkceSupported(): void {
+		if (pkceSupported(this._serverMetadata)) {
+			return;
+		}
+		if (this._requireAdvertisedPkce || this._requestPolicy.requireAdvertisedPkce) {
+			throw new OAuthClientError('pkce_unsupported', nls.localize('pkceUnsupported', "The authorization server '{0}' does not advertise support for PKCE (S256), which is required to sign in securely.", this._serverMetadata.issuer));
+		}
+		this._logger.warn(`The authorization server ${this._serverMetadata.issuer} does not advertise PKCE S256 support; sending an S256 code challenge anyway.`);
+	}
+
+	/** Creates the PKCE verifier and its `S256` challenge (RFC 7636). */
+	protected _createPkcePair(): Promise<{ verifier: string; challenge: string }> {
+		return createPkcePair(
+			bytes => crypto.getRandomValues(new Uint8Array(bytes)),
+			async data => new Uint8Array(await crypto.subtle.digest('SHA-256', data as Uint8Array<ArrayBuffer>)),
+		);
+	}
+
+	/**
+	 * Validates an authorization response in the order RFC 9207 requires: the
+	 * `iss` parameter first (it is compared to the recorded issuer by exact
+	 * string equality), then the `state`, then an `error`. Returns the
+	 * authorization code.
+	 *
+	 * @param expectedState The `state` the request carried, or whether the
+	 * response returned it, for a redirect that delivers it in another form.
+	 */
+	protected _validateAuthorizationResponse(params: IAuthorizationRedirectParams, expectedState: string | ((params: IAuthorizationRedirectParams) => boolean)): string {
+		const issError = validateIssuerParameter(this._serverMetadata.authorization_response_iss_parameter_supported, params.iss, this._serverMetadata.issuer);
+		if (issError) {
+			this._logger.error(`Rejecting the authorization response: ${issError.message}`);
+			throw issError;
+		}
+		if (typeof expectedState === 'string' ? params.state !== expectedState : !expectedState(params)) {
+			this._logger.error('Rejecting the authorization response: it does not carry the state of the request');
+			throw new OAuthClientError('state_mismatch', nls.localize('authStateMismatch', "The authorization response does not carry the state of the request."));
+		}
+		if (params.error) {
+			const reason = params.errorDescription ? `${params.error} (${params.errorDescription})` : params.error;
+			throw new OAuthClientError('authorization_denied', nls.localize('authDenied', "The authorization server denied the request: {0}", reason), { error: params.error, errorDescription: params.errorDescription });
+		}
+		if (!params.code) {
+			throw new OAuthClientError('authorization_denied', nls.localize('authNoCode', "Authentication failed: no authorization code was received."));
+		}
+		return params.code;
+	}
+
+	/** The token endpoint request: the grant's parameters plus the client authentication of {@link tokenEndpointAuthMethod}. */
+	protected _buildTokenRequest(params: Record<string, string>): { headers: Record<string, string>; body: string } {
+		const auth = buildClientAuthentication(this._tokenEndpointAuthMethod, this._clientId, this._clientSecret);
+		const body = new URLSearchParams({ ...auth.body, ...params });
+		return {
+			headers: {
+				'Content-Type': 'application/x-www-form-urlencoded',
+				'Accept': 'application/json',
+				...auth.headers,
+			},
+			body: body.toString(),
+		};
+	}
+
+	/**
+	 * The token response of the code grant and of a refresh, by the rule of the OAuth client
+	 * (`OAuthClient`): HTTP 200 (RFC 6749 section 5.1) with a token response; `undefined` for any
+	 * other, which the caller reports. A 200 response whose token is empty or not a `Bearer` token
+	 * (RFC 6750), which VS Code cannot send, fails with a `token_request_failed` {@link OAuthClientError}.
+	 */
+	protected _acceptTokenResponse(response: Response, result: unknown): IAuthorizationTokenResponse | undefined {
+		if (response.status !== 200 || !isAuthorizationTokenResponse(result)) {
+			return undefined;
+		}
+		if (typeof result.access_token !== 'string' || result.access_token.length === 0) {
+			throw new OAuthClientError('token_request_failed', nls.localize('authNoAccessToken', "The token endpoint of '{0}' issued no usable access token.", this._serverMetadata.issuer));
+		}
+		if (typeof result.token_type !== 'string' || result.token_type.toLowerCase() !== 'bearer') {
+			throw new OAuthClientError('token_request_failed', nls.localize('authUnsupportedTokenType', "The token endpoint of '{0}' issued an unsupported token type '{1}'.", this._serverMetadata.issuer, String(result.token_type)));
+		}
+		return result;
+	}
+
+	/**
+	 * Whether `error` is the authorization server refusing this client as a Client ID Metadata
+	 * Document client (`invalid_client` in the authorization response, after `iss` and `state` were
+	 * validated): its `client_id` is a metadata document URL and the server advertises support.
+	 */
+	private _isRefusedClientIdMetadataDocument(error: OAuthClientError): boolean {
+		const detail = error.detail as { readonly error?: unknown } | undefined;
+		return error.code === 'authorization_denied'
+			&& detail?.error === AuthorizationErrorType.InvalidClient
+			&& this._serverMetadata.client_id_metadata_document_supported === true
+			&& isValidClientMetadataUrl(this._clientId);
+	}
+
+	/** A loggable summary of a token response: never the tokens themselves. */
+	protected _describeTokenResponse(token: IAuthorizationTokenResponse): string {
+		return `token_type=${token.token_type}, scope=${token.scope ?? '(none)'}, expires_in=${token.expires_in ?? '(none)'}, refresh_token=${token.refresh_token ? 'present' : 'absent'}, id_token=${token.id_token ? 'present' : 'absent'}`;
+	}
+
+	/**
+	 * The RFC 8707 resource indicator to send in the authorization and token requests, by the rule
+	 * of the OAuth client (`resourceIndicatorFor`): the `resource` of the protected resource
+	 * metadata as published, less any fragment; without metadata the resource the request names
+	 * (the MCP server URL), slash-less for a bare origin. Omitted for Microsoft auth.
 	 */
 	protected get _resourceIndicator(): string | undefined {
-		return this._isMicrosoftAuth ? undefined : this._resourceMetadata?.resource;
+		if (this._isMicrosoftAuth) {
+			return undefined;
+		}
+		const published = this._resourceMetadata?.resource;
+		const resource = published ?? this._requestedResource;
+		if (resource === undefined) {
+			return undefined;
+		}
+		try {
+			return resourceIndicatorFor(canonicalResourceUri(resource), published);
+		} catch {
+			// Not a URL: metadata is sent as published, a requested resource not at all.
+			return published;
+		}
 	}
 
 	/**
@@ -577,7 +824,33 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		return [...scopes];
 	}
 
+	/**
+	 * The resource the tokens of the request being served are bound to: without protected resource
+	 * metadata a provider is keyed by its authorization server only, so the MCP servers of one origin
+	 * share it, and each of their tokens is issued for one server's URL (RFC 8707). `undefined` when
+	 * the provider is for one resource already (published metadata), or no resource is sent.
+	 */
+	private get _boundResource(): string | undefined {
+		return this._resourceMetadata?.resource ? undefined : this._resourceIndicator;
+	}
+
+	/** Records on a token the resource it was issued for (see {@link _boundResource}). */
+	private _bindToken(token: IAuthorizationTokenResponse, createdAt: number): IAuthorizationToken {
+		return { ...token, created_at: createdAt, resource: this._boundResource };
+	}
+
+	/**
+	 * Whether a stored token can serve the request: one bound to a resource serves only requests for
+	 * that resource. A token stored without one (before tokens were bound, or by a provider for one
+	 * resource) serves any.
+	 */
+	private _tokenServesRequest(token: IAuthorizationToken | undefined): boolean {
+		const bound = this._boundResource;
+		return bound === undefined || token?.resource === undefined || token.resource === bound;
+	}
+
 	async getSessions(scopes: readonly string[] | undefined, options: IAuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession[]> {
+		this._beginRequest(options);
 		this._logger.info(`Getting sessions for scopes: ${scopes?.join(' ') ?? 'all'}`);
 		if (!scopes) {
 			return this._tokenStore.sessions;
@@ -587,7 +860,11 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		// TODO@TylerLeonhardt: Do this for all scope handling in the auth APIs
 		const sortedScopes = [...scopes].sort();
 		const scopeStr = scopes.join(' ');
-		let sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
+		const matching = () => {
+			const tokens = new Map<string, IAuthorizationToken>(this._tokenStore.tokens.map(token => [token.access_token, token]));
+			return this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes) && this._tokenServesRequest(tokens.get(session.accessToken)));
+		};
+		let sessions = matching();
 		this._logger.info(`Found ${sessions.length} sessions for scopes: ${scopeStr}`);
 		if (sessions.length) {
 			const newTokens: IAuthorizationToken[] = [];
@@ -628,7 +905,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				this._tokenStore.update({ added: newTokens, removed: removedTokens });
 				// Since we updated the tokens, we need to re-filter the sessions
 				// to get the latest state
-				sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
+				sessions = matching();
 			}
 			this._logger.info(`Found ${sessions.length} sessions for scopes: ${scopeStr}`);
 			return sessions;
@@ -636,7 +913,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		return [];
 	}
 
-	async createSession(scopes: string[], _options: vscode.AuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession> {
+	async createSession(scopes: string[], options: vscode.AuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession> {
+		this._beginRequest(options);
 		this._logger.info(`Creating session for scopes: ${scopes.join(' ')}`);
 		let token: IAuthorizationTokenResponse | undefined;
 		for (let i = 0; i < this._createFlows.length; i++) {
@@ -655,6 +933,19 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 					break;
 				}
 			} catch (err) {
+				if (err instanceof OAuthClientError && this._isRefusedClientIdMetadataDocument(err)) {
+					// As the OAuth client does: the authorization server advertises Client ID Metadata Documents but
+					// did not accept ours, so the client registers another way (dynamically, else with the user's client).
+					this._logger.warn(`The authorization server ${this._serverMetadata.issuer} refused the client ID metadata document client (${this._clientId}); registering another way.`);
+					await this._generateNewClientId();
+					throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
+				}
+				if (err instanceof OAuthClientError) {
+					// A protocol or security failure (PKCE unsupported, an issuer mismatch, ...) is not
+					// something another flow fixes: surface it as is.
+					this._logger.error(`Authentication failed: ${err.message}`);
+					throw err;
+				}
 				const nextMode = this._createFlows[i + 1]?.label;
 				if (!nextMode) {
 					break; // No more flows to try
@@ -678,8 +969,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			token.scope = scopes.join(' ');
 		}
 
-		// Store session for later retrieval
-		this._tokenStore.update({ added: [{ ...token, created_at: Date.now() }], removed: [] });
+		// Store session for later retrieval, bound to the resource it was issued for
+		this._tokenStore.update({ added: [this._bindToken(token, Date.now())], removed: [] });
 		const session = this._tokenStore.sessions.find(t => t.accessToken === token.access_token)!;
 		this._logger.info(`Created ${token.refresh_token ? 'refreshable' : 'non-refreshable'} session for scopes: ${token.scope}${token.expires_in ? ` that expires in ${token.expires_in} seconds` : ''}`);
 		return session;
@@ -712,10 +1003,10 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		if (!this._serverMetadata.token_endpoint) {
 			throw new Error('Token endpoint not available in server metadata');
 		}
+		this._assertPkceSupported();
 
 		// Generate PKCE code verifier (random string) and code challenge (SHA-256 hash of verifier)
-		const codeVerifier = this.generateRandomString(64);
-		const codeChallenge = await this.generateCodeChallenge(codeVerifier);
+		const { verifier: codeVerifier, challenge: codeChallenge } = await this._createPkcePair();
 
 		// Generate a random state value to prevent CSRF
 		const nonce = this.generateRandomString(32);
@@ -750,7 +1041,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		const redirectUri = 'https://vscode.dev/redirect';
 		authorizationUrl.searchParams.append('redirect_uri', redirectUri);
 
-		const promise = this.waitForAuthorizationCode(callbackUri);
+		const promise = this.waitForAuthorizationCode(callbackUri, nonce);
 
 		// Open the browser for user authorization
 		this._logger.info(`Opening authorization URL for scopes: ${scopeString}`);
@@ -773,6 +1064,10 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				this._logger.info('Authorization code request was cancelled by the user.');
 				throw err;
 			}
+			if (err instanceof OAuthClientError) {
+				// The authorization response failed validation (iss, error): surfaced as is.
+				throw err;
+			}
 			this._logger.error(`Failed to receive authorization code: ${err}`);
 			throw new Error(`Failed to receive authorization code: ${err}`);
 		}
@@ -792,26 +1087,21 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			.substring(0, length);
 	}
 
-	protected async generateCodeChallenge(codeVerifier: string): Promise<string> {
-		const encoder = new TextEncoder();
-		const data = encoder.encode(codeVerifier);
-		const digest = await crypto.subtle.digest('SHA-256', data);
-
-		// Base64url encode the digest
-		return encodeBase64(VSBuffer.wrap(new Uint8Array(digest)), false, false)
-			.replace(/\+/g, '-')
-			.replace(/\//g, '_')
-			.replace(/=+$/, '');
-	}
-
-	private async waitForAuthorizationCode(expectedState: URI): Promise<{ code: string }> {
-		const result = await this._proxy.$waitForUriHandler(expectedState);
+	private async waitForAuthorizationCode(callbackUri: URI, nonce: string): Promise<{ code: string }> {
+		// The URI handler matches the callback's scheme, authority, path and nonce.
+		const result = await this._proxy.$waitForUriHandler(callbackUri);
+		const query = result.query || '';
+		// RFC 9207: the issuer first, then the state, then an error; only then is the code used. The state
+		// sent is the callback URI, and the redirect page delivers the response to that URI: the response
+		// returned the state when it carries the callback's nonce, and any `state` it forwards names a
+		// callback URI with the same nonce.
+		this._validateAuthorizationResponse(parseAuthorizationRedirect(query), params => nonceOfQuery(query) === nonce && (params.state === undefined || nonceOfCallbackUri(params.state) === nonce));
 		// Extract the code parameter directly from the query string. NOTE, URLSearchParams does not work here because
 		// it will decode the query string and we need to keep it encoded.
-		const codeMatch = /[?&]code=([^&]+)/.exec(result.query || '');
+		const codeMatch = /[?&]code=([^&]+)/.exec(query.startsWith('?') || query.startsWith('&') ? query : `?${query}`);
 		if (!codeMatch || codeMatch.length < 2) {
 			// No code parameter found in the query string
-			throw new Error('Authentication failed: No authorization code received');
+			throw new OAuthClientError('authorization_denied', 'Authentication failed: No authorization code received');
 		}
 		return { code: codeMatch[1] };
 	}
@@ -821,57 +1111,51 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			throw new Error('Token endpoint not available in server metadata');
 		}
 
-		const tokenRequest = new URLSearchParams();
-		tokenRequest.append('client_id', this._clientId);
-		tokenRequest.append('grant_type', 'authorization_code');
-		tokenRequest.append('code', code);
-		tokenRequest.append('redirect_uri', redirectUri);
-		tokenRequest.append('code_verifier', codeVerifier);
+		const params: Record<string, string> = {
+			grant_type: 'authorization_code',
+			code,
+			redirect_uri: redirectUri,
+			code_verifier: codeVerifier,
+		};
 
 		// Add resource indicator if available (RFC 8707)
 		const resource = this._resourceIndicator;
 		if (resource) {
-			tokenRequest.append('resource', resource);
+			params.resource = resource;
 		}
 
-		// Add client secret if available
-		if (this._clientSecret) {
-			tokenRequest.append('client_secret', this._clientSecret);
-		}
-
-		this._logger.info('Exchanging authorization code for token...');
+		const request = this._buildTokenRequest(params);
+		this._logger.info(`Exchanging authorization code for token (${this._tokenEndpointAuthMethod} client authentication)...`);
 		this._logger.trace(`Url: ${this._serverMetadata.token_endpoint}`);
-		this._logger.trace(`Token request body: ${tokenRequest.toString()}`);
 		let response: Response;
 		try {
 			response = await this._fetch(this._serverMetadata.token_endpoint, {
 				method: 'POST',
-				headers: {
-					'Content-Type': 'application/x-www-form-urlencoded',
-					'Accept': 'application/json'
-				},
-				body: tokenRequest.toString()
+				headers: request.headers,
+				body: request.body
 			});
 		} catch (err) {
-			this._logger.error(`Failed to exchange authorization code for token: ${err}`);
-			throw new Error(`Failed to exchange authorization code for token: ${err}`);
+			this._logger.error(`Failed to exchange authorization code for token: ${redact(String(err))}`);
+			throw new Error(`Failed to exchange authorization code for token: ${redact(String(err))}`);
 		}
 
-		if (!response.ok) {
-			const text = await response.text();
-			throw new Error(`Token exchange failed: ${response.status} ${response.statusText} - ${text}`);
+		let result: unknown;
+		try {
+			result = await response.json();
+		} catch {
+			result = undefined;
 		}
-
-		const result = await response.json();
-		if (isAuthorizationTokenResponse(result)) {
-			this._logger.info(`Successfully exchanged authorization code for token.`);
-			return result;
+		const token = this._acceptTokenResponse(response, result);
+		if (token) {
+			this._logger.info(`Successfully exchanged authorization code for token (${this._describeTokenResponse(token)}).`);
+			return token;
 		} else if (isAuthorizationErrorResponse(result) && result.error === AuthorizationErrorType.InvalidClient) {
 			this._logger.warn(`Client ID (${this._clientId}) was invalid, generated a new one.`);
 			await this._generateNewClientId();
 			throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
 		}
-		throw new Error(`Invalid authorization token response: ${JSON.stringify(result)}`);
+		const description = isAuthorizationErrorResponse(result) ? `${result.error}${result.error_description ? ` (${result.error_description})` : ''}` : 'no error details';
+		throw new Error(`Token exchange failed: ${response.status} ${response.statusText} - ${redact(description)}`);
 	}
 
 	protected async exchangeRefreshTokenForToken(refreshToken: string, scopes: readonly string[], allowClientRegistration: boolean): Promise<IAuthorizationToken> {
@@ -879,44 +1163,48 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			throw new Error('Token endpoint not available in server metadata');
 		}
 
-		const tokenRequest = new URLSearchParams();
-		tokenRequest.append('client_id', this._clientId);
-		tokenRequest.append('grant_type', 'refresh_token');
-		tokenRequest.append('refresh_token', refreshToken);
+		const params: Record<string, string> = {
+			grant_type: 'refresh_token',
+			refresh_token: refreshToken,
+		};
 
 		if (this._isMicrosoftAuth) {
 			const requestScopeString = this._getRequestScopes(scopes).join(' ');
 			if (requestScopeString) {
-				tokenRequest.append('scope', requestScopeString);
+				params.scope = requestScopeString;
 			}
 		}
 
 		// Add resource indicator if available (RFC 8707)
 		const resource = this._resourceIndicator;
 		if (resource) {
-			tokenRequest.append('resource', resource);
+			params.resource = resource;
 		}
 
-		// Add client secret if available
-		if (this._clientSecret) {
-			tokenRequest.append('client_secret', this._clientSecret);
+		const request = this._buildTokenRequest(params);
+		this._logger.info(`Refreshing the token (${this._tokenEndpointAuthMethod} client authentication)...`);
+		let response: Response;
+		try {
+			response = await this._fetch(this._serverMetadata.token_endpoint, {
+				method: 'POST',
+				headers: request.headers,
+				body: request.body
+			});
+		} catch (err) {
+			throw new Error(`Failed to refresh the token: ${redact(String(err))}`);
 		}
 
-		const response = await this._fetch(this._serverMetadata.token_endpoint, {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/x-www-form-urlencoded',
-				'Accept': 'application/json'
-			},
-			body: tokenRequest.toString()
-		});
-
-		const result = await response.json();
-		if (isAuthorizationTokenResponse(result)) {
-			return {
-				...result,
-				created_at: Date.now(),
-			};
+		let result: unknown;
+		try {
+			result = await response.json();
+		} catch {
+			result = undefined;
+		}
+		// The rules of the code grant: an HTTP 200 response with a usable bearer token, whatever else parses.
+		const token = this._acceptTokenResponse(response, result);
+		if (token) {
+			this._logger.info(`Refreshed the token (${this._describeTokenResponse(token)}).`);
+			return this._bindToken(token, Date.now());
 		} else if (isAuthorizationErrorResponse(result) && result.error === AuthorizationErrorType.InvalidClient) {
 			if (!allowClientRegistration) {
 				this._logger.warn(`Client ID (${this._clientId}) was invalid while silently refreshing the token.`);
@@ -926,18 +1214,29 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			await this._generateNewClientId();
 			throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
 		}
-		throw new Error(`Invalid authorization token response: ${JSON.stringify(result)}`);
+		const description = isAuthorizationErrorResponse(result) ? `${result.error}${result.error_description ? ` (${result.error_description})` : ''}` : 'no error details';
+		throw new Error(`Invalid authorization token response: ${response.status} - ${redact(description)}`);
 	}
 
 	protected async _generateNewClientId(): Promise<void> {
 		try {
-			const registration = await fetchDynamicRegistration(this._serverMetadata, this._initData.environment.appName, this._resourceMetadata?.scopes_supported);
+			const supported = this._serverMetadata.token_endpoint_auth_methods_supported;
+			if (this._serverMetadata.registration_endpoint) {
+				// Client metadata is posted there and the response carries the client secret.
+				assertSecureAuthEndpoint(this._serverMetadata.registration_endpoint, 'registration', this._allowsInsecureHttp);
+			}
+			const registration = await fetchDynamicRegistration(this._serverMetadata, this._initData.environment.appName, this._resourceMetadata?.scopes_supported, {
+				tokenEndpointAuthMethod: selectRegistrationAuthMethod(supported),
+				// The provider's own fetch, as for its token requests.
+				fetch: this._fetch,
+			});
 			this._clientId = registration.client_id;
 			this._clientSecret = registration.client_secret;
+			this._tokenEndpointAuthMethod = selectTokenEndpointAuthMethod(registration.token_endpoint_auth_method, supported, registration.client_secret !== undefined);
 			this._onDidChangeClientId.fire();
 		} catch (err) {
 			// When DCR fails, try to prompt the user for a client ID and client secret
-			this._logger.info(`Dynamic registration failed for ${this.authorizationServer.toString()}: ${err}. Prompting user for client ID and client secret.`);
+			this._logger.info(`Dynamic registration failed for ${this.authorizationServer.toString()}: ${redact(String(err))}. Prompting user for client ID and client secret.`);
 
 			try {
 				const clientDetails = await this._proxy.$promptForClientRegistration(this.authorizationServer.toString());
@@ -946,6 +1245,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				}
 				this._clientId = clientDetails.clientId;
 				this._clientSecret = clientDetails.clientSecret;
+				this._tokenEndpointAuthMethod = selectTokenEndpointAuthMethod(undefined, this._serverMetadata.token_endpoint_auth_methods_supported, clientDetails.clientSecret !== undefined);
 				this._logger.info(`User provided client ID for ${this.authorizationServer.toString()}`);
 				if (clientDetails.clientSecret) {
 					this._logger.info(`User provided client secret for ${this.authorizationServer.toString()}`);
@@ -955,8 +1255,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 
 				this._onDidChangeClientId.fire();
 			} catch (promptErr) {
-				this._logger.error(`Failed to fetch new client ID and user did not provide one: ${err}`);
-				throw new Error(`Failed to fetch new client ID and user did not provide one: ${err}`);
+				this._logger.error(`Failed to fetch new client ID and user did not provide one: ${redact(String(err))}`);
+				throw new Error(`Failed to fetch new client ID and user did not provide one: ${redact(String(err))}`);
 			}
 		}
 	}
@@ -967,6 +1267,12 @@ export type IAuthorizationToken = IAuthorizationTokenResponse & {
 	 * The time when the token was created, in milliseconds since the epoch.
 	 */
 	created_at: number;
+	/**
+	 * The RFC 8707 resource the token was issued for, when the provider serves several resources
+	 * (it has no protected resource metadata): the token serves only requests for it. Absent for a
+	 * token stored before tokens were bound.
+	 */
+	resource?: string;
 };
 
 export class TokenStore implements Disposable {

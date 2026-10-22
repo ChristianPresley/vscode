@@ -923,6 +923,49 @@ suite('mcpListWidget', () => {
 		});
 	});
 
+	test('a gRPC row shows its gRPC definition in the detail view: URL, metadata, TLS, binding, deadline, keep-alive and protocol version', () => {
+		const definitions = observableValue('definitions', {
+			server: {
+				id: 'grpc-1',
+				label: 'gRPC One',
+				launch: {
+					type: McpServerTransportType.Grpc,
+					uri: URI.parse('grpcs://mcp.example:443'),
+					headers: [['x-api-key', 'k']],
+					tls: { serverName: 'mcp.internal' },
+					binding: 'typed',
+					deadlineMs: 30_000,
+					keepAliveMs: 0,
+				},
+				cacheNonce: 'grpc-1',
+				protocolVersionHint: '2025-11-25',
+			},
+			collection: {},
+		});
+		const detail = createInstalledMcpServerDetailInput({
+			type: 'builtin-item',
+			id: 'grpc-1',
+			label: 'gRPC One',
+			description: '',
+			localServer: { readDefinitions: () => definitions } as unknown as IMcpServer,
+		});
+		assert.deepStrictEqual({ config: detail.config, compatibilityId: detail.compatibilityId }, {
+			config: {
+				type: McpServerType.GRPC,
+				url: 'grpcs://mcp.example:443',
+				headers: { 'x-api-key': 'k' },
+				tls: { serverName: 'mcp.internal' },
+				binding: 'typed',
+				deadlineMs: 30_000,
+				keepAliveMs: 0,
+				oauth: undefined,
+				dev: undefined,
+				protocolVersion: '2025-11-25',
+			},
+			compatibilityId: 'grpc-1',
+		});
+	});
+
 	test('passes host-only MCP source locations and ranges to the detail view', () => {
 		const uri = URI.file('/home/test/.copilot/mcp-config.json');
 		const detail = createInstalledMcpServerDetailInput({

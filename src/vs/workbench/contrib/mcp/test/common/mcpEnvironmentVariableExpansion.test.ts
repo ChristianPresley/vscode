@@ -7,7 +7,7 @@ import assert from 'assert';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { expandEnvironmentVariablesInLaunch, IMcpEnvironmentVariableExpansionContext, launchHasEnvironmentVariableReferences } from '../../common/mcpEnvironmentVariableExpansion.js';
-import { McpServerLaunch, McpServerTransportHTTP, McpServerTransportStdio, McpServerTransportType } from '../../common/mcpTypes.js';
+import { McpServerLaunch, McpServerTransportGrpc, McpServerTransportHTTP, McpServerTransportStdio, McpServerTransportType } from '../../common/mcpTypes.js';
 
 suite('MCP - expandEnvironmentVariablesInLaunch', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -130,6 +130,38 @@ suite('MCP - expandEnvironmentVariablesInLaunch', () => {
 				hasReferences: launchHasEnvironmentVariableReferences({ ...launch, headers: [] }, { url }),
 			};
 		}), urls.map(url => ({ url, uriUnchanged: true, headers: [['Authorization', 'Bearer tok']], hasReferences: false })));
+	});
+
+	test('grpc: expands the URL and header values like a remote server and keeps gRPC settings', () => {
+		const url = 'grpcs://${HOST}:50051';
+		const launch: McpServerTransportGrpc = {
+			type: McpServerTransportType.Grpc,
+			uri: URI.parse('grpcs://placeholder.example:50051'),
+			headers: [['Authorization', 'Bearer ${TOKEN}'], ['X-${NAME}', 'v']],
+			tls: { serverName: 'mcp.internal' },
+			binding: 'typed',
+		};
+		const result = expandEnvironmentVariablesInLaunch(launch, { url }, context({ HOST: 'mcp.example.com', TOKEN: 'tok', NAME: 'nope' }));
+
+		assert.deepStrictEqual({
+			type: result.type,
+			url: result.type === McpServerTransportType.Grpc ? result.uri.toString(true) : undefined,
+			headers: result.type === McpServerTransportType.Grpc ? result.headers : undefined,
+			tls: result.type === McpServerTransportType.Grpc ? result.tls : undefined,
+			binding: result.type === McpServerTransportType.Grpc ? result.binding : undefined,
+			hasReferences: [
+				launchHasEnvironmentVariableReferences(launch, {}),
+				launchHasEnvironmentVariableReferences({ ...launch, headers: [] }, { url }),
+				launchHasEnvironmentVariableReferences({ ...launch, headers: [] }, {}),
+			],
+		}, {
+			type: McpServerTransportType.Grpc,
+			url: 'grpcs://mcp.example.com:50051',
+			headers: [['Authorization', 'Bearer tok'], ['X-${NAME}', 'v']],
+			tls: { serverName: 'mcp.internal' },
+			binding: 'typed',
+			hasReferences: [true, true, false],
+		});
 	});
 
 	test('reports whether a launch has expandable references', () => {

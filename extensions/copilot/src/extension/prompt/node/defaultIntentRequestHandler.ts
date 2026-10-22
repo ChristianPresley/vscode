@@ -737,6 +737,9 @@ class DefaultToolCallingLoop extends ToolCallingLoop<IDefaultToolLoopOptions> {
 					(tool, rule) => {
 						this._logService.warn(`Tool ${tool} failed validation: ${rule}`);
 					},
+					(tool, reason) => {
+						this._logService.warn(`Tool ${tool} was dropped: ${reason}`);
+					}
 				),
 				temperature: this.calculateTemperature(),
 			},

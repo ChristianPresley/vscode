@@ -7,7 +7,7 @@ import { decodeBase64, encodeBase64, VSBuffer } from '../../../../base/common/bu
 import { isEqual } from '../../../../base/common/resources.js';
 import { hasKey } from '../../../../base/common/types.js';
 import { URI } from '../../../../base/common/uri.js';
-import type { MCP } from '../../../mcp/common/modelContextProtocol.js';
+import type { MCPLegacy } from '../../../mcp/common/modelContextProtocolLegacy.js';
 import { resolveAgentHostSession } from '../../common/agentHostSubscriptionService.js';
 import { parseMcpResourceUri } from '../../common/mcpResourceUri.js';
 import { AhpErrorCodes, ContentEncoding, ProtocolError, type ResourceReadResult } from '../../common/state/sessionProtocol.js';
@@ -37,7 +37,7 @@ export class McpResourceLinkProvider implements IAgentHostResourceProvider {
 				await this._restoreSessionChat(owningSession, route.chatUri);
 			}
 		}
-		const result = await this._providerService.handleMcpRequest(mcpResource.channel, 'resources/read', { uri: mcpResource.uri }) as MCP.ReadResourceResult;
+		const result = await this._providerService.handleMcpRequest(mcpResource.channel, 'resources/read', { uri: mcpResource.uri }) as MCPLegacy.ReadResourceResult;
 		const requested = URI.parse(mcpResource.uri);
 		const resource = result.contents.find(content => isEqual(URI.parse(content.uri), requested));
 		if (!resource) {

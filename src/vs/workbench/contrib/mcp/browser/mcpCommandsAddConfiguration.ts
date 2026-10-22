@@ -19,7 +19,9 @@ import { ConfigurationTarget, IConfigurationService } from '../../../../platform
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { ILabelService } from '../../../../platform/label/common/label.js';
-import { IMcpRemoteServerConfiguration, IMcpServerConfiguration, IMcpServerVariable, IMcpStdioServerConfiguration, McpServerType } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
+import { Codicon } from '../../../../base/common/codicons.js';
+import { ThemeIcon } from '../../../../base/common/themables.js';
+import { IMcpGrpcServerConfiguration, IMcpRemoteServerConfiguration, IMcpServerConfiguration, IMcpServerVariable, IMcpStdioServerConfiguration, McpServerType } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
 import { IAllowedMcpServersService, IGalleryMcpServerConfiguration, RegistryType } from '../../../../platform/mcp/common/mcpManagement.js';
 import { IMcpResourceScannerService } from '../../../../platform/mcp/common/mcpResourceScannerService.js';
 import { getCopilotGlobalMcpConfigurationError } from '../../../../platform/mcp/common/mcpCopilotGlobalConfiguration.js';
@@ -52,6 +54,7 @@ import { IMcpCopilotGlobalConfigurationService } from '../common/mcpCopilotGloba
 export const enum AddConfigurationType {
 	Stdio,
 	HTTP,
+	GRPC,
 
 	NpmPackage,
 	PipPackage,
@@ -168,8 +171,9 @@ export class McpAddConfigurationCommand {
 	private async getServerType(): Promise<AddConfigurationType | undefined> {
 		type TItem = { kind: AddConfigurationType | 'browse' | 'discovery' } & IQuickPickItem;
 		const items: QuickPickInput<TItem>[] = [
-			{ kind: AddConfigurationType.Stdio, label: localize('mcp.serverType.command', "Command (stdio)"), description: localize('mcp.serverType.command.description', "Run a local command that implements the MCP protocol") },
-			{ kind: AddConfigurationType.HTTP, label: localize('mcp.serverType.http', "HTTP (HTTP or Server-Sent Events)"), description: localize('mcp.serverType.http.description', "Connect to a remote HTTP server that implements the MCP protocol") }
+			{ kind: AddConfigurationType.Stdio, label: localize('mcp.serverType.command', "Command (stdio)"), description: localize('mcp.serverType.command.description', "Run a local command that implements the MCP protocol"), iconClass: ThemeIcon.asClassName(Codicon.terminal) },
+			{ kind: AddConfigurationType.HTTP, label: localize('mcp.serverType.http', "HTTP (HTTP or Server-Sent Events)"), description: localize('mcp.serverType.http.description', "Connect to a remote HTTP server that implements the MCP protocol"), iconClass: ThemeIcon.asClassName(Codicon.globe) },
+			{ kind: AddConfigurationType.GRPC, label: localize('mcp.serverType.grpc', "gRPC"), description: localize('mcp.serverType.grpc.description', "Connect to a remote server that implements the MCP protocol over gRPC"), iconClass: ThemeIcon.asClassName(Codicon.plug) },
 		];
 
 		let aiSupported: boolean | undefined;
@@ -275,6 +279,30 @@ export class McpAddConfigurationCommand {
 		});
 
 		return { url, type: McpServerType.REMOTE };
+	}
+
+	private async getGrpcConfig(): Promise<IMcpGrpcServerConfiguration | undefined> {
+		const url = await this._quickInputService.input({
+			title: localize('mcp.grpc.url.title', "Enter gRPC Server URL"),
+			placeHolder: localize('mcp.grpc.url.placeholder', "URL of the gRPC MCP server (e.g., grpcs://localhost:50051)"),
+			ignoreFocusLost: true,
+			validateInput: async value => {
+				const trimmed = value.trim();
+				return !trimmed || /^grpcs?:\/\/.+/i.test(trimmed) || trimmed.includes('${')
+					? undefined
+					: localize('mcp.grpc.url.invalid', "The URL must start with 'grpc://' or 'grpcs://'.");
+			},
+		});
+
+		if (!url) {
+			return undefined;
+		}
+
+		this._telemetryService.publicLog2<AddServerData, AddServerClassification>('mcp.addserver', {
+			packageType: 'grpc'
+		});
+
+		return { url: url.trim(), type: McpServerType.GRPC };
 	}
 
 	private async getServerId(suggestion = `my-mcp-server-${generateUuid().split('-')[0]}`): Promise<string | undefined> {
@@ -551,6 +579,9 @@ export class McpAddConfigurationCommand {
 			case AddConfigurationType.HTTP:
 				config = await this.getSSEConfig();
 				break;
+			case AddConfigurationType.GRPC:
+				config = await this.getGrpcConfig();
+				break;
 			case AddConfigurationType.NpmPackage:
 			case AddConfigurationType.PipPackage:
 			case AddConfigurationType.NuGetPackage:
@@ -597,6 +628,10 @@ export class McpAddConfigurationCommand {
 		const { installTarget } = destination;
 
 		if (installTarget.kind === 'agentHost') {
+			if (config.type === McpServerType.GRPC) {
+				// No agent host speaks gRPC; VS Code serves such servers itself, through the MCP gateway.
+				throw new Error(localize('mcp.agentHost.grpcUnsupported', "gRPC servers cannot be added to an agent session. Add it to a VS Code configuration file instead."));
+			}
 			if (Object.hasOwn(AssistedTypes, serverType) && (inputs?.length || JSON.stringify(config).includes('${input:'))) {
 				throw new Error(localize('mcp.agentHost.inputsUnsupported', "This server requires VS Code input variables. Add it to a VS Code configuration file instead of the current agent session."));
 			}
@@ -725,6 +760,8 @@ export class McpAddConfigurationCommand {
 				return 'stdio';
 			case AddConfigurationType.HTTP:
 				return 'sse';
+			case AddConfigurationType.GRPC:
+				return 'grpc';
 			default:
 				return undefined;
 		}

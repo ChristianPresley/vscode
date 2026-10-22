@@ -5,17 +5,20 @@
 
 import * as assert from 'assert';
 import * as sinon from 'sinon';
-import { DeferredPromise } from '../../../../base/common/async.js';
+import { DeferredPromise, timeout } from '../../../../base/common/async.js';
 import { isCancellationError } from '../../../../base/common/errors.js';
 import { toDisposable } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
 import { mock } from '../../../../base/test/common/mock.js';
 import { LogLevel, NullLogService } from '../../../../platform/log/common/log.js';
 import { MainThreadMcpShape } from '../../common/extHost.protocol.js';
-import { createAuthMetadata, CommonRequestInit, CommonResponse, IAuthMetadata, McpHTTPHandle } from '../../common/extHostMcp.js';
+import { IExtHostInitDataService } from '../../common/extHostInitDataService.js';
+import { createAuthMetadata, CommonRequestInit, CommonResponse, ExtHostMcpService, IAuthMetadata, McpHTTPHandle } from '../../common/extHostMcp.js';
+import { IExtHostVariableResolverProvider } from '../../common/extHostVariableResolverService.js';
+import { IExtHostWorkspace } from '../../common/extHostWorkspace.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { McpConnectionState, McpServerTransportHTTP, McpServerTransportType } from '../../../contrib/mcp/common/mcpTypes.js';
-import { MCP } from '../../../contrib/mcp/common/modelContextProtocol.js';
+import { McpConnectionState, McpServerLaunch, McpServerTransportHTTP, McpServerTransportType } from '../../../contrib/mcp/common/mcpTypes.js';
+import { SingleProxyRPCProtocol } from './testRPCProtocol.js';
 
 // Test constants to avoid magic strings
 const TEST_MCP_URL = 'https://example.com/mcp';
@@ -110,6 +113,57 @@ async function createTestAuthMetadata(options: {
 suite('ExtHostMcp', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
+	suite('ExtHostMcpService launches that cannot start', () => {
+		function createService(subclass?: (base: typeof ExtHostMcpService) => typeof ExtHostMcpService) {
+			const states: { id: number; state: McpConnectionState }[] = [];
+			const proxy = new class extends mock<MainThreadMcpShape>() {
+				override $onDidChangeState(id: number, state: McpConnectionState): void { states.push({ id, state }); }
+			};
+			const Service = subclass?.(ExtHostMcpService) ?? ExtHostMcpService;
+			const service = store.add(new Service(SingleProxyRPCProtocol(proxy), new NullLogService(), new class extends mock<IExtHostInitDataService>() { }, new class extends mock<IExtHostWorkspace>() { }, new class extends mock<IExtHostVariableResolverProvider>() { }));
+			return { service, states };
+		}
+
+		const stdioLaunch: McpServerLaunch.Serialized = { type: McpServerTransportType.Stdio, cwd: undefined, command: 'node', args: ['server.js'], env: {}, envFile: undefined, sandbox: undefined };
+
+		test('a transport this extension host does not have reports Error instead of staying in Starting', () => {
+			const { service, states } = createService();
+			service.$startMcp(3, { launch: stdioLaunch });
+			assert.deepStrictEqual(states.map(s => ({ id: s.id, kind: s.state.state })), [{ id: 3, kind: McpConnectionState.Kind.Error }]);
+			const error = states[0].state;
+			assert.ok(error.state === McpConnectionState.Kind.Error && error.message.includes('stdio'), JSON.stringify(error));
+		});
+
+		test('an invalid launch reports Error', () => {
+			const { service, states } = createService();
+			service.$startMcp(4, { launch: { type: McpServerTransportType.Grpc, uri: URI.parse('https://example.com:50051').toJSON(), headers: [] } });
+			assert.deepStrictEqual(states.map(s => ({ id: s.id, kind: s.state.state })), [{ id: 4, kind: McpConnectionState.Kind.Error }]);
+		});
+
+		test('a start that rejects later reports Error', async () => {
+			const { service, states } = createService(Base => class extends Base {
+				protected override _startMcp(): Promise<void> {
+					return Promise.reject(new Error('spawn failed'));
+				}
+			});
+			service.$startMcp(5, { launch: stdioLaunch });
+			await timeout(0);
+			assert.deepStrictEqual(states, [{ id: 5, state: { state: McpConnectionState.Kind.Error, message: 'spawn failed' } }]);
+		});
+
+		test('a handle registered before the failure is disposed', () => {
+			let disposed = 0;
+			const { service, states } = createService(Base => class extends Base {
+				protected override _startMcp(id: number): void {
+					this._sseEventSources.set(id, { send: async () => { }, cancelRequest: () => { }, close: async () => { }, dispose: () => { disposed++; } });
+					throw new Error('handle setup failed');
+				}
+			});
+			service.$startMcp(6, { launch: stdioLaunch });
+			assert.deepStrictEqual({ disposed, states }, { disposed: 1, states: [{ id: 6, state: { state: McpConnectionState.Kind.Error, message: 'handle setup failed' } }] });
+		});
+	});
+
 	suite('McpHTTPHandle stream cleanup', () => {
 		teardown(() => sinon.restore());
 
@@ -175,6 +229,62 @@ suite('ExtHostMcp', () => {
 				cancellations: 1,
 				warnings: ['Error reading SSE stream: Error: fixture stream read failed'],
 			});
+		});
+	});
+
+	suite('McpHTTPHandle notification backchannel', () => {
+		/** Records the promise rejections nobody handled while `run` ran, in Node.js and in browsers. */
+		async function unhandledRejectionsOf(run: () => Promise<void>): Promise<unknown[]> {
+			type Listener = (reason: unknown) => void;
+			const reasons: unknown[] = [];
+			const nodeProcess = (globalThis as { process?: { on(event: string, listener: Listener): void; removeListener(event: string, listener: Listener): void } }).process;
+			const eventTarget = globalThis as { addEventListener?(type: string, listener: (event: { reason: unknown; preventDefault(): void }) => void): void; removeEventListener?(type: string, listener: (event: { reason: unknown; preventDefault(): void }) => void): void };
+			const onNode: Listener = reason => reasons.push(reason);
+			const onBrowser = (event: { reason: unknown; preventDefault(): void }) => {
+				reasons.push(event.reason);
+				event.preventDefault();
+			};
+			nodeProcess?.on('unhandledRejection', onNode);
+			eventTarget.addEventListener?.('unhandledrejection', onBrowser);
+			try {
+				await run();
+				await timeout(20);
+			} finally {
+				nodeProcess?.removeListener('unhandledRejection', onNode);
+				eventTarget.removeEventListener?.('unhandledrejection', onBrowser);
+			}
+			return reasons;
+		}
+
+		test('disposing the handle while the backchannel waits to reconnect ends it without an unhandled rejection', async () => {
+			const waiting = new DeferredPromise<void>();
+			const gets: string[] = [];
+			const proxy = Object.assign(new class extends mock<MainThreadMcpShape>() {
+				override $onDidChangeState(): void { }
+				override $onDidReceiveMessage(): void { }
+				override $onDidPublishLog(_id: number, _level: LogLevel, message: string): void {
+					if (message.includes('for async notifications, will retry')) {
+						void waiting.complete();
+					}
+				}
+			}, { async $checkMcpServerAllowed() { return undefined; } });
+			const handle = store.add(new class extends McpHTTPHandle {
+				protected override async _fetchInternal(url: string, init?: CommonRequestInit): Promise<CommonResponse> {
+					if (init?.method === 'GET') {
+						gets.push(url);
+						throw new Error('the backchannel is offline');
+					}
+					return createMockResponse({ headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }) });
+				}
+			}(1, { type: McpServerTransportType.HTTP, uri: URI.parse(TEST_MCP_URL), headers: [] }, proxy, store.add(new NullLogService())));
+
+			const rejections = await unhandledRejectionsOf(async () => {
+				await handle.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }));
+				// The first GET failed: the backchannel now waits a second before it tries again.
+				await waiting.p;
+				handle.dispose();
+			});
+			assert.deepStrictEqual({ gets: gets.length, rejections: rejections.map(r => isCancellationError(r) ? 'CancellationError' : String(r)) }, { gets: 1, rejections: [] });
 		});
 	});
 
@@ -519,7 +629,7 @@ suite('ExtHostMcp', () => {
 			await handle['_fetchWithAuthRetry'](TEST_MCP_URL, { method: 'POST', headers }, headers);
 			const metadataRequest = requests.find(request => request.url === metadataUrl);
 			assert.ok(metadataRequest);
-			assert.strictEqual(metadataRequest.headers['MCP-Protocol-Version'], MCP.LATEST_PROTOCOL_VERSION);
+			assert.strictEqual(metadataRequest.headers['MCP-Protocol-Version'], '2025-11-25');
 		});
 
 		suite('first destinations', () => {
@@ -623,6 +733,42 @@ suite('ExtHostMcp', () => {
 				assert.match(state.message, /non-http\(s\).*not allowed/);
 				assert.deepStrictEqual(requests.map(request => request.url), [TEST_MCP_URL, TEST_MCP_URL]);
 				assert.ok(signals.length > 0 && signals.every(signal => signal.aborted));
+			});
+		});
+	});
+
+	suite('McpHTTPHandle trace logs', () => {
+		test('blank the values of the configured headers, in any letter case, as well as the credential headers', async () => {
+			const logs: string[] = [];
+			const proxy = Object.assign(new class extends mock<MainThreadMcpShape>() {
+				override $onDidChangeState(): void { }
+				override $onDidReceiveMessage(): void { }
+				override $onDidPublishLog(_id: number, _level: LogLevel, message: string): void { logs.push(message); }
+			}, { async $checkMcpServerAllowed(): Promise<string | undefined> { return undefined; } });
+			const sent: Record<string, string>[] = [];
+			const handle = store.add(new class extends McpHTTPHandle {
+				protected override async _fetchInternal(_url: string, init?: CommonRequestInit): Promise<CommonResponse> {
+					sent.push({ ...init?.headers });
+					return createMockResponse({ status: 202 });
+				}
+			}(1, {
+				type: McpServerTransportType.HTTP,
+				uri: URI.parse(TEST_MCP_URL),
+				headers: [['X-Api-Key', 'secret-key'], ['x-tenant', 'tenant-secret']],
+			}, proxy, new class extends NullLogService {
+				override getLevel(): LogLevel { return LogLevel.Trace; }
+			}()));
+			await handle['_fetch'](TEST_MCP_URL, { method: 'POST', headers: { 'X-Api-Key': 'secret-key', 'X-TENANT': 'tenant-secret', 'Authorization': 'Bearer token-value', 'Mcp-Method': 'tools/list' } });
+			const fetching = logs.find(line => line.startsWith('Fetching '));
+			assert.ok(fetching, logs.join('\n'));
+			assert.deepStrictEqual({
+				traced: JSON.parse(fetching.slice(fetching.indexOf('{'))).headers,
+				leaked: logs.filter(line => /secret-key|tenant-secret|token-value/.test(line)),
+				sent: sent.map(headers => [headers['X-Api-Key'], headers['X-TENANT']]),
+			}, {
+				traced: { 'X-Api-Key': '***', 'X-TENANT': '***', 'Authorization': '***', 'Mcp-Method': 'tools/list', 'user-agent': sent[0]['user-agent'] },
+				leaked: [],
+				sent: [['secret-key', 'tenant-secret']],
 			});
 		});
 	});

@@ -329,6 +329,29 @@ suite('McpResourceScannerService', () => {
 		assert.strictEqual(await fileService.exists(resource), false);
 	});
 
+	test('keeps grpc servers in the VS Code format and rejects them in shared formats', async () => {
+		const grpc: IInstallableMcpServer = {
+			name: 'grpc',
+			config: { type: McpServerType.GRPC, url: 'grpcs://localhost:50051', binding: 'typed', tls: { insecure: true }, protocolVersion: '2026-07-28' },
+		};
+		await write('{ "servers": { "untyped": { "url": "https://example.com/mcp" } } }');
+		await scanner.addMcpServers([grpc], resource, target);
+		const scanned = (await scanner.scanMcpServers(resource, target)).servers!;
+		await assert.rejects(scanner.addMcpServers([grpc], resource, target, format), /gRPC servers are not supported in \.mcp\.json/);
+		await assert.rejects(scanner.addMcpServers([grpc], resource, target, McpResourceFormat.CopilotGlobal), /gRPC servers are not supported in Copilot Global MCP configuration/);
+
+		assert.deepStrictEqual({
+			grpc: scanned.grpc,
+			untypedType: scanned.untyped.type,
+			document: parse(await read()),
+		}, {
+			grpc: grpc.config,
+			untypedType: McpServerType.REMOTE,
+			// The untyped neighbor gets its inferred type when the file is rewritten.
+			document: { servers: { untyped: { type: 'http', url: 'https://example.com/mcp' }, grpc: grpc.config }, inputs: [] },
+		});
+	});
+
 	test('omitting format preserves legacy configuration and inputs even for a root-named resource', async () => {
 		const inputs = [{ id: 'token', type: McpServerVariableType.PROMPT, description: 'Token', password: true }];
 		await scanner.addMcpServers([{ ...server('legacy'), inputs }], resource, target);

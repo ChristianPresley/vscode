@@ -138,6 +138,25 @@ function mapIconToTreeItem(icon: ThemeIcon | { dark: URI; light?: URI } | undefi
 	}
 }
 
+/**
+ * The label and description of a tool in the picker. Tools are listed by the
+ * name they are referenced by (`#name`). An MCP tool with a display name of
+ * its own (`title`, then `annotations.title`, then `name`) is listed by that
+ * name, with its reference name in front of its description, where the
+ * picker's filter still finds it.
+ */
+export function toolPickerLabels(tool: IToolData): { label: string; description: string | undefined } {
+	const description = tool.userDescription ?? tool.modelDescription;
+	const referenceName = tool.toolReferenceName;
+	if (tool.source.type !== 'mcp' || !referenceName || !tool.displayName || tool.displayName === referenceName) {
+		return { label: referenceName ?? tool.displayName, description };
+	}
+	return {
+		label: tool.displayName,
+		description: description ? localize('toolPicker.referenceNameAndDescription', "{0} - {1}", referenceName, description) : referenceName,
+	};
+}
+
 function createToolTreeItemFromData(tool: IToolData, checked: boolean): IToolTreeItemData {
 	const iconProps = mapIconToTreeItem(tool.icon, true); // Use default tool icon if none provided
 
@@ -145,8 +164,7 @@ function createToolTreeItemFromData(tool: IToolData, checked: boolean): IToolTre
 		itemType: 'tool',
 		tool,
 		id: tool.id,
-		label: tool.toolReferenceName ?? tool.displayName,
-		description: tool.userDescription ?? tool.modelDescription,
+		...toolPickerLabels(tool),
 		checked,
 		...iconProps
 	};

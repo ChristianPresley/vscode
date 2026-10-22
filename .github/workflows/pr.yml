@@ -30,6 +30,7 @@ jobs:
       cli: ${{ steps.detect.outputs.cli }}
       copilot-shim: ${{ steps.detect.outputs.copilot-shim }}
       copilot: ${{ steps.detect.outputs.copilot }}
+      mcp: ${{ steps.detect.outputs.mcp }}
     steps:
       - name: Checkout microsoft/vscode
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -158,6 +159,26 @@ jobs:
       locked: true
       all_targets: true
       affected: ${{ needs.changes.result != 'success' || needs.changes.outputs.copilot-shim == 'true' }}
+
+  mcp-conformance-linux:
+    name: MCP (Linux)
+    needs: changes
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/mcp-conformance.yml
+    with:
+      job_name: mcp-conformance-linux
+      os: ubuntu-latest
+      affected: ${{ needs.changes.result != 'success' || needs.changes.outputs.mcp == 'true' }}
+
+  mcp-conformance-windows:
+    name: MCP (Windows)
+    needs: changes
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/mcp-conformance.yml
+    with:
+      job_name: mcp-conformance-windows
+      os: windows-latest
+      affected: ${{ needs.changes.result != 'success' || needs.changes.outputs.mcp == 'true' }}
 
   linux-electron-unit-tests:
     name: Linux

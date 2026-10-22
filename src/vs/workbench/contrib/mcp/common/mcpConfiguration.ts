@@ -9,6 +9,7 @@ import { Disposable } from '../../../../base/common/lifecycle.js';
 import { localize } from '../../../../nls.js';
 import { IExtensionManifest, IMcpCollectionContribution } from '../../../../platform/extensions/common/extensions.js';
 import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js';
+import { eraForProtocolVersion, SUPPORTED_MCP_PROTOCOL_VERSIONS } from '../../../../platform/mcp/common/mcpProtocolVersions.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
 import { mcpSchemaId } from '../../../services/configuration/common/configuration.js';
 import { inputsSchema } from '../../../services/configurationResolver/common/configurationResolverSchema.js';
@@ -129,6 +130,66 @@ const httpSchemaExamples = {
 	'my-mcp-server': {
 		url: 'http://localhost:3001/mcp',
 		headers: {},
+	}
+};
+
+const grpcSchemaExamples = {
+	'my-grpc-server': {
+		type: 'grpc',
+		url: 'grpcs://localhost:50051',
+		binding: 'auto',
+	}
+};
+
+/**
+ * The `protocolVersion` property shared by every server kind: an optional pin to
+ * one of the revisions VS Code can speak.
+ */
+const mcpProtocolVersionSchema: IJSONSchema = {
+	type: 'string',
+	enum: [...SUPPORTED_MCP_PROTOCOL_VERSIONS],
+	enumDescriptions: SUPPORTED_MCP_PROTOCOL_VERSIONS.map(version => eraForProtocolVersion(version) === 'modern'
+		? localize('app.mcp.json.protocolVersion.modern', "Revision {0}: stateless requests carrying their protocol metadata, `server/discover` and subscription-based notifications.", version)
+		: localize('app.mcp.json.protocolVersion.legacy', "Revision {0}: the `initialize` handshake with a stateful session.", version)),
+	markdownDescription: localize('app.mcp.json.protocolVersion', "Pins the Model Context Protocol revision used to talk to this server. By default, the newest revision both VS Code and the server support is negotiated. If the server rejects the pinned revision, VS Code negotiates a revision as it does without a pin, and uses that revision instead of the pin until the pin or the server's command, URL or other connection settings change, or until the **MCP: Reset Cached Tools** command runs."),
+};
+
+const mcpOAuthSchema: IJSONSchema = {
+	type: 'object',
+	description: localize('app.mcp.json.oauth', "OAuth configuration for authenticating with the server."),
+	additionalProperties: false,
+	minProperties: 1,
+	properties: {
+		clientId: {
+			type: 'string',
+			minLength: 1,
+			markdownDescription: localize('app.mcp.json.oauth.clientId', "The OAuth client ID to use when authenticating with the server. When `enterpriseManaged` is `true`, this is the **resource** authorization server's client ID (the client trusted by the protected resource), not the IdP's. To set the matching client secret, use the *Set Client Secret* code lens above this field — secrets are stored in the OS secret store, not in this file.")
+		},
+		enterpriseManaged: {
+			type: 'boolean',
+			default: false,
+			markdownDescription: localize('app.mcp.json.oauth.enterpriseManaged', "(Preview) When set to `true`, this MCP server authenticates through the SSO issuer configured by `#mcp.enterpriseManagedAuth.idp#` using OAuth Identity Assertion Authorization Grant (ID-JAG). After a one-time sign-in, subsequent enterprise-managed servers connect silently. The IdP issuer and client credentials are read from the `#mcp.enterpriseManagedAuth.idp#` setting; the `clientId` on this server entry is passed to the resource authorization server.")
+		},
+		authorizationServer: {
+			type: 'string',
+			format: 'uri',
+			markdownDescription: localize('app.mcp.json.oauth.authorizationServer', "The issuer URL of the authorization server that `clientId` and its client secret are registered with. When the server names a different authorization server, VS Code refuses to send these credentials to it. When omitted, the credentials are bound to the authorization server they are first used with.")
+		},
+		pkce: {
+			type: 'string',
+			enum: ['require-advertised', 'assume-supported'],
+			default: 'require-advertised',
+			enumDescriptions: [
+				localize('app.mcp.json.oauth.pkce.requireAdvertised', "Only authorize against authorization servers that advertise the `S256` PKCE method."),
+				localize('app.mcp.json.oauth.pkce.assumeSupported', "Use PKCE `S256` even when the authorization server does not advertise it. Only use this for servers known to support PKCE."),
+			],
+			markdownDescription: localize('app.mcp.json.oauth.pkce', "Whether the authorization server must advertise PKCE `S256` support in its metadata (`code_challenge_methods_supported`).")
+		},
+		allowInsecureHttp: {
+			type: 'boolean',
+			default: false,
+			markdownDescription: localize('app.mcp.json.oauth.allowInsecureHttp', "Allow `http://` authorization server endpoints on hosts other than loopback. Only use this for local development; tokens and credentials are sent unencrypted.")
+		}
 	}
 };
 
@@ -287,6 +348,7 @@ export const mcpStdioServerSchema: IJSONSchema = {
 				]
 			}
 		},
+		protocolVersion: mcpProtocolVersionSchema,
 		...mcpDevModeProps(true),
 	}
 };
@@ -319,24 +381,81 @@ export const mcpRemoteServerSchema: IJSONSchema = {
 			description: localize('app.mcp.json.headers', "Additional headers sent to the server. These headers are not sent to a different origin, including across redirects."),
 			additionalProperties: { type: 'string' },
 		},
-		oauth: {
+		oauth: mcpOAuthSchema,
+		protocolVersion: mcpProtocolVersionSchema,
+		...mcpDevModeProps(false),
+	}
+};
+
+export const mcpGrpcServerSchema: IJSONSchema = {
+	type: 'object',
+	additionalProperties: false,
+	required: ['type', 'url'],
+	examples: [grpcSchemaExamples['my-grpc-server']],
+	properties: {
+		type: {
+			type: 'string',
+			enum: ['grpc'],
+			description: localize('app.mcp.json.type', "The type of the server.")
+		},
+		url: {
+			type: 'string',
+			format: 'uri',
+			pattern: '^grpcs?:\\/\\/.+',
+			patternErrorMessage: localize('app.mcp.json.grpc.url.pattern', "The URL must start with 'grpc://' or 'grpcs://'."),
+			markdownDescription: localize('app.mcp.json.grpc.url', "The gRPC endpoint of the server: `grpc://host:port` for plaintext HTTP/2 or `grpcs://host:port` for TLS.")
+		},
+		headers: {
 			type: 'object',
-			description: localize('app.mcp.json.oauth', "OAuth configuration for authenticating with the server."),
+			description: localize('app.mcp.json.grpc.headers', "Additional metadata sent with every call. It is not sent to a different authority than the configured URL."),
+			additionalProperties: { type: 'string' },
+		},
+		tls: {
+			type: 'object',
 			additionalProperties: false,
-			minProperties: 1,
+			markdownDescription: localize('app.mcp.json.grpc.tls', "TLS settings for `grpcs://` endpoints. The server certificate is verified against the same certificate authorities as HTTPS requests: the bundled roots and, when the `http.systemCertificates` setting is on, the operating system's certificate store."),
 			properties: {
-				clientId: {
+				ca: {
 					type: 'string',
-					minLength: 1,
-					markdownDescription: localize('app.mcp.json.oauth.clientId', "The OAuth client ID to use when authenticating with the server. When `enterpriseManaged` is `true`, this is the **resource** authorization server's client ID (the client trusted by the protected resource), not the IdP's. To set the matching client secret, use the *Set Client Secret* code lens above this field — secrets are stored in the OS secret store, not in this file.")
+					markdownDescription: localize('app.mcp.json.grpc.tls.ca', "Path to a PEM-encoded certificate authority bundle that is trusted for the server certificate in addition to the bundled roots and, when the `http.systemCertificates` setting is on, the operating system's certificate store."),
+					examples: ['${workspaceFolder}/certs/ca.pem'],
 				},
-				enterpriseManaged: {
+				insecure: {
 					type: 'boolean',
 					default: false,
-					markdownDescription: localize('app.mcp.json.oauth.enterpriseManaged', "(Preview) When set to `true`, this MCP server authenticates through the SSO issuer configured by `#mcp.enterpriseManagedAuth.idp#` using OAuth Identity Assertion Authorization Grant (ID-JAG). After a one-time sign-in, subsequent enterprise-managed servers connect silently. The IdP issuer and client credentials are read from the `#mcp.enterpriseManagedAuth.idp#` setting; the `clientId` on this server entry is passed to the resource authorization server.")
-				}
+					description: localize('app.mcp.json.grpc.tls.insecure', "Skips verification of the server certificate. Only use this for local development."),
+				},
+				serverName: {
+					type: 'string',
+					description: localize('app.mcp.json.grpc.tls.serverName', "The host name presented during the TLS handshake (SNI) and checked against the server certificate, when it differs from the host in the URL."),
+				},
 			}
 		},
+		binding: {
+			type: 'string',
+			enum: ['auto', 'tunnel', 'typed'],
+			default: 'auto',
+			markdownEnumDescriptions: [
+				localize('app.mcp.json.grpc.binding.auto', "The default: the JSON-RPC tunnel, exactly as `tunnel`. VS Code never switches to the typed service on its own."),
+				localize('app.mcp.json.grpc.binding.tunnel', "Send the JSON-RPC messages through the `mcp.zig.transport.v1.Mcp/Call` tunnel."),
+				localize('app.mcp.json.grpc.binding.typed', "Call the methods of Google's typed `model_context_protocol.Mcp` service, for a server that does not offer the tunnel. The typed service carries no subscriptions, notifications, pagination beyond the first page or tasks."),
+			],
+			markdownDescription: localize('app.mcp.json.grpc.binding', "The gRPC service the server implements. `auto` (the default) and `tunnel` send MCP's JSON-RPC messages through the `mcp.zig.transport.v1.Mcp/Call` tunnel; VS Code never switches to Google's typed `model_context_protocol.Mcp` service on its own. Set `typed` for a server that only offers the typed service: with `auto`, such a server fails to start with an error that says so."),
+		},
+		deadlineMs: {
+			type: 'number',
+			exclusiveMinimum: 0,
+			maximum: 2147483647,
+			markdownDescription: localize('app.mcp.json.grpc.deadlineMs', "The deadline for each call in milliseconds, sent as `grpc-timeout`; it must be greater than 0. It applies to every request except the `subscriptions/listen` stream, which never has one. When unset, only `server/discover`, `tools/list`, `prompts/list`, `prompts/get`, `resources/list`, `resources/templates/list`, `resources/read` and `completion/complete` get a deadline of 60 seconds; `tools/call`, the retries of `input_required` rounds and the other requests get none, so a tool that never returns keeps its request open until it is cancelled."),
+		},
+		keepAliveMs: {
+			type: 'number',
+			// Either 0 (off) or an interval a gRPC server accepts that a timer can wait.
+			anyOf: [{ minimum: 300000, maximum: 2147483647 }, { const: 0 }],
+			markdownDescription: localize('app.mcp.json.grpc.keepAliveMs', "The interval between HTTP/2 keep-alive pings in milliseconds, from `300000` (5 minutes: gRPC servers allow one ping every 5 minutes by default and close the connection of a client that pings more often) to `2147483647`. The pings are sent only while at least one call is open, as gRPC clients do by default: servers count a ping on an idle connection as abuse. If the server still answers with `too_many_pings`, the interval is doubled for the next connection. `0` sends no pings at all. When unset, a ping is sent every 5 minutes and 10 seconds only while a `subscriptions/listen` stream is open, so that a NAT or load balancer does not cut a stream that has no events for a while."),
+		},
+		oauth: mcpOAuthSchema,
+		protocolVersion: mcpProtocolVersionSchema,
 		...mcpDevModeProps(false),
 	}
 };
@@ -357,10 +476,11 @@ export const mcpServerSchema: IJSONSchema = {
 			examples: [
 				mcpSchemaExampleServers,
 				httpSchemaExamples,
+				grpcSchemaExamples,
 			],
 			additionalProperties: {
 				oneOf: [
-					mcpStdioServerSchema, mcpRemoteServerSchema,
+					mcpStdioServerSchema, mcpRemoteServerSchema, mcpGrpcServerSchema,
 				]
 			}
 		},

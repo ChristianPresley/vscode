@@ -8,6 +8,8 @@ import { assertNever } from '../../../../base/common/assert.js';
 import { decodeHex, encodeHex, VSBuffer } from '../../../../base/common/buffer.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Event } from '../../../../base/common/event.js';
+import { JsonRpcId } from '../../../../base/common/jsonRpcProtocol.js';
+import { McpProtocolEra } from '../../../../platform/mcp/common/mcpProtocolVersions.js';
 import { IMarkdownString } from '../../../../base/common/htmlContent.js';
 import { Disposable, IDisposable } from '../../../../base/common/lifecycle.js';
 import { equals as objectsEqual } from '../../../../base/common/objects.js';
@@ -25,7 +27,7 @@ import { ExtensionIdentifier } from '../../../../platform/extensions/common/exte
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { IMcpGalleryManifest, McpGalleryManifestStatus } from '../../../../platform/mcp/common/mcpGalleryManifest.js';
 import { IGalleryMcpServer, IGalleryMcpServerConfiguration, IInstallableMcpServer, IQueryOptions } from '../../../../platform/mcp/common/mcpManagement.js';
-import { IMcpDevModeConfig, IMcpSandboxConfiguration, IMcpServerConfiguration, McpServerType } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
+import { IMcpDevModeConfig, IMcpGrpcServerTlsConfiguration, IMcpSandboxConfiguration, IMcpServerConfiguration, McpGrpcBinding, McpServerType } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
 import { McpResourceFormat } from '../../../../platform/mcp/common/mcpWorkspaceConfiguration.js';
 import { StorageScope } from '../../../../platform/storage/common/storage.js';
 import { IWorkspaceFolder, IWorkspaceFolderData } from '../../../../platform/workspace/common/workspace.js';
@@ -34,7 +36,7 @@ import { ContributionEnablementState, IEnablementModel } from '../../chat/common
 import { ToolProgress } from '../../chat/common/tools/languageModelToolsService.js';
 import { ExternalDiscoverySource, IMcpServerSamplingConfiguration } from './mcpConfiguration.js';
 import { McpServerRequestHandler } from './mcpServerRequestHandler.js';
-import { MCP } from './modelContextProtocol.js';
+import { MCPLegacy } from './modelContextProtocolLegacy.js';
 import { UriTemplate } from '../../../../base/common/uriTemplate.js';
 
 export const extensionMcpCollectionPrefix = 'ext.';
@@ -216,6 +218,12 @@ export interface McpServerDefinition {
 	readonly environmentVariableExpansion?: McpServerEnvironmentVariableExpansion;
 	/** Nonce used for caching the server. Changing the nonce will indicate that tools need to be refreshed. */
 	readonly cacheNonce: string;
+	/**
+	 * An optional protocol revision the user pinned in the configuration. The
+	 * client skips era detection and speaks that revision (non-strict: it still
+	 * falls back when the server rejects it).
+	 */
+	readonly protocolVersionHint?: string;
 	/** Dev mode configuration for the server */
 	readonly devMode?: IMcpDevModeConfig;
 	/** Optional server version metadata from the source configuration. */
@@ -244,10 +252,10 @@ export const enum McpServerStaticToolAvailability {
 }
 
 export interface McpServerStaticMetadata {
-	tools?: { availability: McpServerStaticToolAvailability; definition: MCP.Tool }[];
+	tools?: { availability: McpServerStaticToolAvailability; definition: MCPLegacy.Tool }[];
 	instructions?: string;
-	capabilities?: MCP.ServerCapabilities;
-	serverInfo?: MCP.Implementation;
+	capabilities?: MCPLegacy.ServerCapabilities;
+	serverInfo?: MCPLegacy.Implementation;
 }
 
 /**
@@ -302,6 +310,7 @@ export namespace McpServerDefinition {
 		readonly id: string;
 		readonly label: string;
 		readonly cacheNonce: string;
+		readonly protocolVersionHint?: string;
 		readonly launch: McpServerLaunch.Serialized;
 		readonly defaultCwd?: UriComponents;
 		readonly variableReplacement?: McpServerDefinitionVariableReplacement.Serialized;
@@ -321,6 +330,7 @@ export namespace McpServerDefinition {
 			id: def.id,
 			label: def.label,
 			cacheNonce: def.cacheNonce,
+			protocolVersionHint: def.protocolVersionHint,
 			staticMetadata: def.staticMetadata,
 			launch: McpServerLaunch.fromSerialized(def.launch),
 			defaultCwd: def.defaultCwd ? URI.revive(def.defaultCwd) : undefined,
@@ -594,7 +604,7 @@ export interface IMcpPrompt {
 	readonly name: string;
 	readonly title?: string;
 	readonly description?: string;
-	readonly arguments: readonly MCP.PromptArgument[];
+	readonly arguments: readonly MCPLegacy.PromptArgument[];
 
 	/** Gets string completions for the given prompt part. */
 	complete(argument: string, prefix: string, alreadyResolved: Record<string, string>, token: CancellationToken): Promise<string[]>;
@@ -607,7 +617,7 @@ export const mcpPromptReplaceSpecialChars = (s: string) => s.replace(/[^a-z0-9_.
 export const mcpPromptPrefix = (definition: McpDefinitionReference) =>
 	`/mcp.` + mcpPromptReplaceSpecialChars(definition.label);
 
-export interface IMcpPromptMessage extends MCP.PromptMessage { }
+export interface IMcpPromptMessage extends MCPLegacy.PromptMessage { }
 
 export interface IMcpToolCallContext {
 	chatSessionResource: URI | undefined;
@@ -674,7 +684,7 @@ export interface IMcpTool {
 	/** Name for #referencing in chat */
 	readonly referenceName: string;
 	readonly icons: IMcpIcons;
-	readonly definition: MCP.Tool;
+	readonly definition: MCPLegacy.Tool;
 	/** Visibility of the tool (Model, App, or both). Defaults to Model | App. */
 	readonly visibility: McpToolVisibility;
 	/** Optional UI resource URI for MCP App rendering */
@@ -685,12 +695,12 @@ export interface IMcpTool {
 	 * @throws {@link MpcResponseError} if the tool fails to execute
 	 * @throws {@link McpConnectionFailedError} if the connection to the server fails
 	 */
-	call(params: Record<string, unknown>, context?: IMcpToolCallContext, token?: CancellationToken): Promise<MCP.CallToolResult>;
+	call(params: Record<string, unknown>, context?: IMcpToolCallContext, token?: CancellationToken): Promise<MCPLegacy.CallToolResult>;
 
 	/**
 	 * Identical to {@link call}, but reports progress.
 	 */
-	callWithProgress(params: Record<string, unknown>, progress: ToolProgress, context?: IMcpToolCallContext, token?: CancellationToken): Promise<MCP.CallToolResult>;
+	callWithProgress(params: Record<string, unknown>, progress: ToolProgress, context?: IMcpToolCallContext, token?: CancellationToken): Promise<MCPLegacy.CallToolResult>;
 }
 
 export const enum McpServerTransportType {
@@ -698,6 +708,8 @@ export const enum McpServerTransportType {
 	Stdio = 1 << 0,
 	/** An MCP server that uses Server-Sent Events */
 	HTTP = 1 << 1,
+	/** An MCP server reached over gRPC (HTTP/2), through the JSON-RPC tunnel or the typed service */
+	Grpc = 1 << 2,
 }
 
 /**
@@ -778,23 +790,108 @@ export interface McpServerTransportHTTP {
 	readonly authentication?: McpServerTransportHTTPAuthentication;
 }
 
+/**
+ * MCP server reached over gRPC on a `grpc://` (plaintext HTTP/2) or `grpcs://`
+ * (TLS) endpoint. The {@link binding} selects the zig-sdk JSON-RPC tunnel
+ * (`/mcp.zig.transport.v1.Mcp/Call`), Google's typed `model_context_protocol.Mcp`
+ * service, or `auto` (the default), which is the tunnel: only `typed` speaks
+ * the typed service.
+ */
+export interface McpServerTransportGrpc {
+	readonly type: McpServerTransportType.Grpc;
+	readonly uri: URI;
+	/** Additional metadata sent with every call, restricted to the configured URI's authority. */
+	readonly headers: [string, string][];
+	readonly tls?: IMcpGrpcServerTlsConfiguration;
+	readonly binding?: McpGrpcBinding;
+	/**
+	 * The deadline in milliseconds of every call except the `subscriptions/listen`
+	 * stream, which never has one. Unset (or not a positive number): 60 seconds for
+	 * `server/discover` and the list, read, prompt and completion requests, and no
+	 * deadline for `tools/call`, the retries of `input_required` rounds and other requests.
+	 */
+	readonly deadlineMs?: number;
+	/**
+	 * Interval in milliseconds between HTTP/2 keep-alive pings, sent only while a
+	 * call is open, raised to at least 300000 (5 minutes) and doubled for the
+	 * next connection after a `too_many_pings`; 0 sends none. Unset (or not a
+	 * number of milliseconds): a ping every 310000 ms only while a
+	 * `subscriptions/listen` stream is open.
+	 */
+	readonly keepAliveMs?: number;
+	readonly oauth?: McpServerTransportHTTPOAuth;
+}
+
 export type McpServerLaunch =
 	| McpServerTransportStdio
-	| McpServerTransportHTTP;
+	| McpServerTransportHTTP
+	| McpServerTransportGrpc;
 
 export namespace McpServerLaunch {
 	export type Serialized =
 		| { type: McpServerTransportType.HTTP; transport?: 'sse' | 'streamable-http'; uri: UriComponents; headers: [string, string][]; oauth?: McpServerTransportHTTPOAuth; authentication?: McpServerTransportHTTPAuthentication }
+		| { type: McpServerTransportType.Grpc; uri: UriComponents; headers: [string, string][]; tls?: IMcpGrpcServerTlsConfiguration; binding?: McpGrpcBinding; deadlineMs?: number; keepAliveMs?: number; oauth?: McpServerTransportHTTPOAuth }
 		| { type: McpServerTransportType.Stdio; cwd: string | undefined; command: string; args: readonly string[]; env: Record<string, string | number | null>; envFile: string | undefined; sandbox: IMcpSandboxConfiguration | undefined };
 
 	export function toSerialized(launch: McpServerLaunch): McpServerLaunch.Serialized {
 		return launch;
 	}
 
+	/** Whether a URI scheme is one a gRPC launch accepts: `grpc` (plaintext HTTP/2) or `grpcs` (TLS). */
+	export function isGrpcScheme(scheme: string): boolean {
+		return scheme === 'grpc' || scheme === 'grpcs';
+	}
+
+	/**
+	 * Validates that {@link uri} is a `grpc://` or `grpcs://` endpoint and returns it,
+	 * throwing a user-facing error otherwise.
+	 */
+	export function validateGrpcUri(uri: URI): URI {
+		if (!isGrpcScheme(uri.scheme)) {
+			throw new Error(localize('mcp.grpc.invalidScheme', "The URL of a gRPC MCP server must start with 'grpc://' or 'grpcs://', but was '{0}'.", uri.toString(true)));
+		}
+		return uri;
+	}
+
+	/**
+	 * Whether a network resource (an icon, an `http:` link) at {@link authority} belongs to
+	 * the server of {@link launch}. HTTP servers match by authority (host and port). gRPC
+	 * servers match by host name, since their HTTP/2 port does not serve web resources.
+	 * Stdio servers have no network authority and never match.
+	 */
+	export function isServerNetworkAuthority(launch: McpServerLaunch, authority: string): boolean {
+		switch (launch.type) {
+			case McpServerTransportType.HTTP:
+				return launch.uri.authority.toLowerCase() === authority.toLowerCase();
+			case McpServerTransportType.Grpc:
+				return authorityHostname(launch.uri.authority) === authorityHostname(authority);
+			default:
+				return false;
+		}
+	}
+
+	/** The host name of a URI authority, without user info or port; IPv6 literals keep their brackets. */
+	function authorityHostname(authority: string): string {
+		const host = authority.slice(authority.lastIndexOf('@') + 1);
+		const end = host.startsWith('[') ? host.indexOf(']') + 1 : host.lastIndexOf(':');
+		return (end > 0 ? host.slice(0, end) : host).toLowerCase();
+	}
+
 	export function fromSerialized(launch: McpServerLaunch.Serialized): McpServerLaunch {
 		switch (launch.type) {
 			case McpServerTransportType.HTTP:
 				return { type: launch.type, transport: launch.transport, uri: URI.revive(launch.uri), headers: launch.headers, oauth: launch.oauth, authentication: launch.authentication };
+			case McpServerTransportType.Grpc:
+				return {
+					type: launch.type,
+					uri: validateGrpcUri(URI.revive(launch.uri)),
+					headers: launch.headers,
+					tls: launch.tls,
+					binding: launch.binding,
+					deadlineMs: launch.deadlineMs,
+					keepAliveMs: launch.keepAliveMs,
+					oauth: launch.oauth,
+				};
 			case McpServerTransportType.Stdio:
 				return {
 					type: launch.type,
@@ -820,6 +917,25 @@ export namespace McpServerLaunch {
 				cwd: configuration.cwd,
 				sandbox: mergeSandboxConfiguration(sandbox, configuration.sandbox),
 			};
+		}
+
+		if (configuration.type === McpServerType.GRPC) {
+			// An invalid URL (including a non-gRPC scheme) makes the configuration unusable, which callers
+			// report like any other invalid configuration rather than failing the whole discovery pass.
+			try {
+				return {
+					type: McpServerTransportType.Grpc,
+					uri: validateGrpcUri(URI.parse(configuration.url)),
+					headers: Object.entries(configuration.headers ?? {}),
+					tls: configuration.tls,
+					binding: configuration.binding,
+					deadlineMs: configuration.deadlineMs,
+					keepAliveMs: configuration.keepAliveMs,
+					oauth: configuration.oauth,
+				};
+			} catch {
+				return undefined;
+			}
 		}
 
 		try {
@@ -886,7 +1002,7 @@ export interface IMcpServerConnection extends IDisposable {
 	 * Starts the server if it's stopped. Returns a promise that resolves once
 	 * server exits a 'starting' state.
 	 */
-	start(methods: IMcpClientMethods): Promise<McpConnectionState>;
+	start(methods: IMcpClientMethods, hints?: IMcpNegotiationHints): Promise<McpConnectionState>;
 
 	/**
 	 * Stops the server.
@@ -896,10 +1012,73 @@ export interface IMcpServerConnection extends IDisposable {
 
 /** Client methods whose implementations are passed through the server connection. */
 export interface IMcpClientMethods {
-	/** Handler for `sampling/createMessage` */
-	createMessageRequestHandler?(req: MCP.CreateMessageRequest['params'], token?: CancellationToken): Promise<MCP.CreateMessageResult>;
-	/** Handler for `elicitation/create` */
-	elicitationRequestHandler?(req: MCP.ElicitRequest['params'], token?: CancellationToken): Promise<MCP.ElicitResult>;
+	/** Handler for `sampling/createMessage` (a server request in the legacy era, an input request in the modern era). */
+	createMessageRequestHandler?(req: MCPLegacy.CreateMessageRequest['params'], token?: CancellationToken, context?: IMcpToolCallContext): Promise<MCPLegacy.CreateMessageResult>;
+	/** Handler for `elicitation/create` (a server request in the legacy era, an input request in the modern era). */
+	elicitationRequestHandler?(req: MCPLegacy.ElicitRequest['params'], token?: CancellationToken, context?: IMcpToolCallContext, options?: IMcpElicitOptions): Promise<MCPLegacy.ElicitResult>;
+}
+
+/**
+ * Hints the protocol engine uses when it connects. Without hints it probes:
+ * `server/discover` first, then the legacy `initialize` handshake.
+ */
+export interface IMcpNegotiationHints {
+	/** The era the server spoke last time (from the metadata cache). Skips the probe; a failure re-probes. */
+	readonly era?: McpProtocolEra;
+	/** The revision to speak (from the cache or a configured pin). */
+	readonly protocolVersion?: string;
+	/**
+	 * Never fall back to the other era. Used by the conformance client, which
+	 * must speak exactly the revision the suite requested.
+	 */
+	readonly strict?: boolean;
+}
+
+/**
+ * Transport-level metadata the protocol engine attaches to every message it
+ * sends. Transports that need it (Streamable HTTP, gRPC) derive their wire
+ * behaviour from it: the protocol era from `protocolVersion`, the mirrored
+ * HTTP headers, deadlines. A message sent without an envelope is treated as
+ * legacy (2025-11-25) traffic and goes on the wire exactly as before.
+ */
+export interface IMcpMessageEnvelope {
+	readonly kind: 'request' | 'notification' | 'listen';
+	/** The JSON-RPC id for requests and listen streams. */
+	readonly requestId?: JsonRpcId;
+	/** The protocol revision the message is sent under. */
+	readonly protocolVersion: string;
+	readonly method: string;
+	/** Mirrored `Mcp-*` headers computed by the engine (modern HTTP and gRPC only). */
+	readonly headers?: Readonly<Record<string, string>>;
+	/** A per-request deadline for transports that support one (gRPC). */
+	readonly deadlineMs?: number;
+}
+
+/**
+ * Reported by a transport when a request can no longer be answered by the
+ * peer: the engine fails the pending request locally. Transports never
+ * synthesize JSON-RPC error messages for these conditions.
+ */
+export interface IMcpRequestAbort {
+	readonly requestId: JsonRpcId;
+	readonly reason:
+	/** A modern probe hit a legacy server (recognized by its HTTP status/body). */
+	| 'legacy-probe'
+	/** The HTTP response status does not carry a JSON-RPC message. */
+	| 'http-status'
+	/** The response stream ended before the response arrived. */
+	| 'stream-closed'
+	/** The request could not be sent or the connection failed. */
+	| 'transport-error'
+	/** A gRPC status-only failure (no `mcp-error-*` trailers). */
+	| 'grpc-status'
+	/** The per-request deadline elapsed. */
+	| 'deadline'
+	/** The message cannot be expressed on this transport. */
+	| 'unexpressible';
+	readonly message?: string;
+	readonly httpStatus?: number;
+	readonly grpcStatus?: number;
 }
 
 /**
@@ -980,6 +1159,34 @@ export type McpConnectionState =
 export class MpcResponseError extends Error {
 	constructor(message: string, public readonly code: number, public readonly data: unknown) {
 		super(`MPC ${code}: ${message}`);
+	}
+}
+
+export type McpClientErrorReason =
+	/** The stdio server answered neither `server/discover` nor `initialize` within the probe timeout. */
+	| 'probe-timeout'
+	/** The server advertises no revision the client speaks. */
+	| 'no-supported-version'
+	/** A result carried an unknown `resultType`. */
+	| 'invalid-result-type'
+	/** The server kept asking for input beyond the round limit. */
+	| 'too-many-rounds'
+	/** The server asked for an input kind the client did not declare. */
+	| 'undeclared-input-request'
+	/** An `input_required` result was malformed. */
+	| 'invalid-input-request'
+	/** The user's elicitation answer does not match the requested schema. */
+	| 'invalid-elicit-content'
+	/** The server requires client capabilities the client did not declare (-32021); the message names them. */
+	| 'missing-capability'
+	/** The transport reported that the request can no longer be answered. */
+	| 'request-aborted';
+
+/** A failure of the client protocol engine itself (as opposed to an error the server returned). */
+export class McpClientError extends Error {
+	constructor(public readonly reason: McpClientErrorReason, message: string, public readonly detail?: unknown) {
+		super(message);
+		this.name = 'McpClientError';
 	}
 }
 
@@ -1201,16 +1408,18 @@ export const enum McpCapability {
 	ResourcesListChanged = 1 << 6,
 	Tools = 1 << 7,
 	ToolsListChanged = 1 << 8,
+	/** The server speaks a stateless (2026-07-28 or later) revision. */
+	StatelessProtocol = 1 << 9,
 }
 
 export interface ISamplingOptions {
 	server: IMcpServer;
 	isDuringToolCall: boolean;
-	params: MCP.CreateMessageRequest['params'];
+	params: MCPLegacy.CreateMessageRequest['params'];
 }
 
 export interface ISamplingResult {
-	sample: MCP.CreateMessageResult;
+	sample: MCPLegacy.CreateMessageResult;
 }
 
 export interface IMcpSamplingService {
@@ -1231,7 +1440,7 @@ export const IMcpSamplingService = createDecorator<IMcpSamplingService>('IMcpSer
 
 export class McpError extends Error {
 	public static methodNotFound(method: string) {
-		return new McpError(MCP.METHOD_NOT_FOUND, `Method not found: ${method}`);
+		return new McpError(MCPLegacy.METHOD_NOT_FOUND, `Method not found: ${method}`);
 	}
 
 	public static notAllowed() {
@@ -1239,7 +1448,7 @@ export class McpError extends Error {
 	}
 
 	public static unknown(e: Error) {
-		const mcpError = new McpError(MCP.INTERNAL_ERROR, `Unknown error: ${e.stack}`);
+		const mcpError = new McpError(MCPLegacy.INTERNAL_ERROR, `Unknown error: ${e.stack}`);
 		mcpError.cause = e;
 		return mcpError;
 	}
@@ -1271,7 +1480,16 @@ export interface IMcpElicitationService {
 	 * @param elicitation Request to elicit a response.
 	 * @returns A promise that resolves to an {@link ElicitationResult}.
 	 */
-	elicit(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCP.ElicitRequest['params'], token: CancellationToken): Promise<ElicitResult>;
+	elicit(server: IMcpServer, context: IMcpToolCallContext | undefined, elicitation: MCPLegacy.ElicitRequest['params'], token: CancellationToken, options?: IMcpElicitOptions): Promise<ElicitResult>;
+}
+
+export interface IMcpElicitOptions {
+	/**
+	 * The same URL elicitation is being asked for again after the user already
+	 * opened it (a modern server re-asked in a later round): show a "Continue"
+	 * affordance instead of opening the URL again.
+	 */
+	readonly resume?: boolean;
 }
 
 export const enum ElicitationKind {
@@ -1281,7 +1499,7 @@ export const enum ElicitationKind {
 
 export interface IUrlModeElicitResult extends IDisposable {
 	kind: ElicitationKind.URL;
-	value: MCP.ElicitResult;
+	value: MCPLegacy.ElicitResult;
 	/**
 	 * Waits until the server tells us the elicitation is completed before resolving.
 	 * Rejects with a CancellationError if the server stops before elicitation is
@@ -1292,7 +1510,7 @@ export interface IUrlModeElicitResult extends IDisposable {
 
 export interface IFormModeElicitResult extends IDisposable {
 	kind: ElicitationKind.Form;
-	value: MCP.ElicitResult;
+	value: MCPLegacy.ElicitResult;
 }
 
 export type ElicitResult = IUrlModeElicitResult | IFormModeElicitResult;
