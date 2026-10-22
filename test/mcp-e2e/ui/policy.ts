@@ -404,7 +404,9 @@ async function main(): Promise<number> {
 		const wire = serverJsonLines(`${phase.tlsProcess}.wire.jsonl`);
 		// The listening entry of the TLS front end restarted for this phase (the log is appended to across the run).
 		const listenedAt = PHASE_START === undefined ? -1 : wire.findIndex(e => e.event === 'listening' && Date.parse(String(e.t)) >= PHASE_START);
-		const contacts = wire.slice(listenedAt >= 0 ? listenedAt : wireFrom).filter(e => e.event === 'connection' || e.event === 'tls-error');
+		// Contacts count from the driver's start on (wireFrom): start-servers.ts probes the restarted
+		// front end with a plain TCP connect, which it logs as a TLS error ("socket hang up").
+		const contacts = wire.slice(Math.max(listenedAt, wireFrom)).filter(e => e.event === 'connection' || e.event === 'tls-error');
 		const httpRequests = serverJsonLines(`${BY_NAME}.http.jsonl`).slice(httpFrom).filter(e => e.event === 'request').length;
 		const rows = observed.rows;
 
