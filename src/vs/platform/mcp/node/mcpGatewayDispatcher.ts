@@ -10,8 +10,8 @@ import { Disposable } from '../../../base/common/lifecycle.js';
 import { generateUuid } from '../../../base/common/uuid.js';
 import { ILogger } from '../../log/common/log.js';
 import { IMcpGatewayCacheHints, IMcpGatewayInputRequired, IMcpGatewayInvokeContext, IMcpGatewayServerCapabilities, IMcpGatewaySingleServerInvoker } from '../common/mcpGateway.js';
-import { applyModernEnvelope, clientCapabilitiesOf, GATEWAY_SERVER_INFO, hasClientCapability, honorSubscriptionFilter, IModernRequestMeta, McpGatewayRpcError, McpInputRequestCapability, requiredCapabilitiesForInputRequest, validateInputResponses, validateModernRequestMeta, validateStandardHeaders } from '../common/mcpGatewayProtocol.js';
-import { LATEST_MCP_PROTOCOL_VERSION, McpProtocolEra } from '../common/mcpProtocolVersions.js';
+import { applyModernEnvelope, clientCapabilitiesOf, GATEWAY_SERVER_INFO, hasClientCapability, honorSubscriptionFilter, IModernRequestMeta, McpGatewayRpcError, McpInputRequestCapability, requiredCapabilitiesForInputRequest, unsupportedProtocolVersionHeader, validateInputResponses, validateModernRequestMeta, validateStandardHeaders } from '../common/mcpGatewayProtocol.js';
+import { LATEST_MCP_PROTOCOL_VERSION, McpProtocolEra, MODERN_MCP_PROTOCOL_VERSIONS } from '../common/mcpProtocolVersions.js';
 import { MCP_PROTOCOL_VERSION_HEADER, trimOws } from '../common/mcpHttpHeaders.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { MCPLegacy } from '../common/modelContextProtocolLegacy.js';
@@ -292,6 +292,12 @@ export class McpGatewayDispatcher extends Disposable {
 	 * arguments). Errors map to HTTP 400 on the HTTP transport.
 	 */
 	async prepareModernRequest(headers: Readonly<Record<string, string>>, request: IJsonRpcRequest): Promise<ModernRequestPreparation> {
+		// A version header of another revision on a body without a _meta version (the gRPC
+		// tunnel, where no era is chosen first) gets -32022 rather than the missing _meta.
+		const headerVersionError = unsupportedProtocolVersionHeader(headers, request, MODERN_MCP_PROTOCOL_VERSIONS);
+		if (headerVersionError) {
+			return { ok: false, error: headerVersionError };
+		}
 		const meta = validateModernRequestMeta(request);
 		if (!meta.ok) {
 			if (meta.error.code === MCP.UNSUPPORTED_PROTOCOL_VERSION) {

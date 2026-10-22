@@ -13,7 +13,8 @@ import { Disposable, IDisposable, toDisposable } from '../../../base/common/life
 import { generateUuid } from '../../../base/common/uuid.js';
 import { ILogger } from '../../log/common/log.js';
 import { IMcpGatewaySingleServerInvoker } from '../common/mcpGateway.js';
-import { applyModernEnvelope, cancellationTargets, classifyEra, clientInfoFromMeta, errorResponse, httpStatusForRpcError, IMcpGatewayCancellable, IMcpGatewayErrorResponse, IMcpGatewayMessageSender, IModernRequestMeta, LEGACY_TRANSPORT_ERROR, McpGatewayRpcError, validateLegacyProtocolVersionHeader, validateSubscriptionFilter } from '../common/mcpGatewayProtocol.js';
+import { applyModernEnvelope, cancellationTargets, classifyEra, clientInfoFromMeta, errorResponse, httpStatusForRpcError, IMcpGatewayCancellable, IMcpGatewayErrorResponse, IMcpGatewayMessageSender, IModernRequestMeta, LEGACY_TRANSPORT_ERROR, McpGatewayRpcError, unsupportedProtocolVersionHeader, validateLegacyProtocolVersionHeader, validateSubscriptionFilter } from '../common/mcpGatewayProtocol.js';
+import { SUPPORTED_MCP_PROTOCOL_VERSIONS } from '../common/mcpProtocolVersions.js';
 import { MCP } from '../common/modelContextProtocol.js';
 import { IMcpGatewayDispatchContext, IMcpGatewayDispatcherOptions, IMcpGatewayNotification, McpGatewayDispatcher } from './mcpGatewayDispatcher.js';
 import { IMcpGatewaySseConnection, McpGatewayStreamKind } from './mcpGatewayEventLog.js';
@@ -742,6 +743,19 @@ export class McpGatewayRoute extends Disposable {
 			return;
 		}
 		const headers = lowercaseRequestHeaders(req.headers);
+		// A version of neither era is refused before an era is chosen, so a client of
+		// another revision learns the supported ones (a body without _meta would
+		// otherwise be served as legacy and refused as an uninitialized session).
+		// Session traffic and initialize keep the 2025-11-25 rules: initialize
+		// negotiates the version, and a session's requests get -32000.
+		if (isRequest(message) && this._sessionIdOf(headers) === undefined && !isInitializeMessage(message)) {
+			const versionError = unsupportedProtocolVersionHeader(headers, message, SUPPORTED_MCP_PROTOCOL_VERSIONS);
+			if (versionError) {
+				this._logger.warn(`[McpGateway][route ${this.routeId}] Refused ${message.method} (id=${String(message.id)}): ${versionError.message}`);
+				this._respondJson(res, 400, errorResponse(message.id, versionError.code, versionError.message, versionError.data));
+				return;
+			}
+		}
 		if (classifyEra(headers, message) === 'modern') {
 			await this._handleModernPost(req, headers, message, res);
 		} else {

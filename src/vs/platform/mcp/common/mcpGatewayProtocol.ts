@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { IJsonRpcError, IJsonRpcRequest, JsonRpcId } from '../../../base/common/jsonRpcProtocol.js';
-import { MCP_PROTOCOL_VERSION_HEADER, verifyMirroredHeaders } from './mcpHttpHeaders.js';
+import { isHeaderSafeAscii, MCP_PROTOCOL_VERSION_HEADER, trimOws, verifyMirroredHeaders } from './mcpHttpHeaders.js';
 import { eraForProtocolVersion, LEGACY_MCP_PROTOCOL_VERSIONS, META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_LOG_LEVEL, META_PROGRESS_TOKEN, META_PROTOCOL_VERSION, META_SERVER_INFO, McpProtocolEra, MODERN_MCP_PROTOCOL_VERSIONS } from './mcpProtocolVersions.js';
 import { MCP } from './modelContextProtocol.js';
 
@@ -61,6 +61,31 @@ export function classifyEra(headers: Readonly<Record<string, string>>, body: unk
 		return 'modern';
 	}
 	return 'legacy';
+}
+
+/**
+ * The version is judged before the rest of a request whose `_meta` carries no
+ * protocol version: an `MCP-Protocol-Version` header that is well formed and
+ * names none of `supported` gets `-32022` with `data.supported` /
+ * `data.requested`, before the era is selected and before the missing `_meta`
+ * or the other mirrored headers are reported. When `_meta` carries a version,
+ * the modern checks compare it with the header (a disagreement is `-32020`).
+ * A missing or malformed header is left to the other checks.
+ */
+export function unsupportedProtocolVersionHeader(headers: Readonly<Record<string, string>>, body: unknown, supported: readonly string[]): McpGatewayRpcError | undefined {
+	const raw = headers[MCP_PROTOCOL_VERSION_HEADER.toLowerCase()];
+	if (raw === undefined) {
+		return undefined;
+	}
+	const meta = readMeta(body);
+	if (meta && typeof meta[META_PROTOCOL_VERSION] === 'string') {
+		return undefined;
+	}
+	const version = trimOws(raw);
+	if (version.length === 0 || !isHeaderSafeAscii(version) || supported.includes(version)) {
+		return undefined;
+	}
+	return new McpGatewayRpcError(MCP.UNSUPPORTED_PROTOCOL_VERSION, `Unsupported protocol version '${version}'`, { supported: [...supported], requested: version });
 }
 
 const LOGGING_LEVELS: ReadonlySet<string> = new Set(['debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency']);
