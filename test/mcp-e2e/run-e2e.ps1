@@ -113,6 +113,13 @@ if ($Cpu) { $llamaArgs += '-Cpu' }
 & pwsh @llamaArgs
 if ($LASTEXITCODE -ne 0) { throw "llama.cpp did not start ($LASTEXITCODE)" }
 
+# The checkout the suite is mounted from (runner/provenance.ts records it): its HEAD and whether
+# test/mcp-e2e has uncommitted changes there (read-only git).
+$suiteHead = (& git -C $script:E2eDir rev-parse HEAD 2>$null)
+$suiteHead = if ($LASTEXITCODE -eq 0 -and $suiteHead) { $suiteHead.Trim() } else { '' }
+$suiteStatus = (& git -C $script:E2eDir status --porcelain -- . 2>$null)
+$suiteDirty = if ($LASTEXITCODE -ne 0) { '' } elseif ($suiteStatus) { '1' } else { '0' }
+
 function Invoke-Suite([string]$Id) {
 	Step "suite (run $Id)"
 	Remove-StaleContainer $Name
@@ -122,7 +129,9 @@ function Invoke-Suite([string]$Id) {
 		'--mount', "type=bind,source=$vv,target=/vv",
 		'--mount', "type=volume,source=$script:Volume,target=/work") + $debMount + @(
 		'-e', "E2E_RUN_ID=$Id",
-		'-e', "LLAMA_URL=http://$($script:LlamaName):8080")
+		'-e', "LLAMA_URL=http://$($script:LlamaName):8080",
+		'-e', "E2E_SUITE_HEAD=$suiteHead",
+		'-e', "E2E_SUITE_DIRTY=$suiteDirty")
 	if ($debInContainer) { $runArgs += @('-e', "E2E_DEB=$debInContainer") }
 	if ($AllowFail) { $runArgs += @('-e', "MCP_E2E_ALLOW_FAIL=$AllowFail") }
 	if ($Only) { $runArgs += @('-e', "MCP_E2E_ONLY=$Only") }

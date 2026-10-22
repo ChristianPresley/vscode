@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import { IAgentRun, mcpToolNameOf, mcpToolsOf, runAgent, selectLlamaModel, toolPrefixOf } from './agent';
+import { mcpToolNameOf, mcpToolsOf, selectLlamaModel, toolPrefixOf } from './agent';
 import { definitionIdOf, startsWithOthers } from './config';
 import { decodeCallToolResponse, decodeListToolsResponse, encodeCallToolRequest, grpcTunnelCall, grpcUnaryCall, IHttpExchange, LEGACY_VERSION, LegacySession, modernRequest, MODERN_VERSION, TYPED_PATH_PREFIX } from './gatewayClients';
 import { E2eHarness, sleep, waitFor } from './harness';
@@ -12,69 +12,14 @@ import { LLAMA_MODEL_ID, LLAMA_VENDOR } from './llamaProvider';
 import { canonicalJson, checkListenDelivery, declaresTasks, describeWireCalls, ILoggedExchange, ITaskRun, IWireEvent, lastInputResponses, LogCheck, loggedMessages, responseTo, sentMethods, TASKS_EXTENSION, taskResultText, taskRunOf, taskStatusOf, TUNNEL_CALL_PATH, TYPED_SERVICE_PREFIX } from './mcpLog';
 import { assert, ITestCase, ITestContext, SkipError } from './runner';
 import { errorText, expectToolText, invokeMcpTool, isCancellation, NEGOTIATED, textOf, toolIdOf, TYPED_CALL_TOOL, TYPED_LIST_TOOLS, wireCallSucceeded, wireEndOf } from './testHelpers';
-import { gatewayTests } from './testsGateway';
+import { agentTests, gatewayAgentTests, GatewayRouteOf } from './testsAgent';
+import { chatTests } from './testsChat';
+import { gatewayRestartTests, gatewayTests } from './testsGateway';
 import { grpcTests } from './testsGrpc';
 import { rootsTest, samplingTest } from './testsMrtr';
 import { oauthScenarios } from './testsOauth';
 import { protocolTests, restartTests } from './testsProtocol';
-
-/** An expected substring, or a list of alternatives of which one must match (case-insensitive). */
-type Expectation = string | RegExp | readonly (string | RegExp)[];
-
-function matches(text: string, expectation: Expectation): boolean {
-	const alternatives = Array.isArray(expectation) ? expectation : [expectation];
-	return alternatives.some(a => typeof a === 'string' ? text.toLowerCase().includes(a.toLowerCase()) : a.test(text));
-}
-
-function describe(expectation: Expectation): string {
-	return (Array.isArray(expectation) ? expectation : [expectation]).map(String).join(' | ');
-}
-
-export interface IToolScenario {
-	readonly server: string;
-	readonly task: string;
-	/** The MCP tool name the model must call on that server. */
-	readonly tool: string;
-	/** What the tool result must contain. */
-	readonly result?: readonly Expectation[];
-	/** What the final answer must contain. */
-	readonly answer?: readonly Expectation[];
-	readonly maxTurns?: number;
-}
-
-/**
- * Runs the agent loop with every MCP tool of one server and checks that the
- * model called the expected tool on that server, that the tool result has
- * the expected content, and that the answer reflects it.
- */
-export async function runToolScenario(h: E2eHarness, ctx: ITestContext, s: IToolScenario): Promise<IAgentRun> {
-	await h.requireServer(s.server);
-	const tools = await h.waitForTools(s.server, 60_000);
-	ctx.details.toolCount = tools.length;
-	ctx.details.toolPrefix = toolPrefixOf(tools);
-	const run = await runAgent(h.env, s.task, { tools, label: `${s.server}:${s.tool}`, maxTurns: s.maxTurns });
-	ctx.details.task = s.task;
-	ctx.details.answer = run.answer;
-	ctx.details.calls = run.calls.map(c => ({ toolId: c.toolId, toolName: c.toolName, serverLabel: c.serverLabel, input: c.input, resultText: c.resultText, error: c.error }));
-	const call = run.calls.find(c => c.toolName === s.tool && c.serverLabel === s.server);
-	assert(call, `The model did not call ${s.tool} on ${s.server}; calls: ${JSON.stringify(run.calls.map(c => `${c.serverLabel}/${c.toolName}`))}`);
-	assert(!call.error, `${s.tool} failed: ${call.error}`);
-	for (const expectation of s.result ?? []) {
-		assert(matches(call.resultText, expectation), `The result of ${s.tool} does not contain ${describe(expectation)}: ${JSON.stringify(call.resultText)}`);
-	}
-	for (const expectation of s.answer ?? []) {
-		assert(matches(run.answer, expectation), `The answer does not contain ${describe(expectation)}: ${JSON.stringify(run.answer)}`);
-	}
-	return run;
-}
-
-/**
- * A test where the llama model picks the tool (the agent loop): the prompt names the tool, and the
- * model's choice is in the details (`calls`) either way.
- */
-function agentTest(h: E2eHarness, name: string, s: IToolScenario): ITestCase {
-	return { name, group: 'agent', fn: async ctx => { await runToolScenario(h, ctx, s); } };
-}
+import { appsTests, resourceTests } from './testsResources';
 
 /** A tool call made directly (no model): the tool, its input and what its result must contain. */
 function callTest(h: E2eHarness, name: string, group: string, label: string, tool: string, input: object, expected: readonly string[]): ITestCase {
@@ -280,6 +225,10 @@ export function apiTests(h: E2eHarness): ITestCase[] {
 		assert(grpcGateway, 'vscode.lm.startMcpGateway(undefined, { grpc: true }) returned undefined');
 		return grpcGateway;
 	};
+	/** The address of a server's route on the HTTP gateway, or on the gRPC listener of the opted-in one. */
+	const routeOf: GatewayRouteOf = async (label, kind) => kind === 'http'
+		? gatewayServer(await getGateway(), label).address.toString(true)
+		: gatewayServer(await getGrpcGateway(), label).grpcAddress?.toString(true);
 
 	/**
 	 * Every server lists the tools of its family: not just some tools (a schema regression drops
@@ -347,21 +296,10 @@ export function apiTests(h: E2eHarness): ITestCase[] {
 			},
 		},
 
-		// --- The model picks the tool (the agent loop) -------------------------------------------------
-		agentTest(h, 'agent (zig-stdio): the llama model picks test_simple_text among the tools of the server, and the answer quotes its text', {
-			server: 'zig-stdio',
-			task: 'Call the tool named test_simple_text (it takes no arguments) and tell me exactly what text it returned.',
-			tool: 'test_simple_text',
-			result: ['This is a simple text response'],
-			answer: ['simple text response'],
-		}),
-		agentTest(h, 'agent (everything-legacy): the llama model picks get-sum with the arguments 17 and 25 and answers 42', {
-			server: 'everything-legacy',
-			task: 'What is 17 plus 25? Call the tool named get-sum with a=17 and b=25 and tell me the result.',
-			tool: 'get-sum',
-			result: ['The sum of 17 and 25 is 42'],
-			answer: ['42'],
-		}),
+		// --- The model picks the tool (the agent loop; testsAgent.ts) -----------------------------------
+		...agentTests(h),
+		// --- The @e2e chat participant in the chat view (testsChat.ts) --------------------------------
+		...chatTests(h),
 
 		// --- One tool call per transport and era (called directly) -------------------------------------
 		callTest(h, 'tool call over stdio (zig-stdio, 2026-07-28): test_simple_text', 'transport', 'zig-stdio', 'test_simple_text', {}, ['This is a simple text response']),
@@ -697,6 +635,8 @@ export function apiTests(h: E2eHarness): ITestCase[] {
 				assert(png.byteLength > 8 && png[0] === 0x89 && png[1] === 0x50 && png[2] === 0x4e && png[3] === 0x47, 'test://static-binary is not a PNG');
 			},
 		},
+		...resourceTests(h),
+		...appsTests(h, routeOf),
 		{
 			name: 'prompts (zig-http through the gateway, 2026-07-28): prompts/list and prompts/get test_prompt_with_arguments',
 			group: 'prompts',
@@ -855,6 +795,9 @@ export function apiTests(h: E2eHarness): ITestCase[] {
 				assert(mismatch.grpcStatus === '3' && mismatch.trailers['mcp-error-code'] === '-32020' && !mismatch.messages.length, `a CallTool whose mcp_tool metadata does not match the tool answered ${JSON.stringify(ctx.details.mismatch)}, expected INVALID_ARGUMENT (3) with mcp-error-code -32020 and no message`);
 			},
 		},
+
+		// --- The model picks a tool of a gateway route (testsAgent.ts) ---------------------------------
+		...gatewayAgentTests(h, routeOf),
 	];
 
 	// --- Protocol negotiation: read back from the MCP server logs --------------------------------
@@ -865,6 +808,8 @@ export function apiTests(h: E2eHarness): ITestCase[] {
 	}
 	// Last: restarts (the cached era hint), after every row has read the first negotiation.
 	tests.push(...restartTests(h));
+	// After the restarts: the gateway routes of restarted servers (testsGateway.ts).
+	tests.push(...gatewayRestartTests(h, routeOf));
 	return tests;
 }
 

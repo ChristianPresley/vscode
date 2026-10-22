@@ -86,7 +86,7 @@ if [ "$(jq -r '.expect.gatewayRateLimits' "$RUN_DIR/provenance.json")" = "true" 
 else
 	export MCP_E2E_EXPECT_GATEWAY_RATE_LIMITS=0
 fi
-e2e_log "provenance: commit $(jq -r .commit "$RUN_DIR/provenance.json") ($(jq -r .deb "$RUN_DIR/provenance.json")), suite $(jq -r .suite.sha256 "$RUN_DIR/provenance.json" | cut -c1-16), gateway gRPC expected: $MCP_E2E_EXPECT_GATEWAY_GRPC ($(jq -r .expect.gatewayGrpcReason "$RUN_DIR/provenance.json"))"
+e2e_log "provenance: commit $(jq -r .commit "$RUN_DIR/provenance.json") ($(jq -r .deb "$RUN_DIR/provenance.json")), suite $(jq -r .suite.sha256 "$RUN_DIR/provenance.json" | cut -c1-16) (committed: $(jq -r '.committedSuite.sha256 // "unknown"' "$RUN_DIR/provenance.json" | cut -c1-16), matches: $(jq -r 'if .suiteMatchesCommit == null then "unknown" else .suiteMatchesCommit end' "$RUN_DIR/provenance.json")), gateway gRPC expected: $MCP_E2E_EXPECT_GATEWAY_GRPC ($(jq -r .expect.gatewayGrpcReason "$RUN_DIR/provenance.json"))"
 
 # 2. llama.cpp must be up before VS Code starts
 bash "$E2E_SRC/containers/check-llama.sh" "$MCP_E2E_LLAMA_URL" test-container > "$RESULTS/check-llama.log" 2>&1 || { cat "$RESULTS/check-llama.log"; fail "llama.cpp is not reachable at $MCP_E2E_LLAMA_URL"; }

@@ -60,6 +60,10 @@ interface IProvenance {
 	readonly buildInfo?: Record<string, unknown>;
 	readonly buildCommitMatches?: boolean;
 	readonly suite: { readonly sha256: string; readonly files: number };
+	/** The same hash over test/mcp-e2e as committed at the installed commit (runner/provenance.ts). */
+	readonly committedSuite?: { readonly commit: string; readonly sha256?: string; readonly files: number; readonly error?: string };
+	readonly suiteMatchesCommit?: boolean;
+	readonly suiteCheckout?: { readonly head?: string; readonly uncommittedChanges?: boolean };
 	readonly mutations: readonly string[];
 	readonly expect: { readonly gatewayGrpc: boolean; readonly gatewayRateLimits?: boolean; readonly gatewayGrpcReason: string };
 }
@@ -75,6 +79,32 @@ function readProvenance(file: string): IProvenance | undefined {
 function argValue(args: readonly string[], name: string): string | undefined {
 	const i = args.indexOf(name);
 	return i !== -1 && i + 1 < args.length ? args[i + 1] : undefined;
+}
+
+/**
+ * Why the suite of the run is not test/mcp-e2e of the installed commit, from the checkout it was
+ * mounted from: uncommitted changes there, a checkout of another commit, or else only that it differs.
+ */
+function suiteMismatchReason(provenance: IProvenance, commit: string): string {
+	const checkout = provenance.suiteCheckout;
+	const head = checkout?.head;
+	const otherHead = head && !head.startsWith(commit) && !commit.startsWith(head) ? head.slice(0, 11) : undefined;
+	if (checkout?.uncommittedChanges === true) {
+		return `test/mcp-e2e has uncommitted changes${otherHead ? `, on a checkout of ${otherHead}, not of the installed commit` : ''}`;
+	}
+	return otherHead ? `the suite is test/mcp-e2e of ${otherHead}, not of the installed commit` : 'test/mcp-e2e differs from the installed commit\'s';
+}
+
+/** The committed suite and whether the run used it: only such a run can be reproduced from the commit. */
+function committedSuiteLine(provenance: IProvenance): string {
+	const committed = provenance.committedSuite;
+	if (!committed) {
+		return 'not recorded';
+	}
+	if (committed.sha256 === undefined) {
+		return `unknown (${committed.error ?? 'no hash'}); suite matches commit: unknown`;
+	}
+	return `test/mcp-e2e at ${committed.commit.slice(0, 11)} sha256 ${committed.sha256} (${committed.files} files); suite matches commit: ${provenance.suiteMatchesCommit ? 'yes' : `NO (${suiteMismatchReason(provenance, committed.commit)})`}`;
 }
 
 function statusLabel(t: ITestResult): string {
@@ -112,7 +142,9 @@ function main(argv: readonly string[]): number {
 		const lines = [
 			`installed commit: ${provenance.commit} (${provenance.version ?? '?'}, ${provenance.deb}, sha256 ${provenance.debSha256.slice(0, 16)})`,
 			`build-info: ${provenance.buildInfo ? `${String(provenance.buildInfo.branch)} ${String(provenance.buildInfo.commit)}${provenance.buildCommitMatches ? '' : ' (DOES NOT MATCH the installed commit)'}` : 'none for this package'}`,
-			`suite: test/mcp-e2e sha256 ${provenance.suite.sha256} (${provenance.suite.files} files)`,
+			`suite: test/mcp-e2e sha256 ${provenance.suite.sha256} (${provenance.suite.files} files, line endings as LF)`,
+			`committed suite: ${committedSuiteLine(provenance)}`,
+			...(provenance.suiteCheckout ? [`suite checkout: HEAD ${provenance.suiteCheckout.head?.slice(0, 11) ?? '?'}, uncommitted changes in test/mcp-e2e: ${provenance.suiteCheckout.uncommittedChanges === undefined ? '?' : provenance.suiteCheckout.uncommittedChanges ? 'yes' : 'no'}`] : []),
 			`expected on this build: gateway gRPC ${provenance.expect.gatewayGrpc ? 'yes' : 'no'}, gateway rate limits ${provenance.expect.gatewayRateLimits === false ? 'no' : 'yes'} (${provenance.expect.gatewayGrpcReason})`,
 			...(provenance.mutations.length ? [`MUTATIONS: ${provenance.mutations.join(', ')} (tests are expected to fail)`] : []),
 		];

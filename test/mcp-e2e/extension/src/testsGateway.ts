@@ -5,11 +5,12 @@
 
 import * as vscode from 'vscode';
 import { mcpToolNameOf, mcpToolsOf } from './agent';
-import { startsWithOthers } from './config';
+import { definitionIdOf, startsWithOthers } from './config';
 import { modernRequest, openListenStream, rawModernPost } from './gatewayClients';
 import { E2eHarness, sleep, waitFor } from './harness';
-import { describeWireCalls, SUBSCRIPTION_ID_META } from './mcpLog';
+import { describeWireCalls, ILoggedMessage, loggedMessages, responseTo, SUBSCRIPTION_ID_META } from './mcpLog';
 import { assert, ITestCase, SkipError } from './runner';
+import type { GatewayRouteOf } from './testsAgent';
 import { expectToolText, mutated, TYPED_CALL_TOOL, wireCallSucceeded } from './testHelpers';
 
 /**
@@ -228,4 +229,142 @@ export function gatewayTests(h: E2eHarness, getGateway: () => Promise<vscode.Mcp
 			},
 		},
 	];
+}
+
+/** The MCP names of the tools a gateway route lists (`[]` when the route does not answer). */
+async function routeToolNames(route: string): Promise<{ status: number; names: string[] }> {
+	const list = await modernRequest(route, 'tools/list');
+	return { status: list.status, names: ((list.response?.result?.tools ?? []) as { name?: string }[]).map(t => t.name ?? '') };
+}
+
+/**
+ * The tool names the server gave in answer to the first `tools/list` VS Code sent from `fromOffset`
+ * of its MCP log on (every page of it), or why there is no complete answer yet.
+ */
+function serverListedTools(logText: string, fromOffset: number): { readonly ok: true; readonly details: string[] } | { readonly ok: false; readonly reason: string } {
+	const messages = loggedMessages(logText, fromOffset);
+	const isList = (m: ILoggedMessage) => m.direction === 'sent' && m.message.method === 'tools/list';
+	let request = messages.find(isList);
+	if (!request) {
+		return { ok: false, reason: 'VS Code sent no tools/list since the restarted connection is Running' };
+	}
+	const names: string[] = [];
+	for (; ;) {
+		const response = responseTo(messages, request);
+		if (!response) {
+			return { ok: false, reason: `the server has not answered VS Code's tools/list (id ${JSON.stringify(request.message.id)}) yet` };
+		}
+		const result = response.message.result as { tools?: { name?: string }[]; nextCursor?: unknown } | undefined;
+		if (!result) {
+			return { ok: false, reason: `the server answered VS Code's tools/list (id ${JSON.stringify(request.message.id)}) with ${JSON.stringify(response.message.error)}` };
+		}
+		names.push(...(result.tools ?? []).map(t => t.name ?? ''));
+		if (typeof result.nextCursor !== 'string') {
+			return { ok: true, details: names };
+		}
+		const cursor = result.nextCursor;
+		const next = messages.find(m => isList(m) && m.offset > response.offset && m.message.params?.cursor === cursor);
+		if (!next) {
+			return { ok: false, reason: `VS Code has not asked for the page after cursor ${JSON.stringify(cursor)} yet` };
+		}
+		request = next;
+	}
+}
+
+/** How `names` (what `who` lists) differs from `expected`: tools listed twice, more, less; '' when it does not. */
+function toolListDifference(who: string, names: readonly string[], expected: readonly string[]): string {
+	const twice = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))];
+	const more = [...new Set(names.filter(n => !expected.includes(n)))];
+	const less = expected.filter(n => !names.includes(n));
+	const parts = [twice.length ? `${JSON.stringify(twice)} twice` : '', more.length ? `${JSON.stringify(more)} more` : '', less.length ? `${JSON.stringify(less)} less` : ''].filter(Boolean);
+	return parts.length ? `${who} lists ${parts.join(', ')}` : '';
+}
+
+/**
+ * The tool that the listen tests show on the zig servers (`test_trigger_tool_change`): a server
+ * process that was started afresh does not list it.
+ */
+const HIDDEN_TOOL = 'test_hidden_tool';
+
+/**
+ * The gateway after `workbench.mcp.restartServer` (a client such as the Copilot CLI keeps the route
+ * address it was given): run at the end of the suite, after the cached era hint restarts. What the
+ * route must list is what the server listed to the restarted connection (VS Code's MCP log), not what
+ * the route listed before: a stdio restart starts a new server process.
+ */
+export function gatewayRestartTests(h: E2eHarness, routeOf: GatewayRouteOf): ITestCase[] {
+	return (['zig-stdio', 'zig-grpc-tunnel'] as const).map((label): ITestCase => ({
+		name: `gateway after a restart (${label}): after workbench.mcp.restartServer the server's gateway route keeps its address and lists exactly the tools the server listed to the restarted connection, as VS Code does (none twice; the same as before the restart where the server process survives it), and tools/call test_simple_text through it reaches the restarted server`,
+		group: 'gateway',
+		fn: async ctx => {
+			await h.requireServer(label);
+			const route = await routeOf(label, 'http');
+			assert(route, `the gateway has no route for ${label}`);
+			ctx.details.route = route;
+			const before = await routeToolNames(route);
+			assert(before.status === 200 && before.names.length > 0, `before the restart the route answered tools/list with ${before.status} and ${before.names.length} tools`);
+			const from = h.serverLog(label).length;
+			await vscode.commands.executeCommand('workbench.mcp.restartServer', definitionIdOf(h.server(label)));
+			// The restart: the connection stopped and is running again.
+			const running = await h.waitForLog(label, 'the restarted connection running', logText => {
+				const matches = [...logText.slice(from).matchAll(/Connection state: (\w+)/g)];
+				const states = matches.map(m => m[1]);
+				return states.includes('Stopped') && states.at(-1) === 'Running'
+					? { ok: true as const, details: { states, offset: from + matches[matches.length - 1].index } }
+					: { ok: false as const, reason: `connection states since the restart: ${JSON.stringify(states)}` };
+			}, 60_000);
+			ctx.details.states = running.states;
+			// What the restarted connection itself listed: the server's answer to the first tools/list
+			// VS Code sent after the last Running (the old connection's list stays in use until then).
+			const listedByServer = await h.waitForLog(label, 'the tools/list of the restarted connection', logText => serverListedTools(logText, running.offset), 30_000);
+			assert(listedByServer.length > 0, `the server listed no tools to the restarted connection`);
+			// VS Code took the new list once it logged "Discovered N tools" after the last Running.
+			await h.waitForLog(label, 'the restarted connection discovered its tools', logText => /Discovered \d+ tools/.test(logText.slice(running.offset))
+				? { ok: true as const, details: true }
+				: { ok: false as const, reason: 'no "Discovered N tools" line after the restarted connection is running' }, 30_000);
+			const after = await routeOf(label, 'http');
+			ctx.details.routeAfter = after;
+			assert(after === route, `the route of ${label} changed with the restart: ${route} -> ${after}`);
+			// VS Code validates the new list before it replaces the old one, and the gateway answers from
+			// VS Code's list: poll until the route and VS Code both list exactly the server's tools, in two
+			// reads in a row (500 ms apart), so a list that only matches in passing does not count.
+			let difference = 'not checked';
+			let matchedBefore = false;
+			const listed = await waitFor('the route and VS Code to list the tools of the restarted connection', 30_000, async () => {
+				let answer: { status: number; names: string[]; error?: string };
+				try {
+					answer = await routeToolNames(route);
+				} catch (e) {
+					answer = { status: 0, names: [], error: e instanceof Error ? e.message : String(e) };
+				}
+				const known = mcpToolsOf(label).map(mcpToolNameOf);
+				difference = [
+					answer.status === 200 ? '' : `the route answered tools/list with ${answer.status}${answer.error ? ` (${answer.error})` : ''}`,
+					toolListDifference('the route', answer.names, listedByServer),
+					toolListDifference('VS Code', known, listedByServer),
+				].filter(Boolean).join('; ');
+				const stable = !difference && matchedBefore;
+				matchedBefore = !difference;
+				return stable ? { route: answer.names, known } : undefined;
+			}, 500).catch(() => undefined);
+			ctx.details.toolCounts = { before: before.names.length, listedByServer: listedByServer.length, route: listed?.route.length, vscode: listed?.known.length };
+			assert(listed, `30 s after the restart, compared with the ${listedByServer.length} tools the server listed to the restarted connection: ${difference}`);
+			// The same tools as before where the server process survives the restart (a network server);
+			// a stdio restart starts a new process, which does not list the tool the listen test showed.
+			const survives = h.server(label).transport !== 'stdio';
+			const expectedBefore = survives ? before.names : before.names.filter(n => n !== HIDDEN_TOOL);
+			const comparedWithBefore = survives ? 'the route listed before the restart' : `the route listed before the restart, without ${HIDDEN_TOOL} (a new server process)`;
+			ctx.details.comparedWithBefore = comparedWithBefore;
+			const changed = toolListDifference('after the restart the server', listedByServer, expectedBefore);
+			assert(!changed, `${changed} than ${comparedWithBefore}`);
+			const restarted = h.serverLog(label).length;
+			const call = await modernRequest(route, 'tools/call', { name: 'test_simple_text', arguments: {} });
+			ctx.details.call = { status: call.status, result: call.response?.result, error: call.response?.error };
+			assert(JSON.stringify(call.response?.result ?? {}).includes('This is a simple text response'), `tools/call through the route after the restart answered ${call.status} ${JSON.stringify(call.response)}`);
+			// It went over the new connection, which logs after the restart.
+			await h.waitForLog(label, 'the forwarded tools/call after the restart', logText => loggedMessages(logText, restarted).some(m => m.direction === 'sent' && m.message.method === 'tools/call' && m.message.params?.name === 'test_simple_text')
+				? { ok: true as const, details: true }
+				: { ok: false as const, reason: 'no tools/call of test_simple_text in the MCP log after the restart' });
+		},
+	}));
 }

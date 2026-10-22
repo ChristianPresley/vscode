@@ -257,6 +257,27 @@
 			}
 		},
 		{
+			"label": "zig-apps",
+			"transport": "http",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3120/mcp"
+			},
+			"process": {
+				"$comment": "The conformance server with --apps: it declares the MCP Apps extension (io.modelcontextprotocol/ui) and serves its fixture, the view ui://conformance/view (text/html;profile=mcp-app) and test_app_tool, whose _meta.ui.resourceUri names it (listed so only to a client that declares the extension, as VS Code does).",
+				"command": "{zig}",
+				"args": [
+					"--port",
+					"3120",
+					"--apps"
+				],
+				"port": 3120
+			}
+		},
+		{
 			"label": "zig-grpc-auto-typed",
 			"transport": "grpc-auto-typed",
 			"era": "modern",

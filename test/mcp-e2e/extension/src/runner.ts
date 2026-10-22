@@ -50,7 +50,7 @@ export interface ITestContext {
 
 export interface ITestCase {
 	readonly name: string;
-	/** `model`, `transport`, `grpc`, `negotiation`, `mrtr`, `sampling`, `listen`, `resources`, `prompts`, `gateway`, `tasks`, `elicitation`, `oauth`. */
+	/** `model`, `agent`, `chat`, `transport`, `grpc`, `negotiation`, `mrtr`, `sampling`, `listen`, `resources`, `apps`, `prompts`, `gateway`, `tasks`, `elicitation`, `oauth`. */
 	readonly group: string;
 	readonly timeoutMs?: number;
 	/** The build feature the test needs; when the build is not expected to have it, a SkipError is a skip. */

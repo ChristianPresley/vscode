@@ -32,6 +32,28 @@
 				"id": "e2e-grpc",
 				"label": "E2E gRPC provider"
 			}
+		],
+		"chatParticipants": [
+			{
+				"id": "mcp-e2e.e2e",
+				"name": "e2e",
+				"fullName": "MCP E2E",
+				"description": "Calls MCP tools for the end-to-end tests: /call one tool directly, or /ask the llama.cpp model",
+				"commands": [
+					{
+						"name": "call",
+						"description": "Call one MCP tool directly (no model): /call <server> <tool> [<JSON object>]"
+					},
+					{
+						"name": "ask",
+						"description": "Let the llama.cpp model call MCP tools: /ask [<server>] <task> (the #-referenced tools, or else those of <server>)"
+					},
+					{
+						"name": "tools",
+						"description": "List the MCP tools of a server: /tools <server>"
+					}
+				]
+			}
 		]
 	}
 }

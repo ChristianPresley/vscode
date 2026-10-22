@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
+import { registerChatParticipant } from './chatParticipant';
 import { startControlServer } from './control';
 import { E2eHarness } from './harness';
 import { LLAMA_VENDOR, LlamaChatProvider } from './llamaProvider';
@@ -18,6 +19,8 @@ export function activate(context: vscode.ExtensionContext): IMcpE2eApi {
 	log(`activated: llama=${harness.env.llamaUrl} results=${harness.env.resultsDir} control=${harness.env.controlPort ?? '-'} logs=${harness.windowLogsDir}`);
 
 	context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider(LLAMA_VENDOR, new LlamaChatProvider(harness.env)));
+	// `@e2e` in the chat view: MCP tool calls with the chat request's toolInvocationToken (chatParticipant.ts).
+	context.subscriptions.push(registerChatParticipant(harness));
 
 	// The gRPC servers defined through the extension API (proposal mcpGrpcServerDefinition): binding
 	// Auto against the tunnel server, Typed against the typed server, and TLS with the run's CA.

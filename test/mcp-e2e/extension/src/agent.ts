@@ -28,9 +28,38 @@ export interface IAgentRun {
 	readonly turns: number;
 }
 
+/** A tool offered to the model in an agent run: what the model sees, and how a call of it runs. */
+export interface IAgentTool {
+	/** The name the model sees and calls (VS Code's tool id, or the MCP name of a gateway tool). */
+	readonly name: string;
+	readonly description: string;
+	readonly inputSchema: object | undefined;
+	/** The tool name as the MCP server published it. */
+	readonly toolName: string;
+	/** The mcp.json label of the server that published the tool (behind a gateway route: the upstream). */
+	readonly serverLabel: string | undefined;
+	invoke(input: object, token: vscode.CancellationToken): Thenable<vscode.LanguageModelToolResult>;
+}
+
+/**
+ * VS Code's tools, each call made with `vscode.lm.invokeTool`. With the `toolInvocationToken` of a
+ * chat request the calls belong to that request (the chat view shows them); without one they run
+ * outside chat.
+ */
+export function vscodeAgentTools(tools: readonly vscode.LanguageModelToolInformation[], toolInvocationToken?: vscode.ChatParticipantToolToken): IAgentTool[] {
+	return tools.map(tool => ({
+		name: tool.name,
+		description: tool.description,
+		inputSchema: tool.inputSchema,
+		toolName: mcpToolNameOf(tool),
+		serverLabel: serverLabelOf(tool),
+		invoke: (input, token) => vscode.lm.invokeTool(tool.name, { input, toolInvocationToken }, token),
+	}));
+}
+
 export interface IAgentOptions {
-	/** The tools offered to the model (all MCP tools of one server, usually). */
-	readonly tools: readonly vscode.LanguageModelToolInformation[];
+	/** The tools offered to the model (MCP tools of one server, usually; see {@link vscodeAgentTools}). */
+	readonly tools: readonly IAgentTool[];
 	readonly maxTurns?: number;
 	/** Require a tool call on the first turn (the model still picks which tool). Default true. */
 	readonly requireToolOnFirstTurn?: boolean;
@@ -117,7 +146,7 @@ export async function runAgent(env: IE2eEnvironment, task: string, options: IAge
 	const model = await selectLlamaModel();
 	const token = options.token ?? new vscode.CancellationTokenSource().token;
 	const maxTurns = options.maxTurns ?? 4;
-	const byId = new Map(options.tools.map(t => [t.name, t]));
+	const byName = new Map(options.tools.map(t => [t.name, t]));
 	const chatTools: vscode.LanguageModelChatTool[] = options.tools.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
 	const messages: vscode.LanguageModelChatMessage[] = [vscode.LanguageModelChatMessage.User(`${SYSTEM_PREAMBLE}\n\nTask: ${task}`)];
 	const calls: IAgentToolCall[] = [];
@@ -146,21 +175,21 @@ export async function runAgent(env: IE2eEnvironment, task: string, options: IAge
 
 		const results: vscode.LanguageModelToolResultPart[] = [];
 		for (const call of toolCalls) {
-			const info = byId.get(call.name);
+			const tool = byName.get(call.name);
 			let result: vscode.LanguageModelToolResult | undefined;
 			let error: string | undefined;
 			try {
-				if (!info) {
+				if (!tool) {
 					throw new Error(`The model called '${call.name}', which is not one of the offered tools`);
 				}
-				result = await vscode.lm.invokeTool(call.name, { input: call.input, toolInvocationToken: undefined }, token);
+				result = await tool.invoke(call.input, token);
 			} catch (e) {
 				error = e instanceof Error ? e.message : String(e);
 			}
 			calls.push({
 				toolId: call.name,
-				toolName: info ? mcpToolNameOf(info) : call.name,
-				serverLabel: info ? serverLabelOf(info) : undefined,
+				toolName: tool?.toolName ?? call.name,
+				serverLabel: tool?.serverLabel,
 				input: call.input,
 				resultText: resultToText(result),
 				result,

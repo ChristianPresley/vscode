@@ -29,6 +29,11 @@ interface IRunData {
 	readonly summaryExit: number | undefined;
 	readonly commit: string | undefined;
 	readonly suiteHash: string | undefined;
+	/** The hash of test/mcp-e2e as committed at the installed commit, and whether the run used exactly that. */
+	readonly committedSuiteHash: string | undefined;
+	readonly suiteMatchesCommit: boolean | undefined;
+	/** Why the suite is not the committed one (runner/summarize.ts), when it is not. */
+	readonly suiteMismatch: string | undefined;
 	readonly tests: Map<string, ITestRow>;
 	readonly failedScreenshots: number;
 }
@@ -53,8 +58,27 @@ function readRun(runsDir: string, id: string, exitCode: number | undefined): IRu
 		failedScreenshots += (results?.screenshots ?? []).filter(s => !s.ok).length;
 	}
 	const summary = readJson<{ exitCode?: number }>(path.join(dir, 'summary.json'));
-	const provenance = readJson<{ commit?: string; suite?: { sha256?: string } }>(path.join(dir, 'provenance.json'));
-	return { id, exitCode, summaryExit: summary?.exitCode, commit: provenance?.commit, suiteHash: provenance?.suite?.sha256, tests, failedScreenshots };
+	const provenance = readJson<{ commit?: string; suite?: { sha256?: string }; committedSuite?: { sha256?: string }; suiteMatchesCommit?: boolean; suiteCheckout?: { head?: string; uncommittedChanges?: boolean } }>(path.join(dir, 'provenance.json'));
+	return {
+		id, exitCode, summaryExit: summary?.exitCode, commit: provenance?.commit, suiteHash: provenance?.suite?.sha256,
+		committedSuiteHash: provenance?.committedSuite?.sha256, suiteMatchesCommit: provenance?.suiteMatchesCommit,
+		suiteMismatch: provenance?.suiteMatchesCommit === false ? suiteMismatchReason(provenance.suiteCheckout, provenance.commit ?? '') : undefined,
+		tests, failedScreenshots,
+	};
+}
+
+/** Why a run's suite is not test/mcp-e2e of the installed commit, from the checkout it was mounted from. */
+function suiteMismatchReason(checkout: { head?: string; uncommittedChanges?: boolean } | undefined, commit: string): string {
+	const head = checkout?.head;
+	const otherHead = head && commit && !head.startsWith(commit) && !commit.startsWith(head) ? head.slice(0, 11) : undefined;
+	if (checkout?.uncommittedChanges === true) {
+		return `test/mcp-e2e has uncommitted changes${otherHead ? `, on a checkout of ${otherHead}, not of the installed commit` : ''}`;
+	}
+	return otherHead ? `the suite is test/mcp-e2e of ${otherHead}, not of the installed commit` : 'test/mcp-e2e differs from the installed commit\'s';
+}
+
+function yesNo(value: boolean | undefined): string {
+	return value === undefined ? 'unknown' : value ? 'yes' : 'NO';
 }
 
 function cell(row: ITestRow | undefined): string {
@@ -83,10 +107,15 @@ function main(argv: readonly string[]): number {
 	const suites = [...new Set(runs.map(r => r.suiteHash ?? '?'))];
 	md.push(`- installed commit: ${commits.join(', ')}${commits.length > 1 ? ' (DIFFERENT COMMITS)' : ''}`);
 	md.push(`- suite sha256: ${suites.join(', ')}${suites.length > 1 ? ' (DIFFERENT SUITES)' : ''}`);
-	md.push('', '| Run | Exit | Summary exit | Failed tests | Failed screenshots |', '| --- | --- | --- | --- | --- |');
+	// Only a run on the committed suite can be reproduced from the commit (line endings do not count).
+	const committedSuites = [...new Set(runs.map(r => r.committedSuiteHash ?? '?'))];
+	const suiteMatchesCommit = runs.every(r => r.suiteMatchesCommit === true) ? true : runs.some(r => r.suiteMatchesCommit === false) ? false : undefined;
+	md.push(`- committed suite sha256 (test/mcp-e2e at the installed commit): ${committedSuites.join(', ')}`);
+	md.push(`- suite matches commit: ${yesNo(suiteMatchesCommit)}${suiteMatchesCommit === false ? ' (some runs used a test/mcp-e2e that differs from the one at the installed commit: not reproducible from that commit alone)' : ''}`);
+	md.push('', '| Run | Exit | Summary exit | Failed tests | Failed screenshots | Suite matches commit |', '| --- | --- | --- | --- | --- | --- |');
 	for (const r of runs) {
 		const failed = [...r.tests.values()].filter(t => t.status === 'failed' && !t.allowedFailure).length;
-		md.push(`| ${r.id} | ${r.exitCode ?? '?'} | ${r.summaryExit ?? 'no summary'} | ${failed} | ${r.failedScreenshots} |`);
+		md.push(`| ${r.id} | ${r.exitCode ?? '?'} | ${r.summaryExit ?? 'no summary'} | ${failed} | ${r.failedScreenshots} | ${yesNo(r.suiteMatchesCommit)}${r.suiteMismatch ? ` (${r.suiteMismatch})` : ''} |`);
 	}
 	md.push('', `| Test | ${runs.map(r => r.id).join(' | ')} | Stable |`, `| --- | ${runs.map(() => '---').join(' | ')} | --- |`);
 	let unstable = 0;
@@ -100,8 +129,8 @@ function main(argv: readonly string[]): number {
 	md.push('', `**verdict: ${allPassed ? 'PASS' : 'FAIL'}** (${runs.filter(r => r.exitCode === 0 && r.summaryExit === 0).length}/${runs.length} runs passed, ${unstable} tests with different results across runs)`);
 	fs.writeFileSync(path.join(runsDir, `${name}.md`), md.join('\n') + '\n');
 	fs.writeFileSync(path.join(runsDir, `${name}.json`), JSON.stringify({
-		name, commits, suites, allPassed, unstable,
-		runs: runs.map(r => ({ id: r.id, exitCode: r.exitCode, summaryExit: r.summaryExit, commit: r.commit, suiteHash: r.suiteHash, failedScreenshots: r.failedScreenshots })),
+		name, commits, suites, committedSuites, suiteMatchesCommit, allPassed, unstable,
+		runs: runs.map(r => ({ id: r.id, exitCode: r.exitCode, summaryExit: r.summaryExit, commit: r.commit, suiteHash: r.suiteHash, committedSuiteHash: r.committedSuiteHash, suiteMatchesCommit: r.suiteMatchesCommit, suiteMismatch: r.suiteMismatch, failedScreenshots: r.failedScreenshots })),
 		tests: Object.fromEntries(names.map(test => [test, runs.map(r => cell(r.tests.get(test)))])),
 	}, null, '\t'));
 	console.log(md.join('\n'));

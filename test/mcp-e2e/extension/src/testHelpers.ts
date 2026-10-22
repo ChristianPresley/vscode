@@ -7,6 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { mcpToolId, resultToText } from './agent';
+import { definitionIdOf } from './config';
 import { E2eHarness, sleep } from './harness';
 import { IWireEvent, TYPED_SERVICE_PREFIX } from './mcpLog';
 import { assert, ITestContext } from './runner';
@@ -136,6 +137,20 @@ export function windowLogLines(h: E2eHarness, pattern: RegExp): { file: string; 
 	};
 	walk(h.windowLogsDir);
 	return out;
+}
+
+/**
+ * The `mcp-resource:` URI under which VS Code serves a resource of a server (`McpResourceURI` in
+ * mcpTypes.ts): the hex-encoded definition id as the authority, the resource's scheme and authority
+ * as the first two path segments (`test://watched-resource` -> `/test/watched-resource`).
+ */
+export function mcpResourceUri(h: E2eHarness, label: string, resource: string): vscode.Uri {
+	const url = new URL(resource);
+	return vscode.Uri.from({
+		scheme: 'mcp-resource',
+		authority: Buffer.from(definitionIdOf(h.server(label)), 'utf8').toString('hex'),
+		path: `/${url.protocol.replace(/:$/, '')}/${url.host}${url.pathname === '/' ? '' : url.pathname}`,
+	});
 }
 
 /** Whether a mutation of runner/mutations.ts that the test itself applies is active (MCP_E2E_MUTATIONS). */
