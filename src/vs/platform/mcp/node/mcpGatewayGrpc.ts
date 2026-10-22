@@ -4,7 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { VSBuffer } from '../../../base/common/buffer.js';
-import { GrpcStatus, encodeBinaryMetadata, grpcStatusForJsonRpcCode } from '../../../base/common/grpc/status.js';
+import { CancellationToken } from '../../../base/common/cancellation.js';
+import { GrpcStatus, encodeBinaryMetadata, grpcStatusForJsonRpcCode, grpcStatusName } from '../../../base/common/grpc/status.js';
 import { IJsonRpcRequest, JsonRpcId } from '../../../base/common/jsonRpcProtocol.js';
 import { Disposable, DisposableStore, IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
 import { ProtoCodecError, decodeMessage, encodeMessage } from '../../../base/common/protobuf/codec.js';
@@ -169,6 +170,78 @@ export function grpcClientKey(remoteAddress: string | undefined, clientInfo: MCP
 	return mcpGatewayClientKey(['grpc', remoteAddress ?? '', clientInfo?.name ?? null, clientInfo?.version ?? null]);
 }
 
+/**
+ * A call of a route as the handlers see it, which logs the request at debug
+ * as the HTTP route and sessions do: `<--` with the route, the binding and
+ * the JSON-RPC method or typed RPC once the request is read, `-->` with the
+ * status it ends with (and the JSON-RPC error code, from `mcp-error-code` or
+ * a tunnel error response), or `cancelled` when the base server ended it
+ * (the client reset it, its deadline passed, the listener closed). Only
+ * names, ids and codes: never metadata, arguments, results or error texts,
+ * which can quote metadata.
+ */
+class LoggedGrpcCall implements IGrpcServerCall {
+	private _request: string | undefined;
+	private _responseErrorCode: number | undefined;
+	private _logged = false;
+
+	constructor(
+		private readonly _call: IGrpcServerCall,
+		private readonly _logger: ILogger,
+		private readonly _routeId: string,
+		private readonly _binding: GrpcBinding,
+	) { }
+
+	get path(): string { return this._call.path; }
+	get authority(): string | undefined { return this._call.authority; }
+	get metadata(): Readonly<Record<string, string>> { return this._call.metadata; }
+	get timeoutMs(): number | undefined { return this._call.timeoutMs; }
+	get remoteAddress(): string | undefined { return this._call.remoteAddress; }
+	get token(): CancellationToken { return this._call.token; }
+	get isEnded(): boolean { return this._call.isEnded; }
+
+	readRequest(): Promise<Uint8Array | undefined> {
+		return this._call.readRequest();
+	}
+
+	sendMessage(payload: Uint8Array): boolean {
+		return this._call.sendMessage(payload);
+	}
+
+	end(status: GrpcStatus, message?: string, trailers?: Readonly<Record<string, string>>): void {
+		if (!this._call.isEnded) {
+			const code = trailers?.[MCP_ERROR_CODE_TRAILER] ?? this._responseErrorCode;
+			this._logEnd(code === undefined ? grpcStatusName(status) : `${grpcStatusName(status)}, JSON-RPC error ${code}`);
+		}
+		this._call.end(status, message, trailers);
+	}
+
+	/** Logs the request: a JSON-RPC method and id (tunnel) or a typed RPC. */
+	received(request: string): void {
+		this._request = request;
+		this._logger.debug(`[McpGateway][gRPC][route ${this._routeId}] <-- ${this._binding} ${request}`);
+	}
+
+	/** The tunnel response about to be sent is a JSON-RPC error (the call still ends with status 0). */
+	respondsWithError(code: number): void {
+		this._responseErrorCode = code;
+	}
+
+	/** Logs the end of a call the base server ended; a no-op while the call is open or once its end is logged. */
+	settle(): void {
+		if (this._call.isEnded) {
+			this._logEnd('cancelled');
+		}
+	}
+
+	private _logEnd(outcome: string): void {
+		if (this._request !== undefined && !this._logged) {
+			this._logged = true;
+			this._logger.debug(`[McpGateway][gRPC][route ${this._routeId}] --> ${this._binding} ${this._request}: ${outcome}`);
+		}
+	}
+}
+
 export class McpGatewayGrpcListener extends Disposable {
 	private readonly _server: GrpcServer;
 	private readonly _routes = new Map<string, IGrpcRoute>();
@@ -315,11 +388,20 @@ export class McpGatewayGrpcListener extends Disposable {
 
 	// ---- tunnel -------------------------------------------------------------------
 
-	private async _handleTunnel(call: IGrpcServerCall): Promise<void> {
-		const route = this._resolveRoute(call);
+	private async _handleTunnel(serverCall: IGrpcServerCall): Promise<void> {
+		const route = this._resolveRoute(serverCall);
 		if (!route) {
 			return;
 		}
+		const call = new LoggedGrpcCall(serverCall, this._logger, route.routeId, 'tunnel');
+		try {
+			await this._serveTunnel(call, route);
+		} finally {
+			call.settle();
+		}
+	}
+
+	private async _serveTunnel(call: LoggedGrpcCall, route: IGrpcRoute): Promise<void> {
 		const payload = await call.readRequest();
 		if (!payload) {
 			return;
@@ -357,6 +439,7 @@ export class McpGatewayGrpcListener extends Disposable {
 			return;
 		}
 		const request = message;
+		call.received(`${request.method} (id=${String(request.id)})`);
 		if (request.method === 'initialize') {
 			// The gRPC bindings speak 2026-07-28 only; a 2025-11-25 client learns which version to use.
 			const requested = isObject(request.params) && typeof request.params.protocolVersion === 'string' ? request.params.protocolVersion : 'unknown';
@@ -403,6 +486,7 @@ export class McpGatewayGrpcListener extends Disposable {
 				return;
 			}
 			response = errorResponse(request.id, rpcError.code, rpcError.message, rpcError.data);
+			call.respondsWithError(rpcError.code);
 		}
 		if (call.isEnded) {
 			// Cancelled (RST_STREAM, deadline): the base server has ended the call.
@@ -414,7 +498,7 @@ export class McpGatewayGrpcListener extends Disposable {
 	}
 
 	/** A `subscriptions/listen` call: the acknowledgement and the events are messages; the graceful result ends it with status 0. */
-	private _openListenStream(call: IGrpcServerCall, route: IGrpcRoute, request: IJsonRpcRequest, params: Record<string, unknown>): void {
+	private _openListenStream(call: LoggedGrpcCall, route: IGrpcRoute, request: IJsonRpcRequest, params: Record<string, unknown>): void {
 		const filterError = validateSubscriptionFilter(params.notifications);
 		if (filterError) {
 			endWithRpcError(call, 'tunnel', filterError, request.id);
@@ -451,20 +535,31 @@ export class McpGatewayGrpcListener extends Disposable {
 		cancellation.listener = call.token.onCancellationRequested(() => {
 			cancellation.listener?.dispose();
 			registration.dispose();
+			call.settle();
 		});
 	}
 
 	// ---- typed --------------------------------------------------------------------
 
-	private async _handleTyped(call: IGrpcServerCall, rpc: ITypedRpc): Promise<void> {
-		const route = this._resolveRoute(call);
+	private async _handleTyped(serverCall: IGrpcServerCall, rpc: ITypedRpc): Promise<void> {
+		const route = this._resolveRoute(serverCall);
 		if (!route) {
 			return;
 		}
+		const call = new LoggedGrpcCall(serverCall, this._logger, route.routeId, 'typed');
+		try {
+			await this._serveTyped(call, route, rpc);
+		} finally {
+			call.settle();
+		}
+	}
+
+	private async _serveTyped(call: LoggedGrpcCall, route: IGrpcRoute, rpc: ITypedRpc): Promise<void> {
 		const payload = await call.readRequest();
 		if (!payload) {
 			return;
 		}
+		call.received(rpc.name);
 		const fail = (code: number, message: string, data?: unknown) => endWithRpcError(call, 'typed', new McpGatewayRpcError(code, message, data), null);
 
 		let params: Record<string, unknown>;

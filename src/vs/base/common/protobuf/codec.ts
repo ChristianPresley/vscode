@@ -24,7 +24,7 @@
  * under {@link UNKNOWN_FIELDS} and re-emitted after the known fields.
  */
 
-import { decodeUtf8, IProtoField, ProtoReader, ProtoWriter, WireType, zigzagDecode32, zigzagDecode64 } from './wire.js';
+import { decodeUtf8, IProtoField, ProtoDecodeError, ProtoReader, ProtoWriter, WireType, zigzagDecode32, zigzagDecode64 } from './wire.js';
 
 export type ScalarKind =
 	| 'int32' | 'int64' | 'uint32' | 'uint64' | 'sint32' | 'sint64'
@@ -556,8 +556,14 @@ function readScalar(kind: ScalarKind, field: IProtoField): unknown {
 }
 
 function readPacked(kind: ScalarKind, payload: Uint8Array, ctx: ICodecContext): unknown[] {
-	const reader = new ProtoReader(payload);
 	const wireType = wireTypeOf(kind);
+	// A packed run of fixed-width values holds a whole number of them: a
+	// remainder is a bad length, not input that ends too early.
+	const width = wireType === WireType.Fixed32 ? 4 : wireType === WireType.Fixed64 ? 8 : 0;
+	if (width > 0 && payload.length % width !== 0) {
+		throw new ProtoDecodeError('malformed', `Packed ${kind} payload of ${payload.length} bytes is not a multiple of ${width} bytes`);
+	}
+	const reader = new ProtoReader(payload);
 	const values: unknown[] = [];
 	while (!reader.eof) {
 		countElements(ctx, 1);

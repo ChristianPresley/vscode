@@ -6,7 +6,7 @@
 import assert from 'assert';
 import { DEFAULT_CODEC_LIMITS, decodeMessage, encodeMessage, IFieldDescriptor, IMessageDescriptor, ProtoCodecError, ProtoCodecErrorReason, ProtoMessage, ScalarKind, UNKNOWN_FIELDS } from '../../../common/protobuf/codec.js';
 import { VALUE } from '../../../common/protobuf/wellKnown.js';
-import { ProtoDecodeError, ProtoWriter, WireType } from '../../../common/protobuf/wire.js';
+import { ProtoDecodeError, ProtoDecodeErrorReason, ProtoWriter, WireType } from '../../../common/protobuf/wire.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../utils.js';
 
 function hex(bytes: Uint8Array): string {
@@ -31,6 +31,10 @@ function concat(...chunks: Uint8Array[]): Uint8Array {
 function assertCodecError(fn: () => unknown, reason: ProtoCodecErrorReason): void {
 	// a function, not an arrow: the browser test runner's assert tries the validator as a class (instanceof) first
 	assert.throws(fn, function (err: unknown) { return err instanceof ProtoCodecError && err.reason === reason; }, `expected ProtoCodecError '${reason}'`);
+}
+
+function assertDecodeError(fn: () => unknown, reason: ProtoDecodeErrorReason): void {
+	assert.throws(fn, function (err: unknown) { return err instanceof ProtoDecodeError && err.reason === reason; }, `expected ProtoDecodeError '${reason}'`);
 }
 
 const SCALAR_FIELDS: readonly IFieldDescriptor[] = [
@@ -375,8 +379,23 @@ suite('protobuf codec', () => {
 			assert.deepStrictEqual(decodeMessage(OUTER, bytes('1a 01 61 1a 01 62 12 02 08 01 12 00')), { names: ['a', 'b'], items: [{ a: 1 }, {}] });
 		});
 
-		test('a truncated packed payload fails with a decode error', () => {
-			assert.throws(() => decodeMessage(REPEATED_SCALARS, bytes('5a 03 01 00 00')), function (err: unknown) { return err instanceof ProtoDecodeError && err.reason === 'truncated'; });
+		test('a packed fixed-width payload that is not a whole number of values is malformed', () => {
+			// f32 = 11 (fixed32), f = 9 (float), sf32 = 13 (sfixed32): lengths 3, 5 and 1.
+			assertDecodeError(() => decodeMessage(REPEATED_SCALARS, bytes('5a 03 01 00 00')), 'malformed');
+			assertDecodeError(() => decodeMessage(REPEATED_SCALARS, bytes('4a 05 00 00 c0 3f 00')), 'malformed');
+			assertDecodeError(() => decodeMessage(REPEATED_SCALARS, bytes('6a 01 00')), 'malformed');
+			// f64 = 12 (fixed64), d = 10 (double), sf64 = 14 (sfixed64): lengths 7, 9 and 4.
+			assertDecodeError(() => decodeMessage(REPEATED_SCALARS, bytes('62 07 01 00 00 00 00 00 00')), 'malformed');
+			assertDecodeError(() => decodeMessage(REPEATED_SCALARS, bytes('52 09 00 00 00 00 00 00 f8 3f 00')), 'malformed');
+			assertDecodeError(() => decodeMessage(REPEATED_SCALARS, bytes('72 04 00 00 00 00')), 'malformed');
+		});
+
+		test('a packed varint run that ends inside a varint is truncated', () => {
+			assertDecodeError(() => decodeMessage(REPEATED_SCALARS, bytes('0a 02 01 80')), 'truncated');
+		});
+
+		test('a packed payload longer than the input is truncated', () => {
+			assertDecodeError(() => decodeMessage(REPEATED_SCALARS, bytes('5a 08 01 00 00 00')), 'truncated');
 		});
 	});
 

@@ -36,11 +36,44 @@ import { httpRequest, jsonOf, modernMeta, modernRequest } from './mcpGatewayTest
 
 type Json = Record<string, unknown>;
 
-/** Records warnings (the destructiveHint note is one). */
+/** Records every line it is given (with its arguments), and the warnings apart (the destructiveHint note is one). */
 class RecordingLogger extends NullLogger {
+	readonly lines: string[] = [];
+	readonly debugLines: string[] = [];
 	readonly warnings: string[] = [];
-	override warn(message: string): void {
+	override trace(message: string, ...args: unknown[]): void {
+		this._record(message, args);
+	}
+	override debug(message: string, ...args: unknown[]): void {
+		this.debugLines.push(message);
+		this._record(message, args);
+	}
+	override info(message: string, ...args: unknown[]): void {
+		this._record(message, args);
+	}
+	override warn(message: string, ...args: unknown[]): void {
 		this.warnings.push(message);
+		this._record(message, args);
+	}
+	override error(message: string | Error, ...args: unknown[]): void {
+		this._record(message, args);
+	}
+	private _record(message: string | Error, args: unknown[]): void {
+		this.lines.push([message, ...args].map(logText).join(' '));
+	}
+}
+
+function logText(part: unknown): string {
+	if (part instanceof Error) {
+		return `${part.message}\n${part.stack}`;
+	}
+	if (typeof part === 'string') {
+		return part;
+	}
+	try {
+		return JSON.stringify(part) ?? String(part);
+	} catch {
+		return String(part);
 	}
 }
 
@@ -645,6 +678,45 @@ suite('MCP - Gateway gRPC listener', () => {
 		assert.ok(!TYPED_RPCS.some(rpc => rpc.jsonRpcMethod === 'subscriptions/listen'));
 		const call = channel().call('/model_context_protocol.Mcp/Listen', {}, new Uint8Array(0));
 		assert.strictEqual((await call.trailers).status, GrpcStatus.UNIMPLEMENTED);
+	});
+
+	// ---- request log ----------------------------------------------------------------
+
+	test('each request is logged at debug with its route, binding and method, then its status; never a metadata value or an argument', async () => {
+		const token = 'Bearer grpc-log-test-token';
+		const argument = 'grpc-log-test-argument';
+		const prefix = `[McpGateway][gRPC][route ${ROUTE_A}]`;
+		const ch = channel();
+
+		const tunnel = await runTunnel(ch, tunnelRequest('tools/call', { name: 'add', arguments: { a: 40, b: 2, note: argument } }, { id: 7, metadata: { authorization: token } }));
+		assert.strictEqual(firstText(tunnel.messages[tunnel.messages.length - 1].result as Json), '42');
+		const typed = await runTyped(ch, 'CallTool', { name: 'add', arguments: { a: 2, b: 2, note: argument } }, { authorization: token });
+		assert.strictEqual(firstText(typed.result), '4');
+		assert.ok(logger.debugLines.includes(`${prefix} <-- tunnel tools/call (id=7)`), logger.debugLines.join('\n'));
+		assert.ok(logger.debugLines.includes(`${prefix} --> tunnel tools/call (id=7): OK`), logger.debugLines.join('\n'));
+		assert.ok(logger.debugLines.includes(`${prefix} <-- typed CallTool`), logger.debugLines.join('\n'));
+		assert.ok(logger.debugLines.includes(`${prefix} --> typed CallTool: OK`), logger.debugLines.join('\n'));
+
+		// Errors: a tunnel error response still ends with status 0; a typed one ends with its status. Both name the JSON-RPC code.
+		await runTunnel(ch, tunnelRequest('tools/call', { name: 'no_such_tool', arguments: {} }, { id: 8, metadata: { authorization: token } }));
+		assert.ok(logger.debugLines.includes(`${prefix} --> tunnel tools/call (id=8): OK, JSON-RPC error ${MCP.INVALID_PARAMS}`), logger.debugLines.join('\n'));
+		await runTyped(ch, 'ListTools', {}, { authorization: token, [MCP_PROTOCOL_VERSION_METADATA]: '2025-11-25' });
+		assert.ok(logger.debugLines.includes(`${prefix} --> typed ListTools: INVALID_ARGUMENT, JSON-RPC error ${MCP.UNSUPPORTED_PROTOCOL_VERSION}`), logger.debugLines.join('\n'));
+
+		// A listen stream the client resets ends as cancelled.
+		const uri = 'test://watched-resource';
+		const listen = tunnelRequest('subscriptions/listen', { notifications: { resourceSubscriptions: [uri] } }, { id: 'listen-9', metadata: { authorization: token } });
+		const call = ch.call(TUNNEL_CALL_PATH, listen.metadata, tunnelPayload(listen.body));
+		const ack = decodeTunnel((await call.messages[Symbol.asyncIterator]().next()).value);
+		assert.strictEqual(ack.method, 'notifications/subscriptions/acknowledged');
+		call.cancel();
+		await call.trailers;
+		await invoker.unsubscribed.p;
+		assert.ok(logger.debugLines.includes(`${prefix} <-- tunnel subscriptions/listen (id=listen-9)`), logger.debugLines.join('\n'));
+		assert.ok(logger.debugLines.includes(`${prefix} --> tunnel subscriptions/listen (id=listen-9): cancelled`), logger.debugLines.join('\n'));
+
+		const leaked = logger.lines.filter(line => line.includes('grpc-log-test'));
+		assert.deepStrictEqual(leaked, [], 'no log line carries the authorization metadata or a tool argument');
 	});
 });
 
