@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { MCP } from './modelContextProtocol.js';
 import { MCPLegacy } from './modelContextProtocolLegacy.js';
 
 type CallToolResult = MCPLegacy.CallToolResult;
@@ -32,6 +33,11 @@ export namespace McpApps {
 
 	export type AppMessage = AppRequest | AppNotification;
 
+	/**
+	 * The App protocol (`io.modelcontextprotocol/ui`) is defined on the
+	 * 2025-11-25 shapes, so a result sent to an App has that shape whichever
+	 * revision the server speaks. Server results pass through {@link toAppResult}.
+	 */
 	export type HostResult =
 		| MCPLegacy.CallToolResult
 		| MCPLegacy.ReadResourceResult
@@ -54,6 +60,27 @@ export namespace McpApps {
 
 	export type HostMessage = HostResult | HostNotification;
 
+	/** Result fields that only the 2026-07-28 revision defines. */
+	const modernOnlyResultFields: ReadonlySet<string> = new Set(['resultType', 'ttlMs', 'cacheScope']);
+
+	/**
+	 * Turns a `tools/call` or `resources/read` result of a server of either
+	 * revision into the 2025-11-25 shape an App expects. It drops `resultType`,
+	 * `ttlMs` and `cacheScope` and keeps the other fields (`content`,
+	 * `structuredContent`, `isError`, `contents`, `_meta`), leaving out
+	 * fields whose value is `undefined`.
+	 */
+	export function toAppResult(result: MCP.CallToolResult | MCPLegacy.CallToolResult): MCPLegacy.CallToolResult;
+	export function toAppResult(result: MCP.ReadResourceResult | MCPLegacy.ReadResourceResult): MCPLegacy.ReadResourceResult;
+	export function toAppResult(result: MCP.Result | MCPLegacy.Result): MCPLegacy.Result {
+		const appResult: MCPLegacy.Result = {};
+		for (const [key, value] of Object.entries(result)) {
+			if (value !== undefined && !modernOnlyResultFields.has(key)) {
+				appResult[key] = value;
+			}
+		}
+		return appResult;
+	}
 
 	/** Custom notification used for bubbling up sandbox wheel events. */
 	export interface CustomSandboxWheelNotification {

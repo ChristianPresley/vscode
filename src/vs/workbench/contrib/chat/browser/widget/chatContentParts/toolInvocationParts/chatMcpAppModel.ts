@@ -588,9 +588,6 @@ export class ChatMcpAppModel extends Disposable {
 	}
 
 	/**
-	 * Sends the tool result notification when the result becomes available.
-	 */
-	/**
 	 * Returns a stable identifier for the originating MCP server to use
 	 * as the webview origin key. Local servers use their definition id,
 	 * agent-host servers use the per-session `serverId`.
@@ -637,11 +634,15 @@ export class ChatMcpAppModel extends Disposable {
 		return McpResourceURI.fromServer({ id: this.renderData.serverDefinitionId, label: '' }, serverUri);
 	}
 
+	/**
+	 * Sends the tool result notification when the result becomes available,
+	 * in the 2025-11-25 shape the App protocol uses.
+	 */
 	private _sendToolResult(resultDetails: IToolResult['toolResultDetails'] | IChatToolInvocationSerialized['resultDetails']): void {
 		if (isToolResultInputOutputDetails(resultDetails) && resultDetails.mcpOutput) {
 			this._sendNotification({
 				method: 'ui/notifications/tool-result',
-				params: resultDetails.mcpOutput as MCPLegacy.CallToolResult,
+				params: McpApps.toAppResult(resultDetails.mcpOutput as MCPLegacy.CallToolResult),
 			});
 		}
 	}

@@ -131,13 +131,7 @@ class LocalMcpAppCallTransport extends Disposable implements IMcpAppCallTranspor
 			throw new Error(`Tool not found on server: ${name}`);
 		}
 
-		const res = await tool.call(params, undefined, token);
-		return {
-			content: res.content,
-			isError: res.isError,
-			_meta: res._meta,
-			structuredContent: res.structuredContent,
-		};
+		return tool.call(params, undefined, token);
 	}
 
 	async readResource(uri: string, token: CancellationToken): Promise<MCPLegacy.ReadResourceResult> {
@@ -419,20 +413,20 @@ export class McpToolCallUI extends Disposable {
 	 * @param name Tool name
 	 * @param params Tool parameters
 	 * @param token Cancellation token
-	 * @returns The tool call result
+	 * @returns The tool call result, in the 2025-11-25 shape the App protocol uses
 	 */
-	public callTool(name: string, params: Record<string, unknown>, token: CancellationToken): Promise<MCPLegacy.CallToolResult> {
-		return this._transport.callTool(name, params, token);
+	public async callTool(name: string, params: Record<string, unknown>, token: CancellationToken): Promise<MCPLegacy.CallToolResult> {
+		return McpApps.toAppResult(await this._transport.callTool(name, params, token));
 	}
 
 	/**
 	 * Reads a resource from the MCP server.
 	 * @param uri Resource URI
 	 * @param token Cancellation token
-	 * @returns The resource content
+	 * @returns The resource content, in the 2025-11-25 shape the App protocol uses
 	 */
-	public readResource(uri: string, token: CancellationToken): Promise<MCPLegacy.ReadResourceResult> {
-		return this._transport.readResource(uri, token);
+	public async readResource(uri: string, token: CancellationToken): Promise<MCPLegacy.ReadResourceResult> {
+		return McpApps.toAppResult(await this._transport.readResource(uri, token));
 	}
 
 	/**
