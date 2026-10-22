@@ -10,8 +10,9 @@
   3. builds the zig-sdk servers when they are missing from the volume (or with -RebuildZig)
   4. starts llama-e2e (llama.cpp, Qwen3-8B) on vscode-e2e-net
   5. runs containers/run-suite.sh in a fresh container on vscode-e2e-net: installs the .deb, starts
-     the MCP servers, runs the API suite (extension tests) and the UI suite (Playwright: screenshots
-     and the input that needs the UI)
+     the MCP servers, runs the API suite (extension tests), the UI suite (Playwright: screenshots
+     and the input that needs the UI) and the enterprise policy phase (ui/policy.ts: Playwright with
+     /etc/vscode/policy.json inside the container; -Only policy runs only that phase)
   Results: <repo>\.build\e2e\runs\<run id>\ (summary.md, which starts with the installed commit and
   the content hash of test/mcp-e2e, provenance.json, api\, ui\, logs-*\); screenshots:
   <repo>\.build\visual-verification\. Exits non-zero on any failure.
@@ -28,12 +29,16 @@
   pwsh -File test\mcp-e2e\run-e2e.ps1 -Branch mcp-2026/final -AllowFail grpc
   pwsh -File test\mcp-e2e\run-e2e.ps1 -SkipBuild -Repeat 3 -RunId final
   pwsh -File test\mcp-e2e\run-e2e.ps1 -Deb .build\e2e-keep\m8-6201d830320.deb -SkipUi -Only 'gRPC soak'
+  pwsh -File test\mcp-e2e\run-e2e.ps1 -SkipBuild -Only policy -RunId policy-1
 #>
 param(
 	[string]$Branch,
 	[switch]$SkipBuild,
 	[switch]$SkipApi,
+	# Also skips the policy phase (it is Playwright-driven).
 	[switch]$SkipUi,
+	# Skips the enterprise policy phase (ui/policy.ts) only.
+	[switch]$SkipPolicy,
 	# Comma-separated test groups whose failures are reported but do not fail the run (e.g. grpc).
 	[string]$AllowFail = '',
 	# Comma-separated substrings: only the tests whose name contains one of them.
@@ -138,6 +143,7 @@ function Invoke-Suite([string]$Id) {
 	if ($Mutate) { $runArgs += @('-e', "MCP_E2E_MUTATIONS=$Mutate") }
 	if ($SkipApi) { $runArgs += @('-e', 'E2E_SKIP_API=1') }
 	if ($SkipUi) { $runArgs += @('-e', 'E2E_SKIP_UI=1') }
+	if ($SkipPolicy) { $runArgs += @('-e', 'E2E_SKIP_POLICY=1') }
 	$runArgs += @($script:Image, 'bash', '/src/e2e/containers/run-suite.sh')
 	Write-Host "wslc $($runArgs -join ' ')"
 	& $script:Wslc @runArgs | Out-Host

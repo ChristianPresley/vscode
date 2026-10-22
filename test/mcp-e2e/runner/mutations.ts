@@ -7,8 +7,8 @@
 // product would show itself, and names the tests that must then fail. A run with
 // MCP_E2E_MUTATIONS=<name> (run-e2e.ps1 -Mutate <name>) applies it; `check` verifies the result.
 // Where a mutation is applied: prepare-profile.ts (mcp.json, settings), start-servers.ts (the proxy
-// and fixture flags), runner/http-fault-proxy.ts (--mutate), runner/oauth-browser.ts, or the test
-// itself (extension/src, testHelpers.mutated).
+// and fixture flags), runner/http-fault-proxy.ts (--mutate), runner/oauth-browser.ts, the test
+// itself (extension/src, testHelpers.mutated), or the policy phase (ui/policy.ts).
 //
 // Usage: node runner/mutations.ts list            the table with the exact commands (Markdown)
 //        node runner/mutations.ts json            the same as JSON (run-mutations.ps1 reads it)
@@ -21,13 +21,13 @@ export interface IMutation {
 	readonly name: string;
 	/** What it simulates. */
 	readonly summary: string;
-	readonly appliedBy: 'prepare-profile' | 'start-servers' | 'http-fault-proxy' | 'oauth-browser' | 'test';
+	readonly appliedBy: 'prepare-profile' | 'start-servers' | 'http-fault-proxy' | 'oauth-browser' | 'test' | 'policy';
 	/** Substrings of the names of the tests that must fail (each must match at least one failed test). */
 	readonly mustFail: readonly string[];
 	/** The -Only filter of the run (comma-separated substrings). */
 	readonly only: string;
-	/** Which suites the run needs. */
-	readonly suites: 'api' | 'ui' | 'both';
+	/** Which suites the run needs (`policy`: only the policy phase, which `-Only policy` selects alone). */
+	readonly suites: 'api' | 'ui' | 'both' | 'policy';
 }
 
 export const MUTATIONS: readonly IMutation[] = [
@@ -56,6 +56,8 @@ export const MUTATIONS: readonly IMutation[] = [
 	{ name: 'gateway-benign', appliedBy: 'test', suites: 'api', only: 'gateway Host/Origin,gateway unknown route,gateway header check,gateway requestState,gateway dispose', summary: 'the gateway tests send valid requests (and do not dispose) where they send invalid ones', mustFail: ['gateway Host/Origin checks', 'gateway unknown route', 'gateway header check', 'gateway requestState check', 'gateway dispose'] },
 	{ name: 'gateway-listen-no-trigger', appliedBy: 'test', suites: 'api', only: 'gateway listen stream', summary: 'the tool list of zig-http-gw does not change', mustFail: ['gateway listen stream'] },
 	{ name: 'gateway-rate-slow', appliedBy: 'test', suites: 'api', only: 'gateway rate limits', summary: 'the 130 calls are sent one after another, slower than the refill', mustFail: ['gateway rate limits'] },
+	{ name: 'no-policy-file', appliedBy: 'policy', suites: 'policy', only: 'policy', summary: 'the policy phase writes no /etc/vscode/policy.json: VS Code applies no allow list', mustFail: ['zig-stdio, not in the allow list', 'zig-grpcs-insecure, allowed by its grpcs:// URL', 'chat.mcp.allowedServers is the policy value'] },
+	{ name: 'allow-list-in-settings', appliedBy: 'policy', suites: 'policy', only: 'policy', summary: 'the same allow list comes from the user settings.json instead of the policy file: zig-stdio stays blocked, but tls.insecure is only warned about', mustFail: ['zig-grpcs-insecure, allowed by its grpcs:// URL', 'chat.mcp.allowedServers is the policy value'] },
 ];
 
 /** The run-e2e.ps1 command of a mutation run. */
@@ -81,7 +83,7 @@ interface ITestRow {
 /** Whether every test the mutation names failed in the run (and which did not). */
 export function checkRun(runDir: string, m: IMutation): { ok: boolean; lines: string[] } {
 	const tests: ITestRow[] = [];
-	for (const suite of ['api', 'ui']) {
+	for (const suite of ['api', 'ui', 'policy']) {
 		try {
 			tests.push(...(JSON.parse(fs.readFileSync(path.join(runDir, suite, `${suite}-results.json`), 'utf8')) as { tests: ITestRow[] }).tests);
 		} catch {

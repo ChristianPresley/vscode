@@ -2,7 +2,7 @@
 # run-e2e.sh - the Git Bash entry point of the MCP end-to-end tests (Windows host with WSL
 # Containers). It maps the options onto run-e2e.ps1, which drives wslc.exe; see README.md.
 #
-#   test/mcp-e2e/run-e2e.sh [--branch <b>] [--skip-build] [--skip-api] [--skip-ui]
+#   test/mcp-e2e/run-e2e.sh [--branch <b>] [--skip-build] [--skip-api] [--skip-ui] [--skip-policy]
 #                           [--allow-fail <groups>] [--only <substrings>] [--run-id <id>]
 #                           [--deb <path>] [--repeat <n>] [--mutate <names>]
 #                           [--cpu] [--rebuild-zig] [--keep-llama]
@@ -19,6 +19,7 @@ while [ $# -gt 0 ]; do
 		--skip-build) args+=(-SkipBuild); shift ;;
 		--skip-api) args+=(-SkipApi); shift ;;
 		--skip-ui) args+=(-SkipUi); shift ;;
+		--skip-policy) args+=(-SkipPolicy); shift ;;
 		--allow-fail) args+=(-AllowFail "$2"); shift 2 ;;
 		--only) args+=(-Only "$2"); shift 2 ;;
 		--run-id) args+=(-RunId "$2"); shift 2 ;;
