@@ -695,10 +695,12 @@ async function screenshotsPart(page: Page): Promise<void> {
 		await command('workbench.mcp.showInstalledServers');
 		await sleep(3000);
 		// The list is virtualized and has more rows than fit: read it scrolled through, then shoot the top.
+		// Only the rows that fit are rendered, and the wheel does not reach this list, so a check names a
+		// server near the top: with skills-stdio added (run skills-1c), zig-grpc-typed is no longer rendered.
 		const text = `${await visibleText(page, '.part.sidebar')}\n${await listTextScrolled(page, '.part.sidebar', 'everything-')}`;
 		await shot(page, '01-servers-extensions-view.png', 'MCP servers in the Extensions view',
 			'The "MCP Servers - Installed" section of the Extensions view lists the servers of mcp.json by their configured names (as many as fit; the others further down).',
-			{ 'zig-http listed': text.includes('zig-http'), 'everything-legacy listed': text.includes('everything-legacy'), 'zig-grpc-typed listed': text.includes('zig-grpc-typed') }, text.slice(0, 400));
+			{ 'zig-http listed': text.includes('zig-http'), 'everything-legacy listed': text.includes('everything-legacy'), 'zig-grpc-tunnel listed': text.includes('zig-grpc-tunnel') }, text.slice(0, 1200));
 	});
 
 	await section(page, 'list servers', async () => {
@@ -1650,15 +1652,15 @@ async function main(): Promise<number> {
 				}
 				await shot(page, '29-customizations-mcp-skills.png', 'Agent Customizations: skills served by an MCP server',
 					'Agent Customizations, Skills, searched for skills-stdio: the group "MCP Servers" lists pdf-processing, refunds and live-report, each with the badge skills-stdio; the context menu of pdf-processing offers Disable and Revoke Approval, and no Delete.', {
-						'the MCP Servers group': text.includes('MCP Servers'),
-						'pdf-processing listed': text.includes('pdf-processing'),
-						'refunds listed': text.includes('refunds'),
-						'live-report listed': text.includes('live-report'),
-						'the server badge': text.includes('skills-stdio'),
-						'Disable offered': menu.includes('Disable'),
-						'Revoke Approval offered': menu.includes('Revoke Approval'),
-						'no Delete': !menu.includes('Delete'),
-					}, `${text.slice(0, 300)}\n---\n${menu}`.slice(0, 500));
+					'the MCP Servers group': text.includes('MCP Servers'),
+					'pdf-processing listed': text.includes('pdf-processing'),
+					'refunds listed': text.includes('refunds'),
+					'live-report listed': text.includes('live-report'),
+					'the server badge': text.includes('skills-stdio'),
+					'Disable offered': menu.includes('Disable'),
+					'Revoke Approval offered': menu.includes('Revoke Approval'),
+					'no Delete': !menu.includes('Delete'),
+				}, `${text.slice(0, 300)}\n---\n${menu}`.slice(0, 500));
 			} finally {
 				await page.keyboard.press('Escape');
 				await page.keyboard.press('Escape');
