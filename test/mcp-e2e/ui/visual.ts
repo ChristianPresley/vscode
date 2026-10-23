@@ -1601,6 +1601,72 @@ async function main(): Promise<number> {
 		await runUiScenario(page, 'oauth-iss-omit', { dialogButton: consent, checkTrace: consentAsked });
 		await runUiScenario(page, 'oauth-grpc', { dialogButton: consent, checkTrace: trace => trace.answeredDialogs.length === 1 ? undefined : `expected exactly one consent dialog for the gRPC sign-in, answered ${trace.answeredDialogs.length}` });
 
+		// Skills served by skills-stdio (SEP-2640): every load the user has not approved is a modal
+		// dialog "Load skill '<name>' from MCP server skills-stdio?", answered Yes: pdf-processing once
+		// (the second load is approved), the dynamic live-report on both of its loads.
+		const loadSkill = (text: string) => /Load skill '[^']+' from MCP server skills-stdio\?/.test(text);
+		await runUiScenario(page, 'mcp-skills', {
+			dialogButton: text => loadSkill(text) ? 'Yes' : undefined,
+			checkTrace: trace => {
+				const names = trace.answeredDialogs.map(d => /Load skill '([^']+)'/.exec(d.text)?.[1]);
+				return JSON.stringify(names) === JSON.stringify(['pdf-processing', 'live-report', 'live-report'])
+					? undefined
+					: `expected approval dialogs for pdf-processing once and live-report twice, answered ${JSON.stringify(names)}`;
+			},
+			onDialog: {
+				file: '28-skill-approval-dialog.png',
+				title: 'Skills: the approval of a skill an MCP server serves',
+				take: async () => {
+					const text = (await visibleText(page, '.monaco-dialog-box')).replace(/\s+/g, ' ');
+					const buttons = (await page.locator('.monaco-dialog-box .monaco-button').allInnerTexts().catch(() => [] as string[])).map(b => b.trim());
+					await shot(page, '28-skill-approval-dialog.png', 'Skills: the approval of a skill an MCP server serves',
+						'The modal dialog "Load skill \'pdf-processing\' from MCP server skills-stdio?": the server, the skill and its SKILL.md URI and description, the warning that its instructions are untrusted, that each tool call that runs code needs approval and that allowed-tools grants nothing, and that it lists 4 files whose change asks again; buttons Yes and Cancel.', {
+						'names the skill and the server': text.includes('Load skill \'pdf-processing\' from MCP server skills-stdio?'),
+						'the SKILL.md URI': text.includes('skill://pdf-processing/SKILL.md'),
+						'untrusted instructions': /untrusted/.test(text),
+						'allowed-tools grants nothing': text.includes('allowed-tools grant nothing'),
+						'the 4 listed files': text.includes('It lists 4 file(s)'),
+						'Yes button': buttons.includes('Yes'),
+					}, text.slice(0, 500));
+				},
+			},
+		});
+		await section(page, 'skills customizations', async () => {
+			// Agent Customizations, Skills: the skills of skills-stdio in the group "MCP Servers", each with
+			// the server as its badge, read-only; the context menu of a row offers Disable and Revoke Approval.
+			await command('aiCustomization.openManagementEditor', ['skills']);
+			await sleep(3000);
+			try {
+				const search = page.getByPlaceholder('Type to search...').filter({ visible: true }).first();
+				await search.fill('skills-stdio', { timeout: 10_000 }).catch(() => undefined);
+				await sleep(1500);
+				const text = (await page.locator('.monaco-list-row').filter({ visible: true }).allInnerTexts().catch(() => [] as string[])).join(' | ').replace(/\s+/g, ' ');
+				const row = page.locator('.monaco-list-row', { hasText: 'pdf-processing' }).first();
+				let menu = '';
+				if (await row.count()) {
+					await row.click({ button: 'right', timeout: 10_000 });
+					await sleep(800);
+					menu = (await visibleText(page, '.context-view .monaco-menu')).replace(/\s+/g, ' ');
+				}
+				await shot(page, '29-customizations-mcp-skills.png', 'Agent Customizations: skills served by an MCP server',
+					'Agent Customizations, Skills, searched for skills-stdio: the group "MCP Servers" lists pdf-processing, refunds and live-report, each with the badge skills-stdio; the context menu of pdf-processing offers Disable and Revoke Approval, and no Delete.', {
+						'the MCP Servers group': text.includes('MCP Servers'),
+						'pdf-processing listed': text.includes('pdf-processing'),
+						'refunds listed': text.includes('refunds'),
+						'live-report listed': text.includes('live-report'),
+						'the server badge': text.includes('skills-stdio'),
+						'Disable offered': menu.includes('Disable'),
+						'Revoke Approval offered': menu.includes('Revoke Approval'),
+						'no Delete': !menu.includes('Delete'),
+					}, `${text.slice(0, 300)}\n---\n${menu}`.slice(0, 500));
+			} finally {
+				await page.keyboard.press('Escape');
+				await page.keyboard.press('Escape');
+				await command('workbench.action.closeActiveEditor').catch(() => undefined);
+				await sleep(500);
+			}
+		});
+
 		// Last: the tool calls from the chat view (a chat request autostarts every server that never ran).
 		await dismissDialogs(page);
 		await clearNotifications();

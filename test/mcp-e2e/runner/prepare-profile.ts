@@ -158,6 +158,8 @@ function main(argv: readonly string[]): void {
 	const placeholders = {
 		zig: argValue(argv, '--zig', '/work/zig-sdk/zig-out/bin/mcp-conformance-server'),
 		everything: argValue(argv, '--everything', '/work/e2e-tools/node_modules/@modelcontextprotocol/server-everything/dist/index.js'),
+		// The fixtures of this folder that VS Code starts itself (runner/skills-server.ts).
+		runner: import.meta.dirname,
 		tlsCa,
 	};
 	const mutations = activeMutations();
