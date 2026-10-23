@@ -842,7 +842,7 @@ async function screenshotsPart(page: Page): Promise<void> {
 		await control('POST', '/open', { path: workspaceMcpJson });
 		await sleep(1500);
 		await suggestShot('08-mcp-json-type-completion.png', 'mcp.json completion of "type"', typeText, 'mcp.json: a new server with a grpc:// url and the completion list of "type" open, offering "grpc".', ['grpc']);
-		await suggestShot('09-mcp-json-binding-completion.png', 'mcp.json completion of "binding"', newServer('\t\t\t"type": "grpc",\n\t\t\t"url": "grpc://127.0.0.1:50051",\n\t\t\t"binding": "$CURSOR$"'), 'mcp.json: a grpc server with the completion list of "binding" open: "auto" (marked Default value), "tunnel" and "typed".', ['auto', 'tunnel', 'typed']);
+		await suggestShot('09-mcp-json-binding-completion.png', 'mcp.json completion of "binding"', newServer('\t\t\t"type": "grpc",\n\t\t\t"url": "grpc://127.0.0.1:50051",\n\t\t\t"binding": "$CURSOR$"'), 'mcp.json: a grpc server with the completion list of "binding" open: "auto" (marked Default value), "tunnel", "typed" and "typed-with-tunnel".', ['auto', 'tunnel', 'typed', 'typed-with-tunnel']);
 
 		// A grpc server with an http:// url: the schema's pattern marks the url, and the hover over it says why.
 		const rule = 'The URL must start with \'grpc://\' or \'grpcs://\'.';

@@ -57,15 +57,15 @@ export interface IExtHostMpcService extends ExtHostMcpShape {
 	startMcpGateway(chatSessionResource: URI | undefined, options: vscode.McpGatewayStartOptions | undefined): Promise<vscode.McpGateway | undefined>;
 }
 
-/** A value of the proposed `McpGrpcBinding` enum (Auto = 1, Tunnel = 2, Typed = 3); any other number is invalid too. */
+/** A value of the proposed `McpGrpcBinding` enum (Auto = 1, Tunnel = 2, Typed = 3, TypedWithTunnel = 4); any other number is invalid too. */
 const vGrpcBinding: IValidator<number> = {
 	validate(content: unknown) {
-		return content === 1 || content === 2 || content === 3
+		return content === 1 || content === 2 || content === 3 || content === 4
 			? { content, error: undefined }
-			: { content: undefined, error: { message: `Expected McpGrpcBinding.Auto, .Tunnel or .Typed, but got ${typeof content === 'number' ? content : typeof content}` } };
+			: { content: undefined, error: { message: `Expected McpGrpcBinding.Auto, .Tunnel, .Typed or .TypedWithTunnel, but got ${typeof content === 'number' ? content : typeof content}` } };
 	},
 	getJSONSchema() {
-		return { enum: [1, 2, 3] };
+		return { enum: [1, 2, 3, 4] };
 	},
 };
 

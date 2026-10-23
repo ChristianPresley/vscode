@@ -119,8 +119,11 @@ export interface IMcpGrpcServerTlsConfiguration {
  * (`/mcp.zig.transport.v1.Mcp/Call`), Google's typed `model_context_protocol.Mcp`
  * service, or `auto` (the default), which is the tunnel: the client never
  * switches to the typed service on its own, only `typed` speaks it.
+ * `typed-with-tunnel` speaks the typed service for the methods it has an RPC
+ * for and the tunnel for the rest (discovery, subscriptions, notifications and
+ * extension methods such as the Skills extension's).
  */
-export type McpGrpcBinding = 'auto' | 'tunnel' | 'typed';
+export type McpGrpcBinding = 'auto' | 'tunnel' | 'typed' | 'typed-with-tunnel';
 
 export interface IMcpGrpcServerConfiguration extends ICommonMcpServerConfiguration {
 	readonly type: McpServerType.GRPC;
