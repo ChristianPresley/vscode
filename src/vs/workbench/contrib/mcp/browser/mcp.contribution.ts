@@ -45,6 +45,7 @@ import { McpGatewayToolBrokerContribution } from './mcpGatewayToolBrokerContribu
 import { McpAddContextContribution } from './mcpAddContextContribution.js';
 import { AddConfigurationAction, EditStoredInput, InstallFromManifestAction, ListMcpServerCommand, McpAgentHostServerOptionsCommand, McpBrowseCommand, McpBrowsePageCommand, McpBrowseResourcesCommand, McpConfigureSamplingModels, McpConfirmationServerOptionsCommand, MCPServerActionRendering, McpServerOptionsCommand, McpSkipCurrentAutostartCommand, McpStartPromptingServerCommand, OpenRemoteUserMcpResourceCommand, OpenUserMcpResourceCommand, OpenWorkspaceFolderMcpResourceCommand, OpenWorkspaceMcpResourceCommand, RemoveStoredInput, ResetMcpCachedTools, ResetMcpTrustCommand, RestartServer, SetOAuthClientSecret, ShowConfiguration, ShowInstalledMcpServersCommand, ShowOutput, StartServer, StopServer } from './mcpCommands.js';
 import { McpDiscovery } from './mcpDiscovery.js';
+import { McpRevokeAllSkillApprovalsAction, McpRevokeSkillApprovalAction } from './mcpSkillsActions.js';
 import { McpElicitationService } from './mcpElicitationService.js';
 import { McpLanguageFeatures } from './mcpLanguageFeatures.js';
 import { McpConfigMigrationContribution } from './mcpMigration.js';
@@ -86,6 +87,8 @@ registerAction2(McpServerOptionsCommand);
 registerAction2(McpAgentHostServerOptionsCommand);
 registerAction2(McpConfirmationServerOptionsCommand);
 registerAction2(ResetMcpTrustCommand);
+registerAction2(McpRevokeSkillApprovalAction);
+registerAction2(McpRevokeAllSkillApprovalsAction);
 registerAction2(ResetMcpCachedTools);
 registerAction2(AddConfigurationAction);
 registerAction2(InstallFromManifestAction);

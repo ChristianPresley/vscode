@@ -725,6 +725,7 @@ suite('aiCustomizationListWidget', () => {
 				listPromptFiles: async () => [],
 				getCustomAgents: async () => [],
 				findAgentSkills: async () => [],
+				getProvidedAgentSkills: async () => [],
 				getHooks: async () => undefined,
 				getInstructionFiles: async () => [],
 				getDisabledPromptFiles: () => new ResourceSet(),

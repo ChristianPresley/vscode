@@ -252,6 +252,11 @@ registerAction2(class extends Action2 {
 				readOnly: true,
 				readOnlyMessage: new MarkdownString(localize('readonlyPluginFile', "This file is provided by a plugin or extension and cannot be edited.")),
 			});
+		} else if (codeEditor && source === AICustomizationSources.mcp) {
+			codeEditor.updateOptions({
+				readOnly: true,
+				readOnlyMessage: new MarkdownString(localize('readonlyMcpSkill', "This skill is served by an MCP server and cannot be edited.")),
+			});
 		}
 	}
 });
@@ -480,6 +485,16 @@ const WHEN_ITEM_IS_DELETABLE = ContextKeyExpr.and(
 	ContextKeyExpr.notEquals(AI_CUSTOMIZATION_ITEM_STORAGE_KEY, AICustomizationSources.extension),
 	ContextKeyExpr.notEquals(AI_CUSTOMIZATION_ITEM_STORAGE_KEY, AICustomizationSources.plugin),
 	ContextKeyExpr.notEquals(AI_CUSTOMIZATION_ITEM_STORAGE_KEY, AICustomizationSources.builtin),
+	ContextKeyExpr.notEquals(AI_CUSTOMIZATION_ITEM_STORAGE_KEY, AICustomizationSources.mcp),
+);
+
+/** When clause of the items that can be disabled and enabled: built-in skills and skills MCP servers serve. */
+const WHEN_ITEM_IS_TOGGLEABLE_SKILL = ContextKeyExpr.and(
+	ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_TYPE_KEY, PromptsType.skill),
+	ContextKeyExpr.or(
+		ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_STORAGE_KEY, AICustomizationSources.builtin),
+		ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_STORAGE_KEY, AICustomizationSources.mcp),
+	),
 );
 
 /**
@@ -703,8 +718,7 @@ for (const menuId of [AICustomizationManagementItemMenuId, AICustomizationManage
 		order: 1,
 		when: ContextKeyExpr.and(
 			ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_DISABLED_KEY, false),
-			ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_STORAGE_KEY, AICustomizationSources.builtin),
-			ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_TYPE_KEY, PromptsType.skill),
+			WHEN_ITEM_IS_TOGGLEABLE_SKILL,
 		),
 	});
 
@@ -715,8 +729,7 @@ for (const menuId of [AICustomizationManagementItemMenuId, AICustomizationManage
 		order: 1,
 		when: ContextKeyExpr.and(
 			ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_DISABLED_KEY, true),
-			ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_STORAGE_KEY, AICustomizationSources.builtin),
-			ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_TYPE_KEY, PromptsType.skill),
+			WHEN_ITEM_IS_TOGGLEABLE_SKILL,
 		),
 	});
 
@@ -727,8 +740,7 @@ for (const menuId of [AICustomizationManagementItemMenuId, AICustomizationManage
 		order: 5,
 		when: ContextKeyExpr.and(
 			ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_DISABLED_KEY, false),
-			ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_STORAGE_KEY, AICustomizationSources.builtin),
-			ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_TYPE_KEY, PromptsType.skill),
+			WHEN_ITEM_IS_TOGGLEABLE_SKILL,
 		),
 	});
 
@@ -739,8 +751,7 @@ for (const menuId of [AICustomizationManagementItemMenuId, AICustomizationManage
 		order: 5,
 		when: ContextKeyExpr.and(
 			ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_DISABLED_KEY, true),
-			ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_STORAGE_KEY, AICustomizationSources.builtin),
-			ContextKeyExpr.equals(AI_CUSTOMIZATION_ITEM_TYPE_KEY, PromptsType.skill),
+			WHEN_ITEM_IS_TOGGLEABLE_SKILL,
 		),
 	});
 }

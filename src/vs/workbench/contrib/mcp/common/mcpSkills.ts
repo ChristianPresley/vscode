@@ -17,9 +17,16 @@ import { MCPLegacy } from './modelContextProtocolLegacy.js';
  * the skill is loaded and a supporting file when it is read.
  */
 
-/** What the loader needs from a connection: `resources/read`. */
+/** What the loader needs from a connection: `resources/read`, and `resources/directory/read` to list a dynamic skill. */
 export interface IMcpSkillResourceReader {
 	readResource(params: { uri: string }, token: CancellationToken): Promise<MCPLegacy.ReadResourceResult>;
+	readDirectory?(params: { uri: string }, token: CancellationToken): Promise<MCPLegacy.Resource[]>;
+}
+
+/** One child of a skill directory. */
+export interface IMcpSkillDirectoryEntry {
+	readonly uri: string;
+	readonly directory: boolean;
 }
 
 /** A skill that cannot be loaded, or a file whose content must not be used. */
@@ -95,6 +102,44 @@ export class McpLoadedSkill {
 			return Promise.reject(verifyError({ problem: McpSkills.VerifyProblem.OutsideSkill, detail: `${uriOrReference} is outside the skill ${this.entry.uri}` }));
 		}
 		return this._read(uri, token);
+	}
+
+	/**
+	 * The direct children of a directory of the skill, by URI or by a path
+	 * relative to the skill's root (empty for the root). A skill with a
+	 * manifest is listed from the held entry, without a request: a file it does
+	 * not list cannot be read anyway. A dynamic skill is listed with
+	 * `resources/directory/read`, which needs the server's `directoryRead`;
+	 * children outside the skill are left out.
+	 */
+	public async listDirectory(uriOrReference: string, token: CancellationToken = CancellationToken.None): Promise<IMcpSkillDirectoryEntry[]> {
+		const root = this.root;
+		const reference = uriOrReference.replace(/\/+$/, '');
+		const dir = reference === '' || reference === '.' || reference === root ? root
+			: reference.includes('://') ? (McpSkills.isInsideSkill(this.entry.uri, reference) ? reference : undefined)
+				: McpSkills.resolveRelative(this.entry.uri, reference);
+		if (dir === undefined) {
+			throw verifyError({ problem: McpSkills.VerifyProblem.OutsideSkill, detail: `${uriOrReference} is outside the skill ${this.entry.uri}` });
+		}
+		const prefix = `${dir}/`;
+		if (this.entry.resources !== McpSkills.DYNAMIC) {
+			const children = new Map<string, boolean>();
+			for (const { uri } of this.entry.resources) {
+				if (uri.startsWith(prefix)) {
+					const rest = uri.slice(prefix.length);
+					const slash = rest.indexOf('/');
+					children.set(prefix + (slash < 0 ? rest : rest.slice(0, slash)), slash >= 0);
+				}
+			}
+			return [...children].map(([uri, directory]) => ({ uri, directory })).sort((a, b) => a.uri < b.uri ? -1 : a.uri > b.uri ? 1 : 0);
+		}
+		if (!this._reader.readDirectory) {
+			throw new McpSkillVerificationError(McpSkills.VerifyProblem.NoContent, `${dir}: the connection cannot read directories`, localize('mcp.skills.noDirectoryListing', 'The files of this skill are not listed, and its server cannot list directories.'));
+		}
+		const resources = await this._reader.readDirectory({ uri: dir }, token);
+		return resources
+			.filter(r => typeof r.uri === 'string' && r.uri.startsWith(prefix) && !r.uri.slice(prefix.length).includes('/') && McpSkills.isInsideSkill(this.entry.uri, r.uri))
+			.map(r => ({ uri: r.uri, directory: r.mimeType === McpSkills.DIRECTORY_MIME_TYPE }));
 	}
 
 	private async _read(uri: string, token: CancellationToken): Promise<Uint8Array> {

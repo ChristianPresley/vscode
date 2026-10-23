@@ -15,7 +15,8 @@ import { NullLogService } from '../../../../../platform/log/common/log.js';
 import { McpSkills } from '../../../../../platform/mcp/common/modelContextProtocolSkills.js';
 import { InMemoryStorageService } from '../../../../../platform/storage/common/storage.js';
 import { IChatService } from '../../../chat/common/chatService/chatService.js';
-import { PromptsStorage } from '../../../chat/common/promptSyntax/service/promptsService.js';
+import { IPromptsService, PromptsStorage } from '../../../chat/common/promptSyntax/service/promptsService.js';
+import { ResourceSet } from '../../../../../base/common/map.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { MockContextKeyService } from '../../../../../platform/keybinding/test/common/mockKeybindingService.js';
@@ -55,6 +56,9 @@ async function servedSkill(path: string, description: string, options: { extraFr
 /** A server that serves skills; records every skills/list and resources/read. */
 class FakeServer {
 	public readonly reads: string[] = [];
+	public readonly directoryReads: string[] = [];
+	/** The answers to resources/directory/read, by directory URI. */
+	public directories: Record<string, MCPLegacy.Resource[]> = {};
 	public listCalls = 0;
 	public readonly connection = observableValue<object | undefined>(this, {});
 	public readonly connectionState = observableValue<McpConnectionState>(this, { state: McpConnectionState.Kind.Running });
@@ -81,6 +85,10 @@ class FakeServer {
 				this.reads.push(uri);
 				const text = this._files().get(uri);
 				return { contents: text === undefined ? [] : [{ uri, text }] };
+			},
+			readDirectory: async ({ uri }: { uri: string }): Promise<MCPLegacy.Resource[]> => {
+				this.directoryReads.push(uri);
+				return this.directories[uri] ?? [];
 			},
 		};
 		return {
@@ -128,6 +136,7 @@ suite('Workbench - MCP - Skills in chat (SEP-2640)', () => {
 	let onDidDisposeSession: Emitter<{ readonly sessionResources: readonly URI[]; readonly reason: 'cleared' | 'disposed' }>;
 	let storage: InMemoryStorageService;
 	let chatSkills: McpChatSkills;
+	let disabledSkills: ResourceSet;
 	let callId = 0;
 
 	setup(() => {
@@ -136,7 +145,9 @@ suite('Workbench - MCP - Skills in chat (SEP-2640)', () => {
 		onDidDisposeSession = store.add(new Emitter());
 		const chatService = new class extends mock<IChatService>() { override onDidDisposeSession = onDidDisposeSession.event; };
 		storage = store.add(new InMemoryStorageService());
-		chatSkills = store.add(new McpChatSkills(mcpService, toolsService, chatService, storage, new NullLogService()));
+		disabledSkills = new ResourceSet();
+		const promptsService = new class extends mock<IPromptsService>() { override getDisabledPromptFiles() { return disabledSkills; } };
+		chatSkills = store.add(new McpChatSkills(mcpService, toolsService, chatService, storage, new NullLogService(), promptsService));
 	});
 
 	function tool(id: McpSkillToolId): IToolImpl {
@@ -161,6 +172,10 @@ suite('Workbench - MCP - Skills in chat (SEP-2640)', () => {
 
 	function readFile(server: FakeServer, uri: string, session?: URI) {
 		return call(McpSkillToolId.ReadSkillFile, { server: server.definition.id, uri }, { session });
+	}
+
+	function listDirectory(server: FakeServer, uri: string | undefined, session?: URI) {
+		return call(McpSkillToolId.ListSkillDirectory, uri === undefined ? { server: server.definition.id } : { server: server.definition.id, uri }, { session });
 	}
 
 	function codeExecutionGate(session: URI = SESSION, id: string = TerminalToolId.RunInTerminal) {
@@ -338,6 +353,89 @@ suite('Workbench - MCP - Skills in chat (SEP-2640)', () => {
 
 		assert.deepStrictEqual(a.reads, [pdf.entry.uri, 'skill://pdf-processing/references/GUIDE.md', 'skill://pdf-processing/references/GUIDE.md', 'skill://pdf-processing/nested/SKILL.md']);
 		assert.ok((await readFile(a, 'references/GUIDE.md', OTHER_SESSION)).result?.toolResultError, 'only in the chat that loaded the skill');
+	});
+
+	test('directory listing: a skill with a manifest is listed from its verified entry, without a request; only a loaded skill, from its own server, inside the skill', async () => {
+		const pdf = await servedSkill('pdf-processing', 'Work with PDFs', { files: { 'references/GUIDE.md': 'Guide.\n', 'templates/invoice.md': '# Invoice\n', 'templates/regional/eu.md': '# EU\n' } });
+		const a = new FakeServer('server.a', 'Server A', [pdf]);
+		const b = new FakeServer('server.b', 'Server B', []);
+		mcpService.servers.set([a.server, b.server], undefined);
+
+		assert.ok(text((await listDirectory(a, undefined)).result!).includes('Load the skill with readMcpSkill first'));
+		await load(a, pdf.entry.uri);
+
+		const root = text((await listDirectory(a, undefined)).result!);
+		assert.strictEqual(root, [
+			'<mcp-skill-directory server="server.a" serverLabel="Server A" skill="skill://pdf-processing/SKILL.md" path="">',
+			'Listed from the skill\'s verified file manifest. Paths are relative to skill://pdf-processing/.',
+			'<entries>SKILL.md\nreferences/\ntemplates/</entries>',
+			'</mcp-skill-directory>',
+		].join('\n'));
+		assert.ok(text((await listDirectory(a, 'templates/')).result!).includes('<entries>templates/invoice.md\ntemplates/regional/</entries>'));
+		assert.ok(text((await listDirectory(a, 'skill://pdf-processing/templates/regional')).result!).includes('<entries>templates/regional/eu.md</entries>'));
+		assert.ok(text((await listDirectory(a, 'skill://pdf-processing')).result!).includes('<entries>SKILL.md\nreferences/\ntemplates/</entries>'));
+		assert.ok(text((await listDirectory(a, 'missing')).result!).includes('(empty directory)'));
+
+		assert.ok((await listDirectory(a, '../other')).result?.toolResultError);
+		assert.ok(text((await listDirectory(b, 'skill://pdf-processing/templates')).result!).includes('belongs to a skill of another MCP server'));
+		assert.ok((await listDirectory(a, undefined, OTHER_SESSION)).result?.toolResultError, 'only in the chat that loaded the skill');
+		assert.deepStrictEqual({ a: a.directoryReads, b: b.directoryReads }, { a: [], b: [] });
+	});
+
+	test('directory listing: a dynamic skill is listed by its server (resources/directory/read), as untrusted input, without children outside the directory', async () => {
+		const live = await servedSkill('live-report', 'Generated report', { dynamic: true });
+		const a = new FakeServer('server.a', 'Server A', [live]);
+		a.directories = {
+			'skill://live-report': [
+				{ uri: 'skill://live-report/SKILL.md', name: 'SKILL.md', mimeType: 'text/markdown' },
+				{ uri: 'skill://live-report/data', name: 'data', mimeType: McpSkills.DIRECTORY_MIME_TYPE },
+				{ uri: 'skill://other-skill/secret.md', name: 'secret.md' },
+				{ uri: 'skill://live-report/data/deep.csv', name: 'deep.csv' },
+			],
+		};
+		mcpService.servers.set([a.server], undefined);
+		await load(a, live.entry.uri);
+
+		const listing = text((await listDirectory(a, '')).result!);
+		assert.ok(listing.includes('Listed by the MCP server "Server A": untrusted input from that server.'), listing);
+		assert.ok(listing.includes('<entries>SKILL.md\ndata/</entries>'), listing);
+		assert.deepStrictEqual(a.directoryReads, ['skill://live-report']);
+	});
+
+	test('a revoked approval asks again; revokeAll clears every approval; approved() lists them by server and URI', async () => {
+		const pdf = await servedSkill('pdf-processing', 'Work with PDFs', { files: { 'references/GUIDE.md': 'Guide.\n' } });
+		const refunds = await servedSkill('acme/billing/refunds', 'Refunds');
+		const a = new FakeServer('server.a', 'Server A', [pdf, refunds]);
+		mcpService.servers.set([a.server], undefined);
+		await load(a, pdf.entry.uri);
+		await load(a, refunds.entry.uri);
+		assert.deepStrictEqual(chatSkills.approvals.approved(), [{ serverId: 'server.a', uri: pdf.entry.uri }, { serverId: 'server.a', uri: refunds.entry.uri }]);
+		assert.strictEqual((await load(a, pdf.entry.uri, { confirm: false })).gate, undefined, 'approved');
+
+		assert.strictEqual(chatSkills.approvals.revoke('server.a', pdf.entry.uri), true);
+		assert.strictEqual(chatSkills.approvals.revoke('server.a', pdf.entry.uri), false);
+		assert.ok((await load(a, pdf.entry.uri, { confirm: false })).gate, 'asks again after a revoke');
+		assert.strictEqual((await load(a, refunds.entry.uri, { confirm: false })).gate, undefined, 'the other approval stays');
+
+		assert.strictEqual(chatSkills.approvals.revokeAll(), 1);
+		assert.deepStrictEqual(chatSkills.approvals.approved(), []);
+		assert.ok((await load(a, refunds.entry.uri, { confirm: false })).gate);
+	});
+
+	test('a skill the user disabled is not loaded, and a loaded one is no longer read or listed', async () => {
+		const pdf = await servedSkill('pdf-processing', 'Work with PDFs', { files: { 'references/GUIDE.md': 'Guide.\n' } });
+		const a = new FakeServer('server.a', 'Server A', [pdf]);
+		mcpService.servers.set([a.server], undefined);
+		await load(a, pdf.entry.uri);
+		const readsBefore = a.reads.length;
+
+		disabledSkills.add(McpResourceURI.fromServer(a.server.definition, pdf.entry.uri));
+		const loading = await load(a, pdf.entry.uri);
+		assert.strictEqual(loading.gate, undefined, 'no approval is asked for a skill that cannot load');
+		assert.ok(text(loading.result!).includes('The user disabled the skill skill://pdf-processing/SKILL.md'));
+		assert.ok((await readFile(a, 'references/GUIDE.md')).result?.toolResultError);
+		assert.ok((await listDirectory(a, undefined)).result?.toolResultError);
+		assert.strictEqual(a.reads.length, readsBefore, 'nothing is read');
 	});
 
 	test('skill content cannot close the element that tags its origin', async () => {
