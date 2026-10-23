@@ -52,6 +52,7 @@ suite('MCP configuration schema: gRPC servers', () => {
 			auto: /^The default: the JSON-RPC tunnel, exactly as `tunnel`\. VS Code never switches to the typed service on its own\.$/.test(binding.markdownEnumDescriptions?.[0] ?? ''),
 			typedOnRequest: /Set `typed` for a server that only offers the typed service/.test(binding.markdownDescription ?? ''),
 			fallback: texts.some(text => /fall(s)? ?back|tries the tunnel first|(?<!never )switches to the typed/i.test(text)),
-		}, { enum: ['auto', 'tunnel', 'typed'], default: 'auto', auto: true, typedOnRequest: true, fallback: false });
+			typedWithTunnel: /the rest through the tunnel on the same connection/.test(binding.markdownEnumDescriptions?.[3] ?? ''),
+		}, { enum: ['auto', 'tunnel', 'typed', 'typed-with-tunnel'], default: 'auto', auto: true, typedOnRequest: true, fallback: false, typedWithTunnel: true });
 	});
 });

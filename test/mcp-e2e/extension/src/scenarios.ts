@@ -27,7 +27,8 @@ function callTest(h: E2eHarness, name: string, group: string, label: string, too
 }
 
 /** The tools every server of a family must list (a schema regression drops single tools, not all). */
-const REQUIRED_TOOLS: Record<'zig' | 'everything', readonly string[]> = {
+const REQUIRED_TOOLS: Record<'zig' | 'everything' | 'skills', readonly string[]> = {
+	skills: ['skills_info'],
 	zig: ['test_simple_text', 'greet', 'test_x_mcp_header', 'json_schema_2020_12_tool', 'slow_compute', 'test_input_required_result_sampling'],
 	everything: ['echo', 'get-sum', 'trigger-sampling-request'],
 };
@@ -148,6 +149,86 @@ function urlElicitationScenario(h: E2eHarness, action: 'accept' | 'decline'): IT
 				ctx.details.browser = opened();
 				assert(!opened().length, `the declined URL was opened: ${JSON.stringify(opened())}`);
 			}
+		},
+	};
+}
+
+/** The server of the Skills extension (SEP-2640): runner/skills-server.ts. */
+const SKILLS_SERVER = 'skills-stdio';
+/** The chat tools of MCP-served skills (src/vs/workbench/contrib/mcp/common/mcpSkillsChat.ts McpSkillToolId). */
+const READ_SKILL = 'vscode_mcp_read_skill';
+const READ_SKILL_FILE = 'vscode_mcp_read_skill_file';
+const LIST_SKILL_DIRECTORY = 'vscode_mcp_list_skill_directory';
+
+/**
+ * Skills served by an MCP server, through the chat tools outside chat: loading a skill asks for the
+ * user's approval in a modal dialog (the UI driver answers Yes), once for a skill with a manifest and
+ * on every load of a dynamic one; the loaded skill's files are listed and read from its own server
+ * and verified against its entry. The UI driver checks that exactly three dialogs were answered.
+ */
+function skillsScenario(h: E2eHarness): ITestCase {
+	const invoke = async (ctx: ITestContext, tool: string, input: Record<string, unknown>): Promise<string> => {
+		let text = '';
+		let error: unknown;
+		try {
+			text = textOf(await vscode.lm.invokeTool(tool, { input, toolInvocationToken: undefined }));
+		} catch (e) {
+			error = e;
+		}
+		const calls = (ctx.details.skillCalls as unknown[] | undefined) ?? [];
+		calls.push({ tool, input, text: text.slice(0, 2000), error: error === undefined ? undefined : errorText(error) });
+		ctx.details.skillCalls = calls;
+		assert(error === undefined, `${tool} ${JSON.stringify(input)} failed: ${errorText(error)}`);
+		return text;
+	};
+	const expectIn = (text: string, what: string, expected: readonly string[]) => {
+		for (const e of expected) {
+			assert(text.includes(e), `${what} returned ${JSON.stringify(text.slice(0, 600))}, which does not contain ${JSON.stringify(e)}`);
+		}
+	};
+	return {
+		name: `skills (${SKILLS_SERVER}, stdio, 2026-07-28, SEP-2640): loading a skill asks for approval once (a dynamic skill on every load), enters context tagged with its server, and its directories and files are listed and read from that server and verified`,
+		group: 'skills',
+		timeoutMs: 180_000,
+		fn: async ctx => {
+			const outcome = await h.startServer(SKILLS_SERVER);
+			assert(outcome.tools > 0, `${SKILLS_SERVER} did not start: ${outcome.error}; log: ${JSON.stringify(outcome.logLines)}`);
+			const server = definitionIdOf(h.server(SKILLS_SERVER));
+			const from = h.serverLog(SKILLS_SERVER).length;
+			for (const tool of [READ_SKILL, READ_SKILL_FILE, LIST_SKILL_DIRECTORY]) {
+				assert(vscode.lm.tools.some(t => t.name === tool), `the tool ${tool} is not registered`);
+			}
+
+			// Before a load, the file and directory tools have nothing to act on (and read nothing).
+			const early = await vscode.lm.invokeTool(LIST_SKILL_DIRECTORY, { input: { server }, toolInvocationToken: undefined }).then(textOf, e => errorText(e));
+			expectIn(early, 'listing before a load', ['Load the skill with readMcpSkill first']);
+
+			// A skill with a manifest: the first load asks (dialog 1), the second does not.
+			const pdf = 'skill://pdf-processing/SKILL.md';
+			const loaded = await invoke(ctx, READ_SKILL, { server, uri: pdf });
+			expectIn(loaded, 'loading pdf-processing', [`<mcp-skill server="${server}"`, 'untrusted input from that server', 'E2E-MARKER: pdf-processing instructions.', 'references/FORMS.md', 'templates/regional/eu-invoice.md']);
+			expectIn(await invoke(ctx, READ_SKILL, { server, uri: pdf }), 'loading pdf-processing again', ['E2E-MARKER: pdf-processing instructions.']);
+			expectIn(await invoke(ctx, LIST_SKILL_DIRECTORY, { server }), 'listing the root of pdf-processing', ['verified file manifest', 'SKILL.md\nreferences/\ntemplates/']);
+			expectIn(await invoke(ctx, LIST_SKILL_DIRECTORY, { server, uri: 'templates' }), 'listing templates', ['templates/invoice.md\ntemplates/regional/']);
+			expectIn(await invoke(ctx, READ_SKILL_FILE, { server, uri: 'references/FORMS.md' }), 'reading references/FORMS.md', ['E2E-MARKER: how to fill PDF forms.']);
+
+			// A dynamic skill: every load asks (dialogs 2 and 3); its files are found with resources/directory/read.
+			const live = 'skill://live-report/SKILL.md';
+			expectIn(await invoke(ctx, READ_SKILL, { server, uri: live }), 'loading live-report', ['# Live report']);
+			const listing = await invoke(ctx, LIST_SKILL_DIRECTORY, { server, uri: 'skill://live-report' });
+			expectIn(listing, 'listing live-report', ['untrusted input from that server', 'SKILL.md\ndata/']);
+			expectIn(await invoke(ctx, READ_SKILL_FILE, { server, uri: 'skill://live-report/data/summary.md' }), 'reading data/summary.md', ['E2E-MARKER: generated summary.']);
+			expectIn(await invoke(ctx, READ_SKILL, { server, uri: live }), 'loading live-report again', ['# Live report']);
+
+			const methods = await waitFor('the skill requests in the MCP log', 10_000, () => {
+				const sent = sentMethods(h.serverLog(SKILLS_SERVER), from);
+				return sent.filter(m => m === 'resources/read').length >= 5 ? sent : undefined;
+			});
+			ctx.details.sentMethods = methods;
+			const count = (method: string) => methods.filter(m => m === method).length;
+			// pdf-processing twice (SKILL.md each), FORMS.md, live-report twice, summary.md: listing reads no file.
+			assert(count('resources/read') === 6, `expected 6 resources/read (two loads of pdf-processing, FORMS.md, two loads of live-report, summary.md), got ${count('resources/read')}: ${methods.join(', ')}`);
+			assert(count('resources/directory/read') === 1, `expected one resources/directory/read (the dynamic skill only; a manifest is listed locally), got ${count('resources/directory/read')}`);
 		},
 	};
 }
@@ -947,6 +1028,7 @@ export function uiScenarios(h: E2eHarness): Map<string, ITestCase> {
 			assert(taskResultText(run.polls.at(-1)!.response).includes('Deleted e2e.txt'), `the completed task carries ${JSON.stringify(run.polls.at(-1)!.response?.message.result)}`);
 		},
 	});
+	scenarios.set('mcp-skills', skillsScenario(h));
 	for (const [id, test] of oauthScenarios(h)) {
 		scenarios.set(id, test);
 	}

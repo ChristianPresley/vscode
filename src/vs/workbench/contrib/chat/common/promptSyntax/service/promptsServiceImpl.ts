@@ -1109,7 +1109,12 @@ export class PromptsService extends Disposable implements IPromptsService {
 		if (this.agentSkillProviders.size === 0) {
 			return result;
 		}
-		return mergeProvidedSkills(result, await this.provideSkills(token));
+		const disabledSkills = this.getDisabledPromptFiles(PromptsType.skill);
+		return mergeProvidedSkills(result, (await this.provideSkills(token)).filter(skill => !disabledSkills.has(skill.uri)));
+	}
+
+	public async getProvidedAgentSkills(token: CancellationToken): Promise<readonly IAgentSkill[]> {
+		return this.agentSkillProviders.size === 0 ? [] : this.provideSkills(token);
 	}
 
 	private async provideSkills(token: CancellationToken): Promise<IAgentSkill[]> {

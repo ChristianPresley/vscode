@@ -53,6 +53,15 @@ import { MCP_OAUTH_MAX_CHALLENGE_CYCLES } from '../common/mcpOAuthClientFactory.
  * with a synthesized result (with the `serverInfo` and `instructions` of the
  * server's first ListTools response) and the second with -32601.
  *
+ * `binding: 'typed-with-tunnel'` speaks the typed service for the methods it
+ * has an RPC for, and the tunnel of the same connection for the rest:
+ * `server/discover`, `subscriptions/listen`, the notifications and the
+ * extension methods (the Skills extension's `skills/list`, `skills/get` and
+ * `resources/directory/read`, the task methods), as the zig-sdk client does
+ * with `fallback = .tunnel`. When the tunnel's `server/discover` finds no
+ * tunnel, the handle answers it as on the typed binding and sends everything
+ * else there for the rest of the connection.
+ *
  * As on the other transports, the handle never invents JSON-RPC errors for
  * transport conditions: a JSON-RPC error the server put in the trailers
  * (`mcp-error-bin`, else `mcp-error-code`) is delivered as a message, and a
@@ -802,9 +811,14 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 	private readonly _secure: boolean;
 	/**
 	 * The binding the handle speaks, fixed for its lifetime: `typed` only with
-	 * `binding: 'typed'`; `auto` (the default) and `tunnel` speak the tunnel.
+	 * `binding: 'typed'` or `'typed-with-tunnel'`; `auto` (the default) and
+	 * `tunnel` speak the tunnel.
 	 */
 	readonly binding: 'tunnel' | 'typed';
+	/** With `binding: 'typed-with-tunnel'`: the methods without a typed RPC go on the tunnel. */
+	readonly tunnelFallback: boolean;
+	/** Set when the tunnel's `server/discover` found no tunnel: the fallback is off for the rest of the connection. */
+	private _tunnelMissing = false;
 	private _channel: Promise<IMcpGrpcChannel> | undefined;
 	/** In-flight requests by {@link requestKey}, for {@link cancelRequest}. */
 	private readonly _requests = new Map<string, IActiveCall>();
@@ -833,7 +847,8 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 		this._authority = authority.slice(authority.lastIndexOf('@') + 1);
 		this._host = authorityHost(this._authority);
 		this._secure = _launch.uri.scheme === 'grpcs';
-		this.binding = _launch.binding === 'typed' ? 'typed' : 'tunnel';
+		this.binding = _launch.binding === 'typed' || _launch.binding === 'typed-with-tunnel' ? 'typed' : 'tunnel';
+		this.tunnelFallback = _launch.binding === 'typed-with-tunnel';
 		this._register(toDisposable(() => {
 			this._abortCtrl.abort();
 			this._cancelAll();
@@ -934,7 +949,7 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 		this._requests.set(key, active);
 		this._active.add(active);
 		try {
-			if (this.binding === 'typed') {
+			if (this.binding === 'typed' && !this._usesTunnelFallback(method)) {
 				await this._sendTyped(id, method, params, envelope, active);
 			} else {
 				await this._sendTunnel(text, id, method, params, envelope, active);
@@ -958,7 +973,7 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 	}
 
 	private async _sendNotification(text: string, method: string, envelope: IMcpMessageEnvelope | undefined): Promise<void> {
-		if (this.binding === 'typed') {
+		if (this.binding === 'typed' && !this._usesTunnelFallback(method)) {
 			this._log(LogLevel.Debug, `The typed gRPC binding has no RPC for the notification ${method}; dropping it`);
 			return;
 		}
@@ -977,6 +992,11 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 		} finally {
 			this._active.delete(active);
 		}
+	}
+
+	/** Whether a message of `method` goes on the tunnel although the handle speaks the typed binding. */
+	private _usesTunnelFallback(method: string): boolean {
+		return this.tunnelFallback && !this._tunnelMissing && !typedRpcForMethod(method);
 	}
 
 	/**
@@ -1012,6 +1032,13 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 			return;
 		}
 		if (method === 'server/discover' && isMissingTunnel(trailers)) {
+			if (this.tunnelFallback) {
+				// typed-with-tunnel on a typed-only server: the typed binding alone, as with `binding: 'typed'`.
+				this._log(LogLevel.Info, `${this._authority} does not serve the JSON-RPC tunnel; the methods without a typed RPC are not available on this connection`);
+				this._tunnelMissing = true;
+				await this._sendTyped(id, method, params, envelope, active);
+				return;
+			}
 			// A gRPC server without the tunnel service (an HTTP 404, any non-200, is no gRPC server
 			// at all and fails below as a transport error). It may serve the typed service, but
 			// only an explicit `binding: 'typed'` uses that.

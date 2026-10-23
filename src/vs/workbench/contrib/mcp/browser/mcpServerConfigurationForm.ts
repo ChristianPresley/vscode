@@ -409,10 +409,11 @@ export class McpServerConfigurationForm extends Disposable {
 				{ text: 'auto', tooltip: localize('mcpForm.grpc.binding.auto.tooltip', "The default: the JSON-RPC tunnel, as tunnel. VS Code never switches to the typed service on its own") },
 				{ text: 'tunnel', tooltip: localize('mcpForm.grpc.binding.tunnel.tooltip', "Send JSON-RPC messages through the mcp.zig.transport.v1.Mcp/Call tunnel") },
 				{ text: 'typed', tooltip: localize('mcpForm.grpc.binding.typed.tooltip', "Call the typed model_context_protocol.Mcp service methods, for a server that does not offer the tunnel") },
+				{ text: 'typed-with-tunnel', tooltip: localize('mcpForm.grpc.binding.typedWithTunnel.tooltip', "Call the typed service methods, and use the tunnel for discovery, subscriptions, notifications and extension methods such as skills") },
 			],
 		}));
 		bindingField.appendChild(this.bindingRadio.domNode);
-		this.appendHint(bindingField, localize('mcpForm.grpc.binding.hint', "Which gRPC service the server implements. auto and tunnel use the JSON-RPC tunnel; choose typed only for a server that offers just the typed service."));
+		this.appendHint(bindingField, localize('mcpForm.grpc.binding.hint', "Which gRPC service the server implements. auto and tunnel use the JSON-RPC tunnel; choose typed only for a server that offers just the typed service, and typed-with-tunnel for a server that offers both."));
 		this._register(this.bindingRadio.onDidSelect(index => {
 			if (this.state) {
 				const binding = mcpServerFormGrpcBindings[index];
