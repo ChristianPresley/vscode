@@ -563,8 +563,9 @@ const REDACTED = '[redacted]';
  */
 export function redact(text: string): string {
 	return text
-		// Everything after the scheme is a credential unless it is a known challenge parameter.
-		.replace(/\b(Bearer|Basic|DPoP)\s+(?!(?:realm|scope|error|error_description|error_uri|resource_metadata|algs|charset)\s*=)[^\s,;"'`]+/gi, `$1 ${REDACTED}`)
+		// Everything after the scheme is a credential unless it is a known challenge parameter, or a
+		// word of the message itself standing alone ("a bearer token", "asked for a DPoP nonce").
+		.replace(/\b(Bearer|Basic|DPoP)\s+(?!(?:realm|scope|error|error_description|error_uri|resource_metadata|algs|charset)\s*=)(?!(?:tokens?|proofs?|nonces?|keys?|challenges?|schemes?|authentication)[.:)]?(?:[\s,;"'`]|$))[^\s,;"'`]+/gi, `$1 ${REDACTED}`)
 		.replace(/\b(location)\s*[:=]\s*[^\s,;"'`]+/gi, `$1: ${REDACTED}`)
 		.replace(/"([A-Za-z_]*(?:token|secret|password|assertion)|code|code_verifier)"\s*:\s*"[^"]*"/gi, `"$1":"${REDACTED}"`)
 		.replace(/(^|[?&;,\s])([A-Za-z_]*(?:token|secret|password|assertion)|code|code_verifier)=[^&\s;"'`]*/gi, `$1$2=${REDACTED}`);

@@ -1119,6 +1119,22 @@ suite('OAuthClient', () => {
 			assert.strictEqual(redact('grant_type=refresh_token&refresh_token=r&subject_token=s&token_type_hint=x'), 'grant_type=refresh_token&refresh_token=[redacted]&subject_token=[redacted]&token_type_hint=x');
 		});
 
+		test('redact keeps the words of a message that follow a scheme name, not credentials that start like them', () => {
+			for (const message of [
+				'the token endpoint https://as.example.test/token asked for a DPoP nonce; sending the request again',
+				'the token endpoint https://as.example.test/token issued a bearer token for a request with a DPoP proof',
+				'the stored tokens for https://mcp.example.test/mcp are bound to another DPoP key; forgetting them',
+				'a DPoP key.',
+				'the server sent a Bearer challenge',
+			]) {
+				assert.strictEqual(redact(message), message);
+			}
+			assert.strictEqual(redact('Authorization: DPoP nonce123'), 'Authorization: DPoP [redacted]');
+			assert.strictEqual(redact('Authorization: Bearer key-1'), 'Authorization: Bearer [redacted]');
+			assert.strictEqual(redact('Authorization: Bearer token.abc'), 'Authorization: Bearer [redacted]');
+			assert.strictEqual(redact('Authorization: Bearer proof:x'), 'Authorization: Bearer [redacted]');
+		});
+
 		test('the log never contains tokens, codes, verifiers or secrets', async () => {
 			const fixture = createOAuthFixture({ as: { tokenEndpointAuthMethodsSupported: ['client_secret_basic'], tokenLifetimeSeconds: 100, clientIdMetadataDocumentSupported: true, rejectCimdClientAt: 'token' } });
 			let now = 0;
