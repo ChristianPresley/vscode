@@ -94,6 +94,7 @@ export function sourceToIcon(source: AICustomizationSource): ThemeIcon {
 		case AICustomizationSources.extension: return extensionIcon;
 		case AICustomizationSources.plugin: return pluginIcon;
 		case AICustomizationSources.builtin: return builtinIcon;
+		case AICustomizationSources.mcp: return mcpServerIcon;
 		default: return instructionsIcon;
 	}
 }

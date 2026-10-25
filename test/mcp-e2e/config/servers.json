@@ -1,5 +1,5 @@
 {
-	"$comment": "The MCP servers of the end-to-end run. runner/prepare-profile.ts writes the 'mcp' entries into the user-level mcp.json, runner/start-servers.ts starts the 'process' entries inside the test container (a 'command' with its 'port'; in front of it, or of 'upstreamPort' for an entry without a command: runner/grpc-log-proxy.ts for 'grpcLogProxy', runner/http-fault-proxy.ts for 'httpProxy', runner/oauth-fixture.ts for 'oauthFixture'), and the suite reads the expectations. {zig} and {everything} are replaced with the zig-sdk conformance server and the server-everything entry point, {tlsCa} with the CA certificate runner/test-ca.ts generates at run time. 'expectConnectError' marks a negative entry (VS Code must fail to connect; 'sharesProcessOf' names the entry whose process and logs it uses), 'ownTest' an entry that only its own test starts, 'suite': 'ui' one that only the UI suite starts (its sign-in needs a dialog answered), 'provider' one that the E2E extension defines through the API instead of mcp.json.",
+	"$comment": "The MCP servers of the end-to-end run. runner/prepare-profile.ts writes the 'mcp' entries into the user-level mcp.json, runner/start-servers.ts starts the 'process' entries inside the test container (a 'command' with its 'port'; in front of it, or of 'upstreamPort' for an entry without a command: runner/grpc-log-proxy.ts for 'grpcLogProxy', runner/http-fault-proxy.ts for 'httpProxy', runner/oauth-fixture.ts for 'oauthFixture'), and the suite reads the expectations. {zig} and {everything} are replaced with the zig-sdk conformance server and the server-everything entry point, {runner} with the runner/ folder of this suite, {tlsCa} with the CA certificate runner/test-ca.ts generates at run time. 'expectConnectError' marks a negative entry (VS Code must fail to connect; 'sharesProcessOf' names the entry whose process and logs it uses), 'ownTest' an entry that only its own test starts, 'suite': 'ui' one that only the UI suite starts (its sign-in needs a dialog answered), 'provider' one that the E2E extension defines through the API instead of mcp.json.",
 	"servers": [
 		{
 			"label": "zig-stdio",
@@ -621,6 +621,22 @@
 				"tls": {
 					"ca": "{tlsCa}"
 				}
+			}
+		},
+		{
+			"label": "skills-stdio",
+			"transport": "stdio",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "skills",
+			"suite": "ui",
+			"$comment": "runner/skills-server.ts: the Skills extension (SEP-2640) with directoryRead, two skills with a manifest and one dynamic skill. Only the UI suite starts it: loading a skill asks for the user's approval in a modal dialog, which the UI driver answers.",
+			"mcp": {
+				"type": "stdio",
+				"command": "node",
+				"args": [
+					"{runner}/skills-server.ts"
+				]
 			}
 		}
 	]

@@ -4336,6 +4336,8 @@ export enum McpGrpcBinding {
 	Tunnel = 2,
 	/** Google's typed `model_context_protocol.Mcp` service, only when it is asked for. */
 	Typed = 3,
+	/** The typed service for the methods it has, the tunnel for the rest (discovery, subscriptions, notifications, extension methods). */
+	TypedWithTunnel = 4,
 }
 
 export class McpGrpcServerDefinition extends McpHttpServerDefinition implements vscode.McpGrpcServerDefinition {

@@ -29,6 +29,15 @@ declare module 'vscode' {
 		 * subscriptions, notifications, pagination beyond the first page or tasks.
 		 */
 		Typed = 3,
+		/**
+		 * Call the typed service for the methods it has, and send the rest through
+		 * the tunnel on the same connection: discovery, subscriptions,
+		 * notifications and extension methods such as the Skills extension's
+		 * `skills/list`, `skills/get` and `resources/directory/read`. For servers
+		 * that offer both services; with a server that has no tunnel it works as
+		 * {@link McpGrpcBinding.Typed Typed}.
+		 */
+		TypedWithTunnel = 4,
 	}
 
 	/**

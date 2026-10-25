@@ -123,8 +123,7 @@ export class PromptsServiceCustomizationItemProvider implements ICustomizationIt
 			const seenUris = new ResourceSet();
 			for (const skill of skills || []) {
 				if (skill.mcp) {
-					// MCP-served skills (SEP-2640) are no files this view can open or toggle
-					continue;
+					continue; // listed below, the disabled ones included
 				}
 				const skillName = skill.name || basename(dirname(skill.uri)) || basename(skill.uri);
 				seenUris.add(skill.uri);
@@ -160,6 +159,9 @@ export class PromptsServiceCustomizationItemProvider implements ICustomizationIt
 					}
 				}
 			}
+			if (skills) {
+				items.push(...await this.provideMcpSkills(disabledUris, token));
+			}
 		} else if (promptType === PromptsType.prompt) {
 			const commands = await this.promptsService.getPromptSlashCommands(token);
 			for (const command of commands) {
@@ -189,6 +191,30 @@ export class PromptsServiceCustomizationItemProvider implements ICustomizationIt
 		}
 
 		return this.applyBuiltinGroupKeys(items, extensionInfoByUri);
+	}
+
+	/**
+	 * The skills MCP servers serve (Skills extension, SEP-2640): read-only rows
+	 * in their own group, named with the server that serves them. Opening one
+	 * shows its `SKILL.md` from the server; enabling and disabling go through
+	 * the disabled skills, which the skill list of chat leaves out.
+	 */
+	private async provideMcpSkills(disabledUris: ResourceSet, token: CancellationToken): Promise<ICustomizationItem[]> {
+		const provided = await this.promptsService.getProvidedAgentSkills(token);
+		return provided.filter(skill => skill.mcp).map(skill => ({
+			uri: skill.uri,
+			type: PromptsType.skill,
+			name: skill.name,
+			description: skill.description,
+			source: PromptsStorage.mcp,
+			groupKey: PromptsStorage.mcp,
+			enabled: !disabledUris.has(skill.uri),
+			extensionId: undefined,
+			pluginUri: undefined,
+			badge: skill.mcp!.serverLabel,
+			badgeTooltip: localize('mcpSkillBadgeTooltip', "Served by the MCP server '{0}' as {1}", skill.mcp!.serverLabel, skill.mcp!.skillUri),
+			userInvocable: false,
+		}));
 	}
 
 	private async fetchPromptServiceHooks(items: ICustomizationItem[], disabledUris: ResourceSet, promptType: PromptsType): Promise<void> {

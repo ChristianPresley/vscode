@@ -23,7 +23,7 @@ export const enum McpServerFormKind {
 }
 
 /** The gRPC bindings the form offers, in display order. */
-export const mcpServerFormGrpcBindings: readonly McpGrpcBinding[] = ['auto', 'tunnel', 'typed'];
+export const mcpServerFormGrpcBindings: readonly McpGrpcBinding[] = ['auto', 'tunnel', 'typed', 'typed-with-tunnel'];
 
 export interface IMcpServerFormKeyValue {
 	name: string;

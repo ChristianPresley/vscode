@@ -21,7 +21,7 @@ export interface IE2eServer {
 	readonly transport: E2eTransport;
 	readonly era: 'modern' | 'legacy';
 	readonly protocolVersion: string;
-	readonly family: 'zig' | 'everything';
+	readonly family: 'zig' | 'everything' | 'skills';
 	readonly grpc?: boolean;
 	readonly pinned?: boolean;
 	readonly mcp?: { readonly type: string; readonly url?: string; readonly protocolVersion?: string; readonly deadlineMs?: number };

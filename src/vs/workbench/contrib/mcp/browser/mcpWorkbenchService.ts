@@ -137,7 +137,7 @@ function sanitizeMcpServerConfiguration(payload: Record<string, unknown>): IMcpS
 			...common,
 			...(headers ? { headers } : {}),
 			...(tls ? { tls } : {}),
-			...(payload.binding === 'auto' || payload.binding === 'tunnel' || payload.binding === 'typed' ? { binding: payload.binding } : {}),
+			...(payload.binding === 'auto' || payload.binding === 'tunnel' || payload.binding === 'typed' || payload.binding === 'typed-with-tunnel' ? { binding: payload.binding } : {}),
 			...(isNumber(payload.deadlineMs) && payload.deadlineMs >= 0 ? { deadlineMs: payload.deadlineMs } : {}),
 			...(isNumber(payload.keepAliveMs) && payload.keepAliveMs >= 0 ? { keepAliveMs: payload.keepAliveMs } : {}),
 			...(oauth ? { oauth } : {}),

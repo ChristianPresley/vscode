@@ -35,4 +35,6 @@ export const enum McpCommandIds {
 	StartPromptForServer = 'workbench.mcp.startPromptForServer',
 	StartServer = 'workbench.mcp.startServer',
 	StopServer = 'workbench.mcp.stopServer',
+	RevokeSkillApproval = 'workbench.mcp.revokeSkillApproval',
+	RevokeAllSkillApprovals = 'workbench.mcp.revokeAllSkillApprovals',
 }

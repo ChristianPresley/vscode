@@ -4191,6 +4191,7 @@ export namespace McpGrpcBinding {
 			case types.McpGrpcBinding.Auto: return 'auto';
 			case types.McpGrpcBinding.Tunnel: return 'tunnel';
 			case types.McpGrpcBinding.Typed: return 'typed';
+			case types.McpGrpcBinding.TypedWithTunnel: return 'typed-with-tunnel';
 			default: return undefined;
 		}
 	}
@@ -4200,6 +4201,7 @@ export namespace McpGrpcBinding {
 			case 'auto': return types.McpGrpcBinding.Auto;
 			case 'tunnel': return types.McpGrpcBinding.Tunnel;
 			case 'typed': return types.McpGrpcBinding.Typed;
+			case 'typed-with-tunnel': return types.McpGrpcBinding.TypedWithTunnel;
 			default: return undefined;
 		}
 	}

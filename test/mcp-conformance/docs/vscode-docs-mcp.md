@@ -35,7 +35,7 @@ You can also run **MCP: Add Server** from the Command Palette and select **gRPC*
 | `tls.ca` | string | Path to a PEM file of certificate authorities that verify the server certificate, in addition to the system roots. Variables such as `${workspaceFolder}` are resolved. |
 | `tls.serverName` | string | The host name sent in the TLS handshake (SNI) and checked against the certificate, when it differs from the host in `url`. |
 | `tls.insecure` | boolean | Skips the verification of the server certificate. Only for local development. When your organization restricts MCP servers with an allow list, `tls.insecure` is not allowed. |
-| `binding` | `"auto"`, `"tunnel"` or `"typed"` | The gRPC service the server implements. `tunnel` sends MCP's JSON-RPC messages through the `mcp.zig.transport.v1.Mcp/Call` method. `typed` calls Google's typed `model_context_protocol.Mcp` service. `auto` (the default) is the tunnel: VS Code never switches to the typed service on its own. Set `typed` for a server that only offers the typed service. |
+| `binding` | `"auto"`, `"tunnel"`, `"typed"` or `"typed-with-tunnel"` | The gRPC service the server implements. `tunnel` sends MCP's JSON-RPC messages through the `mcp.zig.transport.v1.Mcp/Call` method. `typed` calls Google's typed `model_context_protocol.Mcp` service. `typed-with-tunnel` calls the typed service for the methods it has and sends the rest through the tunnel on the same connection. `auto` (the default) is the tunnel: VS Code never switches to the typed service on its own. Set `typed` for a server that only offers the typed service. |
 | `deadlineMs` | number | The deadline of every call, in milliseconds (more than 0). Without it, discovery, listing, reading resources, prompts and completions time out after 60 seconds, and tool calls have no deadline. |
 | `keepAliveMs` | number | The interval between HTTP/2 keep-alive pings, in milliseconds, at least `300000` (5 minutes): gRPC servers close connections that ping more often. The pings are sent only while at least one call is open; if the server still answers with `too_many_pings`, the interval is doubled for the next connection. `0` sends no pings at all. Without it, a ping is sent every 5 minutes and 10 seconds only while a `subscriptions/listen` stream is open, so that a NAT or load balancer does not cut a stream that has no events for a while. |
 | `oauth` | object | OAuth settings, as for `http` servers (see [OAuth settings](#oauth-settings)). |
@@ -52,6 +52,8 @@ When the server sent a reason with its `UNIMPLEMENTED` (a `grpc-message`), the f
 ```text
 The gRPC server at host:port answered a call to the MCP JSON-RPC tunnel service (mcp.zig.transport.v1.Mcp) with UNIMPLEMENTED: "unknown service mcp.zig.transport.v1.Mcp". If it only offers Google's typed MCP service, set "binding": "typed" in its configuration, or, if an extension provides the server, ask its author to use McpGrpcBinding.Typed.
 ```
+
+The typed service has no method for `server/discover`, `subscriptions/listen`, the notifications or the methods of extensions such as Skills (`skills/list`, `skills/get`, `resources/directory/read`). For a server that offers both services, `typed-with-tunnel` calls the typed methods and sends those through the tunnel, so the server's skills, subscriptions and notifications work. If the server has no tunnel after all, the connection works as with `typed`.
 
 For a server that an extension provides, the extension sets the binding (`McpGrpcBinding.Typed` in its `McpGrpcServerDefinition`); you cannot change it in `mcp.json`.
 

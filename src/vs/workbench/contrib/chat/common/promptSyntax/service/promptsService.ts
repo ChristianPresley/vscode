@@ -506,6 +506,7 @@ export interface IAgentSkillProvider {
 export const enum McpSkillToolReferenceName {
 	ReadSkill = 'readMcpSkill',
 	ReadSkillFile = 'readMcpSkillFile',
+	ListSkillDirectory = 'listMcpSkillDirectory',
 }
 
 /**
@@ -800,6 +801,14 @@ export interface IPromptsService extends IDisposable {
 	 * Gets list of agent skills files.
 	 */
 	findAgentSkills(token: CancellationToken): Promise<IAgentSkill[] | undefined>;
+
+	/**
+	 * The skills of the registered providers ({@link registerAgentSkillProvider}),
+	 * the disabled ones included, under the names their providers gave them.
+	 * {@link findAgentSkills} leaves out a provided skill whose URI is among the
+	 * disabled skills ({@link getDisabledPromptFiles}).
+	 */
+	getProvidedAgentSkills(token: CancellationToken): Promise<readonly IAgentSkill[]>;
 
 	/**
 	 * Registers a provider whose skills {@link findAgentSkills} lists next to

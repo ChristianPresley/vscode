@@ -433,14 +433,15 @@ export const mcpGrpcServerSchema: IJSONSchema = {
 		},
 		binding: {
 			type: 'string',
-			enum: ['auto', 'tunnel', 'typed'],
+			enum: ['auto', 'tunnel', 'typed', 'typed-with-tunnel'],
 			default: 'auto',
 			markdownEnumDescriptions: [
 				localize('app.mcp.json.grpc.binding.auto', "The default: the JSON-RPC tunnel, exactly as `tunnel`. VS Code never switches to the typed service on its own."),
 				localize('app.mcp.json.grpc.binding.tunnel', "Send the JSON-RPC messages through the `mcp.zig.transport.v1.Mcp/Call` tunnel."),
 				localize('app.mcp.json.grpc.binding.typed', "Call the methods of Google's typed `model_context_protocol.Mcp` service, for a server that does not offer the tunnel. The typed service carries no subscriptions, notifications, pagination beyond the first page or tasks."),
+				localize('app.mcp.json.grpc.binding.typedWithTunnel', "Call the typed service for the methods it has, and send the rest through the tunnel on the same connection: `server/discover`, `subscriptions/listen`, the notifications and extension methods such as the Skills extension's `skills/list`, `skills/get` and `resources/directory/read`. For a server that offers both services. If the server has no tunnel, it works as `typed`."),
 			],
-			markdownDescription: localize('app.mcp.json.grpc.binding', "The gRPC service the server implements. `auto` (the default) and `tunnel` send MCP's JSON-RPC messages through the `mcp.zig.transport.v1.Mcp/Call` tunnel; VS Code never switches to Google's typed `model_context_protocol.Mcp` service on its own. Set `typed` for a server that only offers the typed service: with `auto`, such a server fails to start with an error that says so."),
+			markdownDescription: localize('app.mcp.json.grpc.binding', "The gRPC service the server implements. `auto` (the default) and `tunnel` send MCP's JSON-RPC messages through the `mcp.zig.transport.v1.Mcp/Call` tunnel; VS Code never switches to Google's typed `model_context_protocol.Mcp` service on its own. Set `typed` for a server that only offers the typed service: with `auto`, such a server fails to start with an error that says so. Set `typed-with-tunnel` for a server that offers both, to call the typed service and keep discovery, subscriptions, notifications and extension methods such as skills on the tunnel."),
 		},
 		deadlineMs: {
 			type: 'number',

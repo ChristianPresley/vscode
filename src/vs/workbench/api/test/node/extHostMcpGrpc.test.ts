@@ -582,6 +582,75 @@ suite('McpGrpcHandle', () => {
 		});
 	});
 
+	test('typed-with-tunnel: the methods with a typed RPC are typed calls; discover, listen, notifications and the Skills extension methods go on the tunnel', async () => {
+		const callTool = typedRpcForMethod('tools/call')!;
+		const discover = { supportedVersions: [MODERN], capabilities: { tools: {}, extensions: { 'io.modelcontextprotocol/skills': { directoryRead: true } } }, resultType: 'complete' };
+		const f = createFixture(store, call => {
+			if (call.path !== TUNNEL_CALL_PATH) {
+				call.push(encodeTypedResponse(callTool, { resultType: 'complete', content: [{ type: 'text', text: 'ok' }] }));
+				return call.finish();
+			}
+			const { id, method } = call.json;
+			if (id === undefined) {
+				return call.finish();
+			}
+			const result = method === 'server/discover' ? discover
+				: method === 'skills/list' ? { resultType: 'complete', skills: [] }
+					: method === 'resources/directory/read' ? { resultType: 'complete', resources: [] }
+						: { resultType: 'complete' };
+			respondTunnel(call, { jsonrpc: '2.0', id, result });
+		}, { launch: { binding: 'typed-with-tunnel' } });
+		await f.handle.send(request(1, 'server/discover'), envelope('server/discover', 1));
+		await f.handle.send(request(2, 'tools/call', { name: 'echo' }), envelope('tools/call', 2));
+		await f.handle.send(request(3, 'skills/list'), envelope('skills/list', 3));
+		await f.handle.send(request(4, 'resources/directory/read', { uri: 'skill://a/' }), envelope('resources/directory/read', 4));
+		await f.handle.send(request(5, 'subscriptions/listen', { notifications: {} }), envelope('subscriptions/listen', 5, { kind: 'listen' }));
+		await f.handle.send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/roots/list_changed' }), envelope('notifications/roots/list_changed', undefined));
+
+		assert.deepStrictEqual({
+			binding: f.handle.binding,
+			calls: f.channel.calls.map(c => c.path === TUNNEL_CALL_PATH ? `tunnel ${c.json.method}` : c.path),
+			ids: f.messages.map(m => m.id),
+			discover: f.messages[0].result,
+			aborts: f.aborts,
+		}, {
+			binding: 'typed',
+			calls: [
+				'tunnel server/discover',
+				'/model_context_protocol.Mcp/CallTool',
+				'tunnel skills/list',
+				'tunnel resources/directory/read',
+				'tunnel subscriptions/listen',
+				'tunnel notifications/roots/list_changed',
+			],
+			ids: [1, 2, 3, 4, 5],
+			discover,
+			aborts: [],
+		});
+	});
+
+	test('typed-with-tunnel: a server without the tunnel works as typed: the discover is synthesized, the extension methods are unexpressible and the notifications dropped, without another tunnel call', async () => {
+		const f = createFixture(store, call => {
+			if (call.path === TUNNEL_CALL_PATH) {
+				return call.finish(GrpcStatus.UNIMPLEMENTED, {}, 'unknown service mcp.zig.transport.v1.Mcp');
+			}
+			call.finish(GrpcStatus.UNIMPLEMENTED, {}, 'no tools here');
+		}, { launch: { binding: 'typed-with-tunnel', uri: URI.parse('grpc://typed.example:50051') } });
+		await f.handle.send(request(1, 'server/discover'), envelope('server/discover', 1));
+		await f.handle.send(request(2, 'skills/list'), envelope('skills/list', 2));
+		await f.handle.send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/roots/list_changed' }), envelope('notifications/roots/list_changed', undefined));
+
+		assert.deepStrictEqual({
+			calls: f.channel.calls.map(c => c.path),
+			serverInfo: ((f.messages[0].result as JsonObject)._meta as JsonObject)['io.modelcontextprotocol/serverInfo'],
+			aborts: f.aborts.map(a => [a.requestId, a.reason]),
+		}, {
+			calls: [TUNNEL_CALL_PATH, '/model_context_protocol.Mcp/ListTools'],
+			serverInfo: { name: 'typed.example:50051', version: '' },
+			aborts: [[2, 'unexpressible']],
+		});
+	});
+
 	test('typed-only servers: the synthesized server/discover takes serverInfo and instructions from the first ListTools response, once per connection', async () => {
 		const listTools = typedRpcForMethod('tools/list')!;
 		const serverInfo = { name: 'mcp-conformance-test-server', version: '0.1.0', title: 'Conformance' };
@@ -2163,6 +2232,7 @@ suite('ExtHostMcpService - the mcpGrpcServerDefinition proposal', () => {
 			['binding is a string', definitionWith(undefined, 'typed')],
 			['binding is a number outside the enum', definitionWith(undefined, 7)],
 			['well-formed', definitionWith({ ca: '/certs/ca.pem', insecure: false, serverName: 'mcp.example' }, McpGrpcBinding.Typed)],
+			['typed with tunnel', definitionWith(undefined, McpGrpcBinding.TypedWithTunnel)],
 		];
 		const outcomes: Record<string, unknown> = {};
 		for (const [name, definition] of cases) {
@@ -2182,9 +2252,10 @@ suite('ExtHostMcpService - the mcpGrpcServerDefinition proposal', () => {
 		assert.deepStrictEqual(outcomes, {
 			'tls is a string': { upserts: [], rejections: [`Error in property 'tls': Expected object`] },
 			'tls.insecure is a string': { upserts: [], rejections: [`Error in property 'tls': Error in property 'insecure': Expected boolean, but got string`] },
-			'binding is a string': { upserts: [], rejections: [`Error in property 'binding': Expected McpGrpcBinding.Auto, .Tunnel or .Typed, but got string`] },
-			'binding is a number outside the enum': { upserts: [], rejections: [`Error in property 'binding': Expected McpGrpcBinding.Auto, .Tunnel or .Typed, but got 7`] },
+			'binding is a string': { upserts: [], rejections: [`Error in property 'binding': Expected McpGrpcBinding.Auto, .Tunnel, .Typed or .TypedWithTunnel, but got string`] },
+			'binding is a number outside the enum': { upserts: [], rejections: [`Error in property 'binding': Expected McpGrpcBinding.Auto, .Tunnel, .Typed or .TypedWithTunnel, but got 7`] },
 			'well-formed': { upserts: [[McpServerTransportType.Grpc]], rejections: [], tls: { ca: '/certs/ca.pem', insecure: false, serverName: 'mcp.example' }, binding: 'typed' },
+			'typed with tunnel': { upserts: [[McpServerTransportType.Grpc]], rejections: [], tls: undefined, binding: 'typed-with-tunnel' },
 		});
 	});
 
