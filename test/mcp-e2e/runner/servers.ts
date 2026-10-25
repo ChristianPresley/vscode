@@ -49,6 +49,12 @@ export interface IRunnerServer {
 			readonly issMode?: 'ok' | 'wrong' | 'omit';
 			/** A gRPC front on this port instead of the Streamable HTTP /mcp (the upstream is a gRPC port). */
 			readonly grpcPort?: number;
+			/** The client id of a pre-registered machine client (`private_key_jwt` with the key of runner/oauth-credentials.ts). */
+			readonly machineClient?: string;
+			/** The workload identity JWT the fixture writes to `file` and accepts; `aud: other` names another authorization server. */
+			readonly workloadToken?: { readonly file: string; readonly aud?: 'issuer' | 'other' };
+			/** DPoP (`--dpop`); off by default. */
+			readonly dpop?: 'off' | 'optional' | 'required';
 		};
 	};
 	readonly provider?: { readonly url: string; readonly binding?: string; readonly tls?: Record<string, unknown> };

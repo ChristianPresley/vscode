@@ -12,12 +12,16 @@
 //   <tls dir>/ca.pem, server.pem, server-key.pem
 //                                  the throw-away CA of the grpcs:// servers (runner/test-ca.ts),
 //                                  when an entry uses {tlsCa}; mcp.json gets the path of ca.pem
+//   <tls dir>/oauth/client-key.pem, client-key.jwk.json
+//                                  the key pair of the OAuth machine clients (runner/oauth-credentials.ts),
+//                                  when an entry uses {oauthCredentials}; mcp.json gets the key's path
 //
 // Usage: node runner/prepare-profile.ts <profile dir> --zig <server binary> --everything <entry point> [--tls-dir <dir>]
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { ensureOAuthCredentials, oauthCredentialsDir } from './oauth-credentials.ts';
 import { activeMutations, readServers, resolvePlaceholders, samplingKeyOf, type IRunnerServer } from './servers.ts';
 import { ensureTestCa } from './test-ca.ts';
 
@@ -155,12 +159,15 @@ function main(argv: readonly string[]): void {
 	const servers = readServers(serversFile);
 	// The CA is created here (before VS Code reads mcp.json) and reused by runner/start-servers.ts.
 	const tlsCa = JSON.stringify(servers).includes('{tlsCa}') ? ensureTestCa(tlsDir).caCert : path.join(tlsDir, 'ca.pem');
+	// The same for the key pair of the OAuth machine clients (oauth.privateKeyFile), reused by runner/start-servers.ts.
+	const oauthCredentials = JSON.stringify(servers).includes('{oauthCredentials}') ? ensureOAuthCredentials(oauthCredentialsDir(tlsDir)).dir : oauthCredentialsDir(tlsDir);
 	const placeholders = {
 		zig: argValue(argv, '--zig', '/work/zig-sdk/zig-out/bin/mcp-conformance-server'),
 		everything: argValue(argv, '--everything', '/work/e2e-tools/node_modules/@modelcontextprotocol/server-everything/dist/index.js'),
 		// The fixtures of this folder that VS Code starts itself (runner/skills-server.ts).
 		runner: import.meta.dirname,
 		tlsCa,
+		oauthCredentials,
 	};
 	const mutations = activeMutations();
 	const user = path.join(profile, 'User');

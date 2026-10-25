@@ -17,7 +17,7 @@ import { chatTests } from './testsChat';
 import { gatewayRestartTests, gatewayTests } from './testsGateway';
 import { grpcTests } from './testsGrpc';
 import { rootsTest, samplingTest } from './testsMrtr';
-import { BROWSER_LOG, IOAuthBrowserEvent, oauthScenarios } from './testsOauth';
+import { BROWSER_LOG, IOAuthBrowserEvent, oauthMachineTests, oauthScenarios } from './testsOauth';
 import { protocolTests, restartTests } from './testsProtocol';
 import { appsTests, resourceTests } from './testsResources';
 
@@ -937,6 +937,9 @@ export function apiTests(h: E2eHarness): ITestCase[] {
 
 		// --- The model picks a tool of a gateway route (testsAgent.ts) ---------------------------------
 		...gatewayAgentTests(h, routeOf),
+
+		// --- OAuth machine clients: client credentials, workload identity, DPoP (testsOauth.ts) -------
+		...oauthMachineTests(h),
 	];
 
 	// --- Protocol negotiation: read back from the MCP server logs --------------------------------

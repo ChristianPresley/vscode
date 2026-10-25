@@ -1,5 +1,5 @@
 {
-	"$comment": "The MCP servers of the end-to-end run. runner/prepare-profile.ts writes the 'mcp' entries into the user-level mcp.json, runner/start-servers.ts starts the 'process' entries inside the test container (a 'command' with its 'port'; in front of it, or of 'upstreamPort' for an entry without a command: runner/grpc-log-proxy.ts for 'grpcLogProxy', runner/http-fault-proxy.ts for 'httpProxy', runner/oauth-fixture.ts for 'oauthFixture'), and the suite reads the expectations. {zig} and {everything} are replaced with the zig-sdk conformance server and the server-everything entry point, {runner} with the runner/ folder of this suite, {tlsCa} with the CA certificate runner/test-ca.ts generates at run time. 'expectConnectError' marks a negative entry (VS Code must fail to connect; 'sharesProcessOf' names the entry whose process and logs it uses), 'ownTest' an entry that only its own test starts, 'suite': 'ui' one that only the UI suite starts (its sign-in needs a dialog answered), 'provider' one that the E2E extension defines through the API instead of mcp.json.",
+	"$comment": "The MCP servers of the end-to-end run. runner/prepare-profile.ts writes the 'mcp' entries into the user-level mcp.json, runner/start-servers.ts starts the 'process' entries inside the test container (a 'command' with its 'port'; in front of it, or of 'upstreamPort' for an entry without a command: runner/grpc-log-proxy.ts for 'grpcLogProxy', runner/http-fault-proxy.ts for 'httpProxy', runner/oauth-fixture.ts for 'oauthFixture'), and the suite reads the expectations. {zig} and {everything} are replaced with the zig-sdk conformance server and the server-everything entry point, {runner} with the runner/ folder of this suite, {tlsCa} with the CA certificate runner/test-ca.ts generates at run time, {oauthCredentials} with the folder of the throw-away OAuth machine client key (runner/oauth-credentials.ts) and the workload identity JWTs. 'expectConnectError' marks a negative entry (VS Code must fail to connect; 'sharesProcessOf' names the entry whose process and logs it uses), 'ownTest' an entry that only its own test starts, 'suite': 'ui' one that only the UI suite starts (its sign-in needs a dialog answered), 'provider' one that the E2E extension defines through the API instead of mcp.json.",
 	"servers": [
 		{
 			"label": "zig-stdio",
@@ -570,6 +570,143 @@
 				"oauthFixture": {
 					"port": 3404,
 					"grpcPort": 50060
+				}
+			}
+		},
+		{
+			"label": "zig-oauth-client-credentials",
+			"transport": "http",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"ownTest": true,
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3405/mcp",
+				"oauth": {
+					"grant": "client_credentials",
+					"clientId": "mcp-e2e-machine",
+					"privateKeyFile": "{oauthCredentials}/client-key.pem",
+					"keyId": "mcp-e2e-client-key"
+				}
+			},
+			"process": {
+				"$comment": "runner/oauth-fixture.ts --machine-client: the client credentials grant of the pre-registered client mcp-e2e-machine, authenticated with private_key_jwt (the throw-away key of runner/oauth-credentials.ts); no registration, no browser, no consent. In front of the server on 3107.",
+				"upstreamPort": 3107,
+				"oauthFixture": {
+					"port": 3405,
+					"machineClient": "mcp-e2e-machine"
+				}
+			}
+		},
+		{
+			"label": "zig-oauth-wif",
+			"transport": "http",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"ownTest": true,
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3406/mcp",
+				"oauth": {
+					"grant": "workload_identity",
+					"workloadIdentityTokenFile": "{oauthCredentials}/zig-oauth-wif.jwt"
+				}
+			},
+			"process": {
+				"$comment": "runner/oauth-fixture.ts --workload-token-out: the fixture is the workload identity provider too; it writes a signed workload JWT (aud: its issuer) to the file and accepts it in the JWT authorization grant (RFC 7523). In front of the server on 3107.",
+				"upstreamPort": 3107,
+				"oauthFixture": {
+					"port": 3406,
+					"workloadToken": {
+						"file": "{oauthCredentials}/zig-oauth-wif.jwt"
+					}
+				}
+			}
+		},
+		{
+			"label": "zig-oauth-wif-wrong-aud",
+			"transport": "http",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"ownTest": true,
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3407/mcp",
+				"oauth": {
+					"grant": "workload_identity",
+					"workloadIdentityTokenFile": "{oauthCredentials}/zig-oauth-wif-wrong-aud.jwt"
+				}
+			},
+			"process": {
+				"$comment": "runner/oauth-fixture.ts --workload-token-aud other: the workload JWT names another authorization server as its audience; VS Code must not send it to this one (no token request).",
+				"upstreamPort": 3107,
+				"oauthFixture": {
+					"port": 3407,
+					"workloadToken": {
+						"file": "{oauthCredentials}/zig-oauth-wif-wrong-aud.jwt",
+						"aud": "other"
+					}
+				}
+			}
+		},
+		{
+			"label": "zig-oauth-dpop",
+			"transport": "http",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"ownTest": true,
+			"mcp": {
+				"type": "http",
+				"url": "http://127.0.0.1:3408/mcp",
+				"oauth": {
+					"grant": "client_credentials",
+					"clientId": "mcp-e2e-machine",
+					"privateKeyFile": "{oauthCredentials}/client-key.pem",
+					"keyId": "mcp-e2e-client-key"
+				}
+			},
+			"process": {
+				"$comment": "runner/oauth-fixture.ts --dpop required: the resource requires DPoP-bound tokens (PRM dpop_bound_access_tokens_required, DPoP challenge), the authorization server on its own origin 3411 binds the client credentials token to the proof's key after a use_dpop_nonce round, and the resource asks for its own nonce once. mcp.json does not set oauth.dpop: the resource's requirement alone must turn DPoP on.",
+				"upstreamPort": 3107,
+				"oauthFixture": {
+					"port": 3408,
+					"asPort": 3411,
+					"machineClient": "mcp-e2e-machine",
+					"dpop": "required"
+				}
+			}
+		},
+		{
+			"label": "zig-grpc-oauth-dpop",
+			"transport": "grpc-tunnel",
+			"era": "modern",
+			"protocolVersion": "2026-07-28",
+			"family": "zig",
+			"grpc": true,
+			"ownTest": true,
+			"mcp": {
+				"type": "grpc",
+				"url": "grpc://127.0.0.1:50061",
+				"binding": "tunnel",
+				"oauth": {
+					"grant": "client_credentials",
+					"clientId": "mcp-e2e-machine",
+					"privateKeyFile": "{oauthCredentials}/client-key.pem",
+					"keyId": "mcp-e2e-client-key"
+				}
+			},
+			"process": {
+				"$comment": "runner/oauth-fixture.ts with its gRPC front on 50061 and --dpop required, in front of the zig-grpc-tunnel server: each call needs a DPoP proof of its own (htu http://127.0.0.1:50061/<method path>), and the first one with the token gets UNAUTHENTICATED with use_dpop_nonce and a dpop-nonce. PRM and authorization server on 3409 (resource https://127.0.0.1:50061/).",
+				"upstreamPort": 50051,
+				"oauthFixture": {
+					"port": 3409,
+					"grpcPort": 50061,
+					"machineClient": "mcp-e2e-machine",
+					"dpop": "required"
 				}
 			}
 		},
