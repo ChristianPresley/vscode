@@ -462,6 +462,8 @@ function createMockPromptsService(files: IFixtureFile[], agentInstructions: IAge
 				extension: toExtensionInfo(f) as never,
 			}));
 		}
+		// The skills of extensions and MCP servers: the fixtures show none.
+		override async getProvidedAgentSkills() { return []; }
 		override async findAgentSkills(): Promise<IAgentSkill[]> {
 			return files.filter(f => f.type === PromptsType.skill).map(f => ({
 				uri: f.uri,

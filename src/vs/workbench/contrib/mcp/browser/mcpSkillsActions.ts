@@ -12,6 +12,7 @@ import { ServicesAccessor } from '../../../../platform/instantiation/common/inst
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { IStorageService } from '../../../../platform/storage/common/storage.js';
 import { AI_CUSTOMIZATION_ITEM_STORAGE_KEY, AI_CUSTOMIZATION_ITEM_TYPE_KEY, AICustomizationManagementItemMenuId } from '../../chat/browser/aiCustomization/aiCustomizationManagement.js';
+import { ChatContextKeys } from '../../chat/common/actions/chatContextKeys.js';
 import { PromptsType } from '../../chat/common/promptSyntax/promptTypes.js';
 import { PromptsStorage } from '../../chat/common/promptSyntax/service/promptsService.js';
 import { McpCommandIds } from '../common/mcpCommandIds.js';
@@ -66,6 +67,8 @@ export class McpRevokeAllSkillApprovalsAction extends Action2 {
 			title: localize2('mcp.skills.revokeAllApprovals', "Revoke All Skill Approvals"),
 			category: localize2('mcp.category', "MCP"),
 			f1: true,
+			// As every MCP command: hidden while AI features are disabled.
+			precondition: ContextKeyExpr.and(ChatContextKeys.Setup.hidden.negate(), ChatContextKeys.Setup.disabledInWorkspace.negate()),
 		});
 	}
 
