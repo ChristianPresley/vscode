@@ -5,12 +5,13 @@
 
 import assert from 'assert';
 import type { ProgressOptions } from 'vscode';
-import { encodeBase64, VSBuffer } from '../../../../base/common/buffer.js';
+import { decodeBase64, encodeBase64, VSBuffer } from '../../../../base/common/buffer.js';
 import { DeferredPromise } from '../../../../base/common/async.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { canonicalResourceUri, IAuthorizationServerMetadata, OAuthClientError } from '../../../../base/common/oauth.js';
 import { resourceIndicatorFor } from '../../../../base/common/oauthClient.js';
+import { jwkThumbprint } from '../../../../base/common/oauthJose.js';
 import { URI, UriComponents } from '../../../../base/common/uri.js';
 import { mock } from '../../../../base/test/common/mock.js';
 import { createOAuthFixture, IOAuthFixture } from '../../../../base/test/common/oauthClientFixture.js';
@@ -26,7 +27,7 @@ import { IExtHostProgress } from '../../common/extHostProgress.js';
 import { IExtHostRpcService } from '../../common/extHostRpcService.js';
 import { IExtHostUrlsService } from '../../common/extHostUrls.js';
 import { IExtHostWindow } from '../../common/extHostWindow.js';
-import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION, MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION } from '../../common/mcpOAuthClientFactory.js';
+import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION, MCP_OAUTH_DPOP_SESSION_OPTION, MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION } from '../../common/mcpOAuthClientFactory.js';
 import { Proxied } from '../../../services/extensions/common/proxyIdentifier.js';
 
 /** Builds a structurally-valid JWT carrying the given claims. */
@@ -402,6 +403,89 @@ suite('DynamicAuthProvider', () => {
 		const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
 		assert.strictEqual(challenge, encodeBase64(VSBuffer.wrap(digest), false, true));
 		assert.strictEqual(bodies[0].code, 'the-code');
+	});
+
+	/** The header and claims of a DPoP proof whose signature verifies with the key of its `jwk` header. */
+	async function verifiedProof(proof: string | undefined): Promise<{ readonly jkt: string; readonly claims: Record<string, unknown> }> {
+		assert.ok(proof, 'the request carries a DPoP proof');
+		const [header, claims, signature] = proof.split('.');
+		const jwk = JSON.parse(decodeBase64(header).toString()).jwk as JsonWebKey;
+		const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+		assert.ok(await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, decodeBase64(signature).buffer as Uint8Array<ArrayBuffer>, new TextEncoder().encode(`${header}.${claims}`) as Uint8Array<ArrayBuffer>));
+		return { jkt: await jwkThumbprint(jwk), claims: JSON.parse(decodeBase64(claims).toString()) };
+	}
+
+	test('a request that asks for DPoP gets a DPoP-bound token: the code is bound to the key, the token requests prove possession of it, and the token is stored and refreshed with it', async () => {
+		const requests: { readonly grant: string | null; readonly proof: string | undefined }[] = [];
+		const persisted: IAuthorizationToken[][] = [];
+		let dpopJkt: string | null = null;
+		const provider = createProvider({
+			authorizationServer: servers.nonMicrosoft.authorizationServer,
+			serverMetadata: { ...servers.nonMicrosoft.serverMetadata, dpop_signing_alg_values_supported: ['ES256'] },
+			resource,
+			redirectQuery: url => {
+				dpopJkt = url.searchParams.get('dpop_jkt');
+				return 'code=the-code';
+			},
+			onDidPersist: tokens => persisted.push(tokens),
+			fetcher: async (_input, init) => {
+				requests.push({ grant: new URLSearchParams(String(init?.body)).get('grant_type'), proof: (init?.headers as Record<string, string>).DPoP });
+				// The first token request learns the nonce the authorization server requires (RFC 9449 section 8).
+				if (requests.length === 1) {
+					return new Response(JSON.stringify({ error: 'use_dpop_nonce' }), { status: 400, headers: { 'Content-Type': 'application/json', 'DPoP-Nonce': 'as-nonce' } });
+				}
+				return tokenResponse({ access_token: jwt({ sub: 'account', n: requests.length }), token_type: 'DPoP', expires_in: 1, refresh_token: 'refresh-token' });
+			},
+		});
+
+		await provider.createSession(['mcp:read'], { [MCP_OAUTH_DPOP_SESSION_OPTION]: true });
+		const stored = persisted.at(-1)![0];
+		// The token expires within the refresh margin: the next lookup refreshes it with the stored key.
+		await provider.getSessions(['mcp:read'], {});
+		const proofs = await Promise.all(requests.map(r => verifiedProof(r.proof)));
+
+		assert.ok(stored.dpop_jwk?.d, 'the token is stored with its private key');
+		assert.deepStrictEqual({
+			tokenType: stored.token_type,
+			grants: requests.map(r => r.grant),
+			nonces: proofs.map(p => p.claims.nonce),
+			htu: proofs.map(p => p.claims.htu),
+			keys: new Set([dpopJkt, ...proofs.map(p => p.jkt), await jwkThumbprint(stored.dpop_jwk!)]).size,
+			refreshed: persisted.at(-1)![0].dpop_jwk !== undefined,
+		}, {
+			tokenType: 'DPoP',
+			grants: ['authorization_code', 'authorization_code', 'refresh_token'],
+			nonces: [undefined, 'as-nonce', undefined],
+			htu: [servers.nonMicrosoft.serverMetadata.token_endpoint, servers.nonMicrosoft.serverMetadata.token_endpoint, servers.nonMicrosoft.serverMetadata.token_endpoint],
+			keys: 1,
+			refreshed: true,
+		});
+	});
+
+	test('without the DPoP request option, or from an authorization server without DPoP, a sign-in asks for no DPoP-bound token, and a DPoP token type is refused', async () => {
+		const cases: [IAuthorizationServerMetadata, IAuthenticationProviderSessionOptions][] = [
+			[{ ...servers.nonMicrosoft.serverMetadata, dpop_signing_alg_values_supported: ['ES256'] }, {}],
+			[servers.nonMicrosoft.serverMetadata, { [MCP_OAUTH_DPOP_SESSION_OPTION]: true }],
+		];
+		for (const [metadata, options] of cases) {
+			const proofs: (string | undefined)[] = [];
+			let dpopJkt: string | null = 'unset';
+			const provider = createProvider({
+				authorizationServer: servers.nonMicrosoft.authorizationServer,
+				serverMetadata: metadata,
+				resource,
+				redirectQuery: url => {
+					dpopJkt = url.searchParams.get('dpop_jkt');
+					return 'code=the-code';
+				},
+				fetcher: async (_input, init) => {
+					proofs.push((init?.headers as Record<string, string>).DPoP);
+					return tokenResponse({ access_token: jwt({ sub: 'account' }), token_type: 'DPoP' });
+				},
+			});
+			await expectOAuthError(provider.createSession(['mcp:read'], options), 'token_request_failed');
+			assert.deepStrictEqual([proofs, dpopJkt], [[undefined], null]);
+		}
 	});
 
 	test('validates iss before the code and before an error', async () => {

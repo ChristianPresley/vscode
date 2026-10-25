@@ -782,6 +782,27 @@ export interface McpServerTransportHTTPOAuth {
 	 * servers connect silently.
 	 */
 	readonly enterpriseManaged?: boolean;
+	/**
+	 * How VS Code obtains tokens: a user signs in (`authorization_code`, the default), or VS Code
+	 * authenticates as a machine client, with its pre-registered credentials (`client_credentials`)
+	 * or a workload identity JWT (`workload_identity`).
+	 */
+	readonly grant?: 'authorization_code' | 'client_credentials' | 'workload_identity';
+	/** For `client_credentials`: a PKCS #8 PEM private key file for `private_key_jwt` client authentication. */
+	readonly privateKeyFile?: string;
+	/** The JWS algorithm of {@link privateKeyFile}'s key; `ES256` by default. */
+	readonly signingAlgorithm?: string;
+	/** The key ID (`kid`) the authorization server knows {@link privateKeyFile}'s key by. */
+	readonly keyId?: string;
+	/** The `aud` of the client assertion: the issuer identifier (the default) or the token endpoint URL. */
+	readonly clientAssertionAudience?: 'issuer' | 'token_endpoint';
+	/** For `workload_identity`: the file the workload platform writes the workload JWT to; it is read for each token request. */
+	readonly workloadIdentityTokenFile?: string;
+	/**
+	 * Whether VS Code requests DPoP-bound tokens (RFC 9449) from an authorization server that supports
+	 * them: `true` always, `false` never; by default only when the MCP server requires them.
+	 */
+	readonly dpop?: boolean;
 }
 
 /**

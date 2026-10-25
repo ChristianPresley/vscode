@@ -5,7 +5,7 @@
 
 import type * as vscode from 'vscode';
 import { stringHash } from '../../../base/common/hash.js';
-import { buildIdJagExchangeBody, buildResourceRedemptionBody, fetchAuthorizationServerMetadata, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationTokenResponse, isLoopbackUrl, OAuthClientError, OAuthIssuerMismatchError } from '../../../base/common/oauth.js';
+import { buildClientAuthentication, buildIdJagExchangeBody, buildResourceRedemptionBody, fetchAuthorizationServerMetadata, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationTokenResponse, isLoopbackUrl, OAuthClientError, OAuthIssuerMismatchError } from '../../../base/common/oauth.js';
 import { localize } from '../../../nls.js';
 import { DynamicAuthProvider } from './extHostAuthentication.js';
 import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION } from './mcpOAuthClientFactory.js';
@@ -64,6 +64,25 @@ function assertSecureEndpoint(url: string, what: string, allowInsecureHttp: bool
 		return;
 	}
 	throw new OAuthClientError('insecure_endpoint', localize('xaaInsecureEndpoint', "The {0} '{1}' is not served over HTTPS; the resource client credentials are not sent there.", what, url));
+}
+
+/**
+ * How a token request of the XAA legs sends a client secret: in the body (`client_secret_post`), as
+ * the preview always did, unless the authorization server lists `client_secret_basic` and not
+ * `client_secret_post` in `token_endpoint_auth_methods_supported` (as the conformance suite's
+ * resource authorization server does); a client without a secret sends none. Exported for testing.
+ */
+export function xaaSecretTransmission(supported: readonly string[] | undefined, clientSecret: string | undefined): 'none' | 'client_secret_basic' | 'client_secret_post' {
+	if (clientSecret === undefined) {
+		return 'none';
+	}
+	return supported?.includes('client_secret_basic') && !supported.includes('client_secret_post') ? 'client_secret_basic' : 'client_secret_post';
+}
+
+/** The token endpoint of an authorization server of the XAA legs and the client authentication methods it lists. */
+interface IXaaTokenEndpoint {
+	readonly url: string;
+	readonly authMethods: readonly string[] | undefined;
 }
 
 /** Whether the workbench asked for the server's `oauth.allowInsecureHttp` ({@link MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION}). */
@@ -228,7 +247,7 @@ export function XaaifyAuthProvider<TBase extends Ctor<DynamicAuthProvider>>(Base
 			resource: string,
 			options: vscode.AuthenticationProviderSessionOptions,
 			silent: boolean,
-			resourceTokenEndpoint?: string,
+			resourceTokenEndpoint?: IXaaTokenEndpoint,
 		): Promise<IResourceCacheEntry | undefined> {
 			// Leg 1: resource AS token endpoint, before anything is sent to the IdP
 			resourceTokenEndpoint ??= await this._discoverResourceTokenEndpoint(audience, allowsInsecureHttp(options));
@@ -340,13 +359,15 @@ export function XaaifyAuthProvider<TBase extends Ctor<DynamicAuthProvider>>(Base
 			if (!tokenEndpoint) {
 				throw new Error('Issuer metadata is missing token_endpoint; cannot perform XAA token exchange.');
 			}
-			const body = buildIdJagExchangeBody(this._clientId, this._clientSecret, idToken, audience, resource, scopes);
-			this._logger.trace(`[XAA] POST ${tokenEndpoint} (ID-JAG exchange) audience=${audience} resource=${resource} scope=${scopes.join(' ')}`);
+			const method = xaaSecretTransmission(this._serverMetadata.token_endpoint_auth_methods_supported, this._clientSecret);
+			const body = buildIdJagExchangeBody(this._clientId, method === 'client_secret_post' ? this._clientSecret : undefined, idToken, audience, resource, scopes);
+			this._logger.trace(`[XAA] POST ${tokenEndpoint} (ID-JAG exchange, ${method}) audience=${audience} resource=${resource} scope=${scopes.join(' ')}`);
 			const response = await this._fetch(tokenEndpoint, {
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/x-www-form-urlencoded',
 					'Accept': 'application/json',
+					...buildClientAuthentication(method === 'client_secret_basic' ? method : 'none', this._clientId, this._clientSecret).headers,
 				},
 				body: body.toString(),
 			});
@@ -370,7 +391,7 @@ export function XaaifyAuthProvider<TBase extends Ctor<DynamicAuthProvider>>(Base
 		 * (whose metadata names the endpoint) and the endpoint must be HTTPS or loopback, as for
 		 * the transport's own discovery, unless the server's `oauth.allowInsecureHttp` allows plain HTTP.
 		 */
-		private async _discoverResourceTokenEndpoint(audience: string, allowInsecureHttp: boolean): Promise<string> {
+		private async _discoverResourceTokenEndpoint(audience: string, allowInsecureHttp: boolean): Promise<IXaaTokenEndpoint> {
 			assertSecureEndpoint(audience, localize('xaaResourceAuthorizationServer', "resource authorization server"), allowInsecureHttp);
 			let metadata: IAuthorizationServerMetadata;
 			try {
@@ -393,17 +414,19 @@ export function XaaifyAuthProvider<TBase extends Ctor<DynamicAuthProvider>>(Base
 				this._logger.error(`[XAA] Rejecting the resource authorization server metadata of '${audience}': token_endpoint ${metadata.token_endpoint} is not HTTPS or loopback`);
 				throw error;
 			}
-			return metadata.token_endpoint;
+			return { url: metadata.token_endpoint, authMethods: metadata.token_endpoint_auth_methods_supported };
 		}
 
-		private async _redeemAtResource(tokenEndpoint: string, idJag: string, resource: string, scopes: string[], resourceClientId: string, resourceClientSecret: string | undefined): Promise<IAuthorizationTokenResponse> {
-			const body = buildResourceRedemptionBody(resourceClientId, resourceClientSecret, idJag, resource, scopes);
-			this._logger.trace(`[XAA] POST ${tokenEndpoint} (ID-JAG redemption) client_id=${resourceClientId} resource=${resource} scope=${scopes.join(' ')}`);
-			const response = await this._fetch(tokenEndpoint, {
+		private async _redeemAtResource(tokenEndpoint: IXaaTokenEndpoint, idJag: string, resource: string, scopes: string[], resourceClientId: string, resourceClientSecret: string | undefined): Promise<IAuthorizationTokenResponse> {
+			const method = xaaSecretTransmission(tokenEndpoint.authMethods, resourceClientSecret);
+			const body = buildResourceRedemptionBody(resourceClientId, method === 'client_secret_post' ? resourceClientSecret : undefined, idJag, resource, scopes);
+			this._logger.trace(`[XAA] POST ${tokenEndpoint.url} (ID-JAG redemption, ${method}) client_id=${resourceClientId} resource=${resource} scope=${scopes.join(' ')}`);
+			const response = await this._fetch(tokenEndpoint.url, {
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/x-www-form-urlencoded',
 					'Accept': 'application/json',
+					...buildClientAuthentication(method === 'client_secret_basic' ? method : 'none', resourceClientId, resourceClientSecret).headers,
 				},
 				body: body.toString(),
 			});

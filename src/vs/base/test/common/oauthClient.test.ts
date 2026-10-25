@@ -8,7 +8,7 @@ import { decodeBase64 } from '../../common/buffer.js';
 import { CancellationTokenSource } from '../../common/cancellation.js';
 import { isCancellationError } from '../../common/errors.js';
 import { IAuthorizationServerMetadata, OAuthClientError, OAuthClientErrorCode } from '../../common/oauth.js';
-import { createHeadlessRedirectAuthorize, InMemoryOAuthClientStorage, IOAuthClientOptions, IOAuthClientRecord, IOAuthFetch, OAuthClient, parseBearerChallenge, redact, resourceIndicatorFor, selectScopes } from '../../common/oauthClient.js';
+import { createHeadlessRedirectAuthorize, InMemoryOAuthClientStorage, IOAuthClientOptions, IOAuthClientRecord, IOAuthFetch, OAuthClient, parseOAuthChallenge, redact, resourceIndicatorFor, selectScopes } from '../../common/oauthClient.js';
 import { bearerChallenge, createAuthorizationServerFixture, createFixtureRouter, createOAuthFixture, createResourceServerFixture, IFixtureResponse, IOAuthAuthorizationServerFixtureOptions } from './oauthClientFixture.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from './utils.js';
 
@@ -1092,14 +1092,16 @@ suite('OAuthClient', () => {
 			assert.strictEqual(cancelling.as.tokenRequests.length, 0);
 		});
 
-		test('parseBearerChallenge reads the Bearer challenge only', () => {
-			assert.deepStrictEqual(parseBearerChallenge('Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="a b", error="insufficient_scope", error_description="more"'), {
+		test('parseOAuthChallenge reads the Bearer or DPoP challenge only', () => {
+			assert.deepStrictEqual(parseOAuthChallenge('Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="a b", error="insufficient_scope", error_description="more"'), {
 				scheme: 'Bearer', resourceMetadataUrl: 'https://mcp.example.test/.well-known/oauth-protected-resource/mcp', scope: 'a b', error: 'insufficient_scope', errorDescription: 'more',
 			});
-			assert.deepStrictEqual(parseBearerChallenge('Basic realm="r", Bearer scope=""'), { scheme: 'Bearer', resourceMetadataUrl: undefined, scope: undefined, error: undefined, errorDescription: undefined });
-			assert.strictEqual(parseBearerChallenge('Basic realm="r"'), undefined);
-			assert.strictEqual(parseBearerChallenge(undefined), undefined);
-			assert.strictEqual(parseBearerChallenge(''), undefined);
+			assert.deepStrictEqual(parseOAuthChallenge('Basic realm="r", Bearer scope=""'), { scheme: 'Bearer', resourceMetadataUrl: undefined, scope: undefined, error: undefined, errorDescription: undefined });
+			// A resource server that accepts DPoP-bound tokens challenges with that scheme (RFC 9449 section 7.1).
+			assert.deepStrictEqual(parseOAuthChallenge('Basic realm="r", DPoP resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp"'), { scheme: 'DPoP', resourceMetadataUrl: 'https://mcp.example.test/.well-known/oauth-protected-resource/mcp', scope: undefined, error: undefined, errorDescription: undefined });
+			assert.strictEqual(parseOAuthChallenge('Basic realm="r"'), undefined);
+			assert.strictEqual(parseOAuthChallenge(undefined), undefined);
+			assert.strictEqual(parseOAuthChallenge(''), undefined);
 		});
 
 		test('redact strips credentials from log messages', () => {

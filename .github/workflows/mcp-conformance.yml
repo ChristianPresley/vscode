@@ -39,6 +39,8 @@ on:
       - 'src/vs/workbench/api/browser/mainThreadMcp.ts'
       - 'src/vs/base/common/oauth.ts'
       - 'src/vs/base/common/oauthClient.ts'
+      - 'src/vs/base/common/oauthJose.ts'
+      - 'src/vs/base/common/oauthDpop.ts'
       - 'src/vs/base/common/jsonRpcProtocol.ts'
       - 'src/vs/base/common/jsonSchemaValidator/**'
       - 'src/vs/base/common/protobuf/**'
@@ -228,7 +230,11 @@ jobs:
             src/vs/workbench/api/test/node/loopbackServer.test.ts
             src/vs/base/common/oauth.ts
             src/vs/base/common/oauthClient.ts
+            src/vs/base/common/oauthJose.ts
+            src/vs/base/common/oauthDpop.ts
             src/vs/base/test/common/oauthProtocolHelpers.test.ts
+            src/vs/base/test/common/oauthJose.test.ts
+            src/vs/base/test/common/oauthClientExtensions.test.ts
             src/vs/base/common/jsonRpcProtocol.ts
             src/vs/base/common/jsonSchemaValidator
             src/vs/base/common/protobuf

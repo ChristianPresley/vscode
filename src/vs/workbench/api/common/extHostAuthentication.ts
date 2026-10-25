@@ -16,7 +16,8 @@ import { IExtHostRpcService } from './extHostRpcService.js';
 import { URI, UriComponents } from '../../../base/common/uri.js';
 import { AuthorizationErrorType, buildClientAuthentication, canonicalResourceUri, createPkcePair, fetchDynamicRegistration, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationProtectedResourceMetadata, IAuthorizationRedirectParams, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationErrorResponse, isAuthorizationTokenResponse, isValidClientMetadataUrl, OAuthClientError, OAuthTokenEndpointAuthMethod, parseAuthorizationRedirect, pkceSupported, selectRegistrationAuthMethod, selectTokenEndpointAuthMethod, validateIssuerParameter } from '../../../base/common/oauth.js';
 import { isSecureOAuthEndpoint, redact, resourceIndicatorFor } from '../../../base/common/oauthClient.js';
-import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION, MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION } from './mcpOAuthClientFactory.js';
+import { authorizationServerSupportsDpop, DPOP_HEADER, DPOP_NONCE_HEADER, isDpopTokenType, OAuthDpopProver, storedDpopKey, USE_DPOP_NONCE_ERROR } from '../../../base/common/oauthDpop.js';
+import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION, MCP_OAUTH_DPOP_SESSION_OPTION, MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION } from './mcpOAuthClientFactory.js';
 import { IExtHostWindow } from './extHostWindow.js';
 import { IExtHostInitDataService } from './extHostInitDataService.js';
 import { ILogger, ILoggerService, ILogService } from '../../../platform/log/common/log.js';
@@ -577,7 +578,14 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	 * {@link MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION}); any other request gets the strict
 	 * endpoint rule.
 	 */
-	private _requestPolicy: { readonly allowInsecureHttp: boolean; readonly requireAdvertisedPkce: boolean } = { allowInsecureHttp: false, requireAdvertisedPkce: false };
+	private _requestPolicy: { readonly allowInsecureHttp: boolean; readonly requireAdvertisedPkce: boolean; readonly dpop: boolean } = { allowInsecureHttp: false, requireAdvertisedPkce: false, dpop: false };
+	/**
+	 * The DPoP key of the sign-in in progress (RFC 9449): set when its request asks for a
+	 * DPoP-bound token ({@link MCP_OAUTH_DPOP_SESSION_OPTION}) and the authorization server
+	 * supports DPoP. The token requests of the sign-in prove possession of it, and a DPoP-bound
+	 * token is stored with it.
+	 */
+	protected _signInDpopProver: OAuthDpopProver | undefined;
 
 	constructor(
 		@IExtHostWindow protected readonly _extHostWindow: IExtHostWindow,
@@ -672,7 +680,50 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		this._requestPolicy = {
 			allowInsecureHttp: record[MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION] === true,
 			requireAdvertisedPkce: record[MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION] === true,
+			dpop: record[MCP_OAUTH_DPOP_SESSION_OPTION] === true,
 		};
+	}
+
+	/**
+	 * Binds the authorization code of the sign-in in progress to its DPoP key (`dpop_jkt`,
+	 * RFC 9449 section 10), when it has one.
+	 */
+	protected _bindAuthorizationToDpopKey(authorizationUrl: URL): void {
+		if (this._signInDpopProver) {
+			authorizationUrl.searchParams.set('dpop_jkt', this._signInDpopProver.thumbprint);
+		}
+	}
+
+	/**
+	 * Sends a token request ({@link _buildTokenRequest}) with the provider's fetch. With a DPoP
+	 * key it carries a fresh proof, and a `use_dpop_nonce` error is answered once with the
+	 * server's nonce (RFC 9449 section 8). The body is parsed when it is JSON.
+	 */
+	protected async _postTokenRequest(params: Record<string, string>, prover: OAuthDpopProver | undefined): Promise<{ readonly response: Response; readonly result: unknown }> {
+		const tokenEndpoint = this._serverMetadata.token_endpoint!;
+		for (let attempt = 0; ; attempt++) {
+			const request = this._buildTokenRequest(params);
+			const headers: Record<string, string> = { ...request.headers };
+			if (prover) {
+				headers[DPOP_HEADER] = await prover.createProof('POST', tokenEndpoint);
+			}
+			const response = await this._fetch(tokenEndpoint, { method: 'POST', headers, body: request.body });
+			const nonce = response.headers.get(DPOP_NONCE_HEADER);
+			if (prover && nonce !== null) {
+				prover.rememberNonce(tokenEndpoint, nonce);
+			}
+			let result: unknown;
+			try {
+				result = await response.json();
+			} catch {
+				result = undefined;
+			}
+			if (prover && attempt === 0 && nonce !== null && response.status === 400 && isAuthorizationErrorResponse(result) && result.error === USE_DPOP_NONCE_ERROR) {
+				this._logger.info('The token endpoint asked for a DPoP nonce; sending the request again.');
+				continue;
+			}
+			return { response, result };
+		}
 	}
 
 	/**
@@ -756,15 +807,22 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	/**
 	 * The token response of the code grant and of a refresh, by the rule of the OAuth client
 	 * (`OAuthClient`): HTTP 200 (RFC 6749 section 5.1) with a token response; `undefined` for any
-	 * other, which the caller reports. A 200 response whose token is empty or not a `Bearer` token
-	 * (RFC 6750), which VS Code cannot send, fails with a `token_request_failed` {@link OAuthClientError}.
+	 * other, which the caller reports. A 200 response whose token is empty, or neither a `Bearer`
+	 * token (RFC 6750) nor, for a request that proved possession of `prover`'s key, a `DPoP` token
+	 * (RFC 9449), which VS Code cannot send, fails with a `token_request_failed`
+	 * {@link OAuthClientError}. A DPoP-bound token is returned with its key (`dpop_jwk`), which it is
+	 * stored with.
 	 */
-	protected _acceptTokenResponse(response: Response, result: unknown): IAuthorizationTokenResponse | undefined {
+	protected _acceptTokenResponse(response: Response, result: unknown, prover?: OAuthDpopProver): IAuthorizationTokenResponse | undefined {
 		if (response.status !== 200 || !isAuthorizationTokenResponse(result)) {
 			return undefined;
 		}
 		if (typeof result.access_token !== 'string' || result.access_token.length === 0) {
 			throw new OAuthClientError('token_request_failed', nls.localize('authNoAccessToken', "The token endpoint of '{0}' issued no usable access token.", this._serverMetadata.issuer));
+		}
+		if (prover && isDpopTokenType(result.token_type)) {
+			const bound: IAuthorizationTokenResponse & Pick<IAuthorizationToken, 'dpop_jwk'> = { ...result, dpop_jwk: prover.privateJwk };
+			return bound;
 		}
 		if (typeof result.token_type !== 'string' || result.token_type.toLowerCase() !== 'bearer') {
 			throw new OAuthClientError('token_request_failed', nls.localize('authUnsupportedTokenType', "The token endpoint of '{0}' issued an unsupported token type '{1}'.", this._serverMetadata.issuer, String(result.token_type)));
@@ -885,7 +943,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 							continue;
 						}
 						try {
-							const newToken = await this.exchangeRefreshTokenForToken(token.refresh_token, session.scopes, options.silent !== true);
+							const newToken = await this.exchangeRefreshTokenForToken(token.refresh_token, session.scopes, options.silent !== true, storedDpopKey(token));
 							// TODO@TylerLeonhardt: When the core scope handling doesn't care about order, this check should be
 							// updated to not care about order
 							if (newToken.scope !== scopeStr) {
@@ -916,6 +974,18 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	async createSession(scopes: string[], options: vscode.AuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession> {
 		this._beginRequest(options);
 		this._logger.info(`Creating session for scopes: ${scopes.join(' ')}`);
+		this._signInDpopProver = this._requestPolicy.dpop && authorizationServerSupportsDpop(this._serverMetadata) ? await OAuthDpopProver.generate() : undefined;
+		if (this._signInDpopProver) {
+			this._logger.info('Requesting a DPoP-bound token.');
+		}
+		try {
+			return await this._createSession(scopes);
+		} finally {
+			this._signInDpopProver = undefined;
+		}
+	}
+
+	private async _createSession(scopes: string[]): Promise<vscode.AuthenticationSession> {
 		let token: IAuthorizationTokenResponse | undefined;
 		for (let i = 0; i < this._createFlows.length; i++) {
 			const { handler } = this._createFlows[i];
@@ -1037,6 +1107,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			authorizationUrl.searchParams.append('resource', resource);
 		}
 
+		this._bindAuthorizationToDpopKey(authorizationUrl);
+
 		// Use a redirect URI that matches what was registered during dynamic registration
 		const redirectUri = 'https://vscode.dev/redirect';
 		authorizationUrl.searchParams.append('redirect_uri', redirectUri);
@@ -1124,28 +1196,18 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			params.resource = resource;
 		}
 
-		const request = this._buildTokenRequest(params);
 		this._logger.info(`Exchanging authorization code for token (${this._tokenEndpointAuthMethod} client authentication)...`);
 		this._logger.trace(`Url: ${this._serverMetadata.token_endpoint}`);
+		const prover = this._signInDpopProver;
 		let response: Response;
+		let result: unknown;
 		try {
-			response = await this._fetch(this._serverMetadata.token_endpoint, {
-				method: 'POST',
-				headers: request.headers,
-				body: request.body
-			});
+			({ response, result } = await this._postTokenRequest(params, prover));
 		} catch (err) {
 			this._logger.error(`Failed to exchange authorization code for token: ${redact(String(err))}`);
 			throw new Error(`Failed to exchange authorization code for token: ${redact(String(err))}`);
 		}
-
-		let result: unknown;
-		try {
-			result = await response.json();
-		} catch {
-			result = undefined;
-		}
-		const token = this._acceptTokenResponse(response, result);
+		const token = this._acceptTokenResponse(response, result, prover);
 		if (token) {
 			this._logger.info(`Successfully exchanged authorization code for token (${this._describeTokenResponse(token)}).`);
 			return token;
@@ -1158,7 +1220,11 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		throw new Error(`Token exchange failed: ${response.status} ${response.statusText} - ${redact(description)}`);
 	}
 
-	protected async exchangeRefreshTokenForToken(refreshToken: string, scopes: readonly string[], allowClientRegistration: boolean): Promise<IAuthorizationToken> {
+	/**
+	 * @param dpopKey The DPoP key the token being refreshed is bound to: a public client's refresh
+	 * token is bound to it too (RFC 9449 section 5), so the request proves possession of it.
+	 */
+	protected async exchangeRefreshTokenForToken(refreshToken: string, scopes: readonly string[], allowClientRegistration: boolean, dpopKey?: JsonWebKey): Promise<IAuthorizationToken> {
 		if (!this._serverMetadata.token_endpoint) {
 			throw new Error('Token endpoint not available in server metadata');
 		}
@@ -1181,27 +1247,19 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			params.resource = resource;
 		}
 
-		const request = this._buildTokenRequest(params);
-		this._logger.info(`Refreshing the token (${this._tokenEndpointAuthMethod} client authentication)...`);
+		this._logger.info(`Refreshing the ${dpopKey ? 'DPoP-bound ' : ''}token (${this._tokenEndpointAuthMethod} client authentication)...`);
+		let prover: OAuthDpopProver | undefined;
 		let response: Response;
+		let result: unknown;
 		try {
-			response = await this._fetch(this._serverMetadata.token_endpoint, {
-				method: 'POST',
-				headers: request.headers,
-				body: request.body
-			});
+			prover = dpopKey ? await OAuthDpopProver.fromPrivateJwk(dpopKey) : undefined;
+			({ response, result } = await this._postTokenRequest(params, prover));
 		} catch (err) {
 			throw new Error(`Failed to refresh the token: ${redact(String(err))}`);
 		}
 
-		let result: unknown;
-		try {
-			result = await response.json();
-		} catch {
-			result = undefined;
-		}
-		// The rules of the code grant: an HTTP 200 response with a usable bearer token, whatever else parses.
-		const token = this._acceptTokenResponse(response, result);
+		// The rules of the code grant: an HTTP 200 response with a usable token, whatever else parses.
+		const token = this._acceptTokenResponse(response, result, prover);
 		if (token) {
 			this._logger.info(`Refreshed the token (${this._describeTokenResponse(token)}).`);
 			return this._bindToken(token, Date.now());
@@ -1273,6 +1331,11 @@ export type IAuthorizationToken = IAuthorizationTokenResponse & {
 	 * token stored before tokens were bound.
 	 */
 	resource?: string;
+	/**
+	 * The private JWK of the DPoP key a `DPoP` token is bound to (RFC 9449): only that key can
+	 * present the token and refresh it, so it is stored with it (in the secret storage).
+	 */
+	dpop_jwk?: JsonWebKey;
 };
 
 export class TokenStore implements Disposable {

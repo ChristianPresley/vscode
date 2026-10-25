@@ -5,7 +5,7 @@
 
 import assert from 'assert';
 import type { ProgressOptions } from 'vscode';
-import { encodeBase64, VSBuffer } from '../../../../base/common/buffer.js';
+import { decodeBase64, encodeBase64, VSBuffer } from '../../../../base/common/buffer.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { IAuthorizationServerMetadata, IAuthorizationTokenResponse, OAuthClientError } from '../../../../base/common/oauth.js';
@@ -28,6 +28,7 @@ import {
 	isExpired,
 	toSession,
 	XaaifyAuthProvider,
+	xaaSecretTransmission,
 } from '../../common/extHostXaaAuthProvider.js';
 import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION } from '../../common/mcpOAuthClientFactory.js';
 
@@ -133,6 +134,7 @@ suite('XaaAuthProvider resource token endpoint', () => {
 	interface IRequest {
 		readonly url: string;
 		readonly body: string | undefined;
+		readonly authorization: string | undefined;
 	}
 
 	/** An XAA provider with a signed-in IdP session (unless `signedOut`) whose requests `respond` answers. */
@@ -142,7 +144,7 @@ suite('XaaAuthProvider resource token endpoint', () => {
 		const signIns: string[] = [];
 		const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 			const url = String(input);
-			requests.push({ url, body: typeof init?.body === 'string' ? init.body : undefined });
+			requests.push({ url, body: typeof init?.body === 'string' ? init.body : undefined, authorization: (init?.headers as Record<string, string> | undefined)?.Authorization });
 			return respond(url);
 		};
 		const loggerService = new class extends mock<ILoggerService>() {
@@ -191,13 +193,13 @@ suite('XaaAuthProvider resource token endpoint', () => {
 		return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	function respondWith(resourceAsIssuer: string, resourceTokenEndpoint: string) {
+	function respondWith(resourceAsIssuer: string, resourceTokenEndpoint: string, authMethods?: string[]) {
 		return (url: string): Response => {
 			if (url === idpMetadata.token_endpoint) {
 				return json({ access_token: jwt({ client_id: 'resource-client', aud: audience }), token_type: 'N_A', issued_token_type: 'urn:ietf:params:oauth:token-type:id-jag' });
 			}
 			if (url.startsWith(`${audience}/.well-known/`)) {
-				return json({ issuer: resourceAsIssuer, token_endpoint: resourceTokenEndpoint, response_types_supported: ['code'] });
+				return json({ issuer: resourceAsIssuer, token_endpoint: resourceTokenEndpoint, response_types_supported: ['code'], ...(authMethods ? { token_endpoint_auth_methods_supported: authMethods } : {}) });
 			}
 			if (url === resourceTokenEndpoint) {
 				return json({ access_token: 'resource-access-token', token_type: 'Bearer' });
@@ -284,6 +286,25 @@ suite('XaaAuthProvider resource token endpoint', () => {
 			accessToken: 'resource-access-token',
 			redemptions: ['resource-secret'],
 		});
+	});
+
+	test('the resource client secret goes in the body, unless the resource authorization server lists client_secret_basic and not client_secret_post', async () => {
+		const redemption = async (authMethods: string[] | undefined) => {
+			const created = createProvider(respondWith(audience, `${audience}/token`, authMethods));
+			await created.provider.createSession(['mcp.read'], sessionOptions);
+			const request = created.requests.find(r => r.url === `${audience}/token`)!;
+			return { body: new URLSearchParams(request.body).get('client_secret'), basic: request.authorization ? decodeBase64(request.authorization.substring('Basic '.length)).toString() : undefined };
+		};
+		assert.deepStrictEqual([
+			await redemption(undefined),
+			await redemption(['client_secret_basic', 'client_secret_post']),
+			await redemption(['client_secret_basic']),
+		], [
+			{ body: 'resource-secret', basic: undefined },
+			{ body: 'resource-secret', basic: undefined },
+			{ body: null, basic: 'resource-client:resource-secret' },
+		]);
+		assert.deepStrictEqual([xaaSecretTransmission(['client_secret_basic'], undefined), xaaSecretTransmission(['private_key_jwt'], 's')], ['none', 'client_secret_post']);
 	});
 
 	test('a refused audience ends the sign-in before the user signs in to the IdP', async () => {

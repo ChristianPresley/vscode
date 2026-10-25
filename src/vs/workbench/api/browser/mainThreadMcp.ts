@@ -35,12 +35,13 @@ import { IDynamicAuthenticationProviderStorageService } from '../../services/aut
 import { canonicalResourceUri, OAuthClientError } from '../../../base/common/oauth.js';
 import { IMcpRemoteServerOAuthConfiguration } from '../../../platform/mcp/common/mcpPlatformTypes.js';
 import { parseStoredClientSecret, serializeStoredClientSecret } from '../../contrib/mcp/common/mcpOAuthClientSecret.js';
-import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION, MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION, previousMcpAuthorizationFallbackScopes, resolveMcpOAuthPolicy, selectMcpAuthorizationScopes } from '../common/mcpOAuthClientFactory.js';
+import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION, MCP_OAUTH_DPOP_SESSION_OPTION, MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION, previousMcpAuthorizationFallbackScopes, resolveMcpOAuthPolicy, selectMcpAuthorizationScopes } from '../common/mcpOAuthClientFactory.js';
+import { storedDpopKey } from '../../../base/common/oauthDpop.js';
 import { ExtensionHostKind, extensionHostKindToString } from '../../services/extensions/common/extensionHostKind.js';
 import { IExtensionService } from '../../services/extensions/common/extensions.js';
 import { IExtHostContext, extHostNamedCustomer } from '../../services/extensions/common/extHostCustomers.js';
 import { Proxied } from '../../services/extensions/common/proxyIdentifier.js';
-import { ExtHostContext, ExtHostMcpShape, IMcpAuthenticationDetails, IMcpAuthenticationOptions, IAuthMetadataSource, IMcpGatewayServerDto, IMcpGatewayStartOptionsDto, IMcpRegisteredAuthorizationServer, MainContext, MainThreadMcpShape } from '../common/extHost.protocol.js';
+import { ExtHostContext, ExtHostMcpShape, IMcpAccessTokenBinding, IMcpAuthenticationDetails, IMcpAuthenticationOptions, IAuthMetadataSource, IMcpGatewayServerDto, IMcpGatewayStartOptionsDto, IMcpRegisteredAuthorizationServer, MainContext, MainThreadMcpShape } from '../common/extHost.protocol.js';
 
 /** A gateway server for the extension host; `grpcAddress` only when the gateway serves gRPC. */
 function gatewayServerDto(server: IMcpGatewayResultServer): IMcpGatewayServerDto {
@@ -141,6 +142,8 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 	private readonly _serverResources = new Map<number, Set<string>>();
 	/** Running servers whose HTTP identity others can share ({@link sharedHttpIdentityOwner}), with their own URL. */
 	private readonly _sharedIdentityServers = new Map<number, string>();
+	/** The dynamic provider each server's last token came from: {@link $getAccessTokenBinding} reads the token's binding there. */
+	private readonly _serverTokenProviders = new Map<number, string>();
 	/**
 	 * The dynamic providers each such URL obtained a token through in this window: the only
 	 * registrations it learns of, since the stored ones are keyed by the shared identity.
@@ -403,6 +406,7 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 			this._serverRequestUrls.delete(id);
 			this._serverResources.delete(id);
 			this._sharedIdentityServers.delete(id);
+			this._serverTokenProviders.delete(id);
 			this._insecureGrpcServers.delete(id);
 			this._serverAuthTracking.untrack(id);
 		}
@@ -595,7 +599,11 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 			authorizationServer, clientId: resolvedClientId, resource: authDetails.resourceMetadata?.resource ?? authDetails.resource, clientSecretStorageKey,
 			// The provider may be shared with callers whose rules differ (the agent host): this server's rules go with each request.
 			allowInsecureHttp: policy.allowInsecureHttp || undefined, requireAdvertisedPkce: true,
+			dpop: authDetails.dpop,
 		}, errorOnUserInteraction, clientSecret, previousMcpAuthorizationFallbackScopes(scopesInput));
+		if (token) {
+			this._serverTokenProviders.set(id, providerId);
+		}
 		if (token && clientSecretStorageKey && clientSecret !== undefined && boundIssuer === undefined) {
 			// First successful use: bind the pre-registered credentials to this issuer.
 			await this._bindClientSecret(clientSecretStorageKey, authDetails.authorizationServerMetadata.issuer, clientSecret);
@@ -674,6 +682,69 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 			}
 		}
 		return registered;
+	}
+
+	/**
+	 * The DPoP key a token of {@link $getTokenFromServerMetadata} is bound to: the dynamic provider
+	 * the server's last token came from stores a DPoP-bound token with its key (in the secret
+	 * storage). Only that provider's tokens are answered, so a server learns no other server's key;
+	 * `undefined` for a bearer token.
+	 */
+	async $getAccessTokenBinding(id: number, accessToken: string): Promise<IMcpAccessTokenBinding | undefined> {
+		const providerId = this._serverTokenProviders.get(id);
+		if (providerId === undefined || !this._serverDefinitions.has(id)) {
+			return undefined;
+		}
+		try {
+			const registration = await this._dynamicAuthenticationProviderStorageService.getClientRegistration(providerId);
+			if (registration?.clientId === undefined) {
+				return undefined;
+			}
+			const tokens = await this._dynamicAuthenticationProviderStorageService.getSessionsForDynamicAuthProvider(providerId, registration.clientId);
+			const stored = tokens?.find(token => token.access_token === accessToken);
+			const dpopKey = stored ? storedDpopKey(stored) : undefined;
+			return dpopKey ? { dpopKey } : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * The client secret of a machine client (`oauth.grant` other than `authorization_code`), which
+	 * the transport's grant authenticates with at the authorization server `issuer`: only for the
+	 * server's own `oauth.clientId`, from the secret storage of the *Set Client Secret* code lens.
+	 * As for a user's sign-in, the secret belongs to one authorization server: the configured one
+	 * (`oauth.authorizationServer`) or the one it was first used with, to which an unbound secret is
+	 * bound now; another gets an `issuer_not_registered` error and no secret.
+	 */
+	async $getMcpOAuthClientSecret(id: number, clientId: string, issuer: string): Promise<string | undefined> {
+		const server = this._serverDefinitions.get(id);
+		if (!server || (server.launch.type !== McpServerTransportType.HTTP && server.launch.type !== McpServerTransportType.Grpc)) {
+			return undefined;
+		}
+		const oauth = server.launch.oauth as IMcpRemoteServerOAuthConfiguration | undefined;
+		const policy = resolveMcpOAuthPolicy(oauth);
+		if (policy.grant === 'authorization_code' || oauth?.clientId !== clientId) {
+			return undefined;
+		}
+		const key = mcpOAuthClientSecretStorageKey(server.launch.uri.toString(true), clientId);
+		let stored;
+		try {
+			stored = parseStoredClientSecret(await this._secretStorageService.get(key));
+		} catch {
+			return undefined;
+		}
+		if (stored?.clientSecret === undefined) {
+			return undefined;
+		}
+		const expectedIssuer = policy.authorizationServer ?? stored.issuer;
+		if (expectedIssuer !== undefined && expectedIssuer !== issuer) {
+			throw issuerMismatchError(clientId, server.label, expectedIssuer, issuer);
+		}
+		if (stored.issuer === undefined) {
+			await this._bindClientSecret(key, issuer, stored.clientSecret);
+		}
+		return stored.clientSecret;
 	}
 
 	/**
@@ -760,10 +831,13 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		clientSecret?: string,
 		previousScopes?: string[],
 	): Promise<string | undefined> {
-		const { authorizationServer, clientId, resource, audience, allowInsecureHttp, requireAdvertisedPkce } = authContext;
+		const { authorizationServer, clientId, resource, audience, allowInsecureHttp, requireAdvertisedPkce, dpop } = authContext;
 		const providerOptions: IAuthenticationProviderSessionOptions = { authorizationServer, clientId, clientSecret, resource, audience };
 		if (allowInsecureHttp) {
 			providerOptions[MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION] = true;
+		}
+		if (dpop) {
+			providerOptions[MCP_OAUTH_DPOP_SESSION_OPTION] = true;
 		}
 		if (requireAdvertisedPkce) {
 			providerOptions[MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION] = true;
@@ -1084,6 +1158,8 @@ export interface IMcpServerAuthContext {
 	readonly requireAdvertisedPkce?: boolean;
 	/** Secret-storage reference; the secret itself is never retained here. */
 	readonly clientSecretStorageKey?: string;
+	/** Whether the dynamic provider requests a DPoP-bound token for this request (RFC 9449). */
+	readonly dpop?: boolean;
 }
 
 /**

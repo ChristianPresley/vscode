@@ -743,7 +743,7 @@ export interface IMetadataRequestInit {
 }
 
 /** The metadata that carries credentials; trace logs show it blanked, as on Streamable HTTP. */
-const CREDENTIAL_METADATA: ReadonlySet<string> = new Set(['authorization', 'proxy-authorization', 'cookie', 'set-cookie']);
+const CREDENTIAL_METADATA: ReadonlySet<string> = new Set(['authorization', 'dpop', 'proxy-authorization', 'cookie', 'set-cookie']);
 
 /** Redirects of an authorization metadata request that are followed, as on Streamable HTTP. */
 const MAX_METADATA_REDIRECTS = 5;
@@ -862,7 +862,9 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 			// The gRPC port serves no HTTP/1.1: the protected resource is the server's HTTPS identity.
 			resourceUrl: () => `https://${this._authority}/`,
 			fetchMetadata: (url, init, transportHeaders, signal) => this._fetchMetadata(url, init, transportHeaders, signal),
+			fetchToken: (url, init, signal) => this._fetchToken(url, init, signal),
 			log: (level, message) => this._log(level, message),
+			readFile: path => readFile(untildify(path, homedir()), 'utf-8'),
 		}));
 		this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Running });
 		// The mcp.json schema rejects these values; a configuration that has them anyway still works.
@@ -1195,6 +1197,12 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 				throw new CancellationError();
 			}
 			this._noteTokenSent(callMetadata);
+			// A DPoP-bound token needs a fresh proof for each call: the call is an HTTP/2 POST to its method's path.
+			const target = `${this._secure ? 'https' : 'http'}://${this._authority}${path}`;
+			const signing = this._auth.addDpopProof(callMetadata, 'POST', target);
+			if (signing) {
+				await signing;
+			}
 			this._traceCall(path, callMetadata, callOptions.deadlineMs);
 			const call = channel.call(path, callMetadata, body, callOptions);
 			active.call = call;
@@ -1227,6 +1235,7 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 			if (active.cancelled) {
 				throw new CancellationError();
 			}
+			this._auth.observeResponse(target, callMetadata, { get: name => trailers.raw[name.toLowerCase()] ?? null });
 			const challengeStatus = received === 0 ? authChallengeStatus(trailers) : undefined;
 			if (challengeStatus === undefined) {
 				this._auth.onDidAccept(callMetadata);
@@ -1236,7 +1245,7 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 				this._log(LogLevel.Warning, `${grpcStatusName(trailers.status)} from ${this._authority} after ${cycle} authorization attempts; giving up on this call`);
 				return trailers;
 			}
-			if (!await this._handleChallenge(challengeStatus, trailers.raw['www-authenticate'], callMetadata, active)) {
+			if (!await this._handleChallenge(challengeStatus, trailers.raw['www-authenticate'], callMetadata, active, trailers.raw['dpop-nonce'])) {
 				return trailers;
 			}
 			this._log(LogLevel.Debug, `Retrying ${path} after ${grpcStatusName(trailers.status)} with a new token`);
@@ -1249,18 +1258,41 @@ export class McpGrpcHandle extends Disposable implements IMcpExtHostHandle {
 	 * or disposal), so that cancelling the call ends its discovery (and aborts
 	 * the metadata request in flight) and stops it waiting for other challenges.
 	 */
-	private async _handleChallenge(status: 401 | 403, wwwAuthenticate: string | undefined, metadata: Record<string, string>, active: IActiveCall): Promise<boolean> {
+	private async _handleChallenge(status: 401 | 403, wwwAuthenticate: string | undefined, metadata: Record<string, string>, active: IActiveCall, dpopNonce?: string): Promise<boolean> {
 		const cts = new CancellationTokenSource();
 		active.onCancel = () => cts.cancel();
 		if (active.cancelled || this._store.isDisposed) {
 			cts.cancel();
 		}
 		try {
-			return await this._auth.handleChallenge(status, wwwAuthenticate, metadata, cts.token);
+			return await this._auth.handleChallenge(status, wwwAuthenticate, metadata, cts.token, dpopNonce);
 		} finally {
 			active.onCancel = undefined;
 			cts.dispose();
 		}
+	}
+
+	/**
+	 * A token request of a machine client's grant: to the authorization
+	 * server's token endpoint only, with its own headers (the client
+	 * authentication and the DPoP proof; none of the configured ones), following
+	 * no redirect (the body carries the credentials), within the metadata
+	 * timeout. Disposing the handle or `requestSignal` aborts it.
+	 */
+	private async _fetchToken(url: string, init: Pick<IMetadataRequestInit, 'method' | 'headers' | 'body'>, requestSignal?: AbortSignal): Promise<CommonResponse> {
+		const target = new URL(url);
+		if (target.protocol !== 'https:' && target.protocol !== 'http:') {
+			throw new Error(`The token endpoint ${url} is not an http(s) URL`);
+		}
+		const headers: Record<string, string> = { ...init.headers };
+		setHeader(headers, 'user-agent', `${product.nameLong}/${product.version}`);
+		const signals = [this._abortCtrl.signal, AbortSignal.timeout(this._options.metadataTimeoutMs ?? DEFAULT_METADATA_TIMEOUT_MS)];
+		if (requestSignal) {
+			signals.push(requestSignal);
+		}
+		const fetchOnce = this._options.fetchMetadata ?? ((destination: string, request: IMetadataRequestInit): Promise<CommonResponse> => fetch(destination, request));
+		this._log(LogLevel.Trace, `Token request to ${target.origin}${target.pathname}`);
+		return fetchOnce(url, { method: init.method, headers, body: init.body, redirect: 'manual', signal: AbortSignal.any(signals) });
 	}
 
 	/**
