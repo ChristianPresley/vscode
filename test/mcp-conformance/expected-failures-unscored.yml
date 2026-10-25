@@ -4,16 +4,10 @@
 # against this file: a failure that is not listed fails the run, and so does a
 # listed scenario or check that passes.
 #
-# The client implements none of the authorization extensions (OAuth client
+# The client implements the four authorization extensions (OAuth client
 # credentials, enterprise-managed authorization, DPoP, workload identity
-# federation), so their six scenarios are listed whole.
-client:
-  - auth/client-credentials-basic
-  - auth/client-credentials-jwt
-  - auth/dpop
-  - auth/dpop-nonce
-  - auth/enterprise-managed-authorization
-  - auth/wif-jwt-bearer
+# federation): every check of their six scenarios passes at both revisions.
+client: []
 # The server leg runs against the gateway fixture (milestone M6), which serves
 # the Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663, milestone
 # M9): every check of the ten `tasks-*` scenarios passes. That includes

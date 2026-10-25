@@ -48,12 +48,12 @@ One row per scenario that the requirement sets of `@modelcontextprotocol/conform
 | client | 2026-07-28 | `http-custom-headers` | scored | driven | mirrors the `x-mcp-header` parameters into `Mcp-Param-*` headers |
 | client | 2026-07-28 | `http-invalid-tool-headers` | scored | driven | drops the tools whose `x-mcp-header` annotations are invalid |
 | client | 2026-07-28 | `json-schema-ref-no-deref` | scored | driven | never dereferences a network `$ref` of an input schema |
-| client | 2026-07-28 | `auth/client-credentials-jwt` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
-| client | 2026-07-28 | `auth/client-credentials-basic` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
-| client | 2026-07-28 | `auth/enterprise-managed-authorization` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
-| client | 2026-07-28 | `auth/dpop` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
-| client | 2026-07-28 | `auth/dpop-nonce` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
-| client | 2026-07-28 | `auth/wif-jwt-bearer` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
+| client | 2026-07-28 | `auth/client-credentials-jwt` | not-scored | driven | extension (`io.modelcontextprotocol/oauth-client-credentials`): the client credentials grant with `private_key_jwt`, signed with the key of the context |
+| client | 2026-07-28 | `auth/client-credentials-basic` | not-scored | driven | extension (`io.modelcontextprotocol/oauth-client-credentials`): the client credentials grant with the client secret of the context (`client_secret_basic`) |
+| client | 2026-07-28 | `auth/enterprise-managed-authorization` | not-scored | driven | extension (enterprise-managed authorization): the ID token of the context is exchanged for an ID-JAG at the identity provider, which the resource authorization server redeems (JWT authorization grant, `client_secret_basic`) |
+| client | 2026-07-28 | `auth/dpop` | not-scored | driven | extension (`io.modelcontextprotocol/auth/dpop`): the server challenges with `DPoP` only, so the token request proves possession of the DPoP key and every request carries the token with the `DPoP` scheme and a fresh proof |
+| client | 2026-07-28 | `auth/dpop-nonce` | not-scored | driven | extension (`io.modelcontextprotocol/auth/dpop`): as `auth/dpop`, and the token request and the MCP request are sent again with the nonce of a `use_dpop_nonce` challenge |
+| client | 2026-07-28 | `auth/wif-jwt-bearer` | not-scored | driven | extension (`io.modelcontextprotocol/auth/wif`): a JWT authorization grant with the workload identity JWT of the context, without a client |
 | client | 2026-07-28 | `json-schema-2020-12-preservation` | not-scored | driven | added-after-release: echoes the focal tool's `inputSchema` exactly as received |
 
 ### 2025-11-25
@@ -78,12 +78,12 @@ One row per scenario that the requirement sets of `@modelcontextprotocol/conform
 | client | 2025-11-25 | `auth/token-endpoint-auth-post` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
 | client | 2025-11-25 | `auth/token-endpoint-auth-none` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
 | client | 2025-11-25 | `auth/pre-registration` | scored | driven | OAuth (M5): the transport answers the challenges; the conformance OAuth client (the product's rule set) registers and authorizes |
-| client | 2025-11-25 | `auth/client-credentials-jwt` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
-| client | 2025-11-25 | `auth/client-credentials-basic` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
-| client | 2025-11-25 | `auth/enterprise-managed-authorization` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
-| client | 2025-11-25 | `auth/dpop` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
-| client | 2025-11-25 | `auth/dpop-nonce` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
-| client | 2025-11-25 | `auth/wif-jwt-bearer` | not-scored | gap | extension: an authorization extension the client does not implement; baselined whole |
+| client | 2025-11-25 | `auth/client-credentials-jwt` | not-scored | driven | extension (`io.modelcontextprotocol/oauth-client-credentials`): the client credentials grant with `private_key_jwt`, signed with the key of the context |
+| client | 2025-11-25 | `auth/client-credentials-basic` | not-scored | driven | extension (`io.modelcontextprotocol/oauth-client-credentials`): the client credentials grant with the client secret of the context (`client_secret_basic`) |
+| client | 2025-11-25 | `auth/enterprise-managed-authorization` | not-scored | driven | extension (enterprise-managed authorization): the ID token of the context is exchanged for an ID-JAG at the identity provider, which the resource authorization server redeems (JWT authorization grant, `client_secret_basic`) |
+| client | 2025-11-25 | `auth/dpop` | not-scored | driven | extension (`io.modelcontextprotocol/auth/dpop`): the server challenges with `DPoP` only, so the token request proves possession of the DPoP key and every request carries the token with the `DPoP` scheme and a fresh proof |
+| client | 2025-11-25 | `auth/dpop-nonce` | not-scored | driven | extension (`io.modelcontextprotocol/auth/dpop`): as `auth/dpop`, and the token request and the MCP request are sent again with the nonce of a `use_dpop_nonce` challenge |
+| client | 2025-11-25 | `auth/wif-jwt-bearer` | not-scored | driven | extension (`io.modelcontextprotocol/auth/wif`): a JWT authorization grant with the workload identity JWT of the context, without a client |
 | client | 2025-11-25 | `json-schema-2020-12-preservation` | not-scored | driven | added-after-release: echoes the focal tool's `inputSchema` exactly as received |
 
 ## Server leg

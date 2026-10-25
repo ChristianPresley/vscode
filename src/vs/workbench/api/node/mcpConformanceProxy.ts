@@ -12,7 +12,7 @@ import { UriComponents } from '../../../base/common/uri.js';
 import { AbstractLogger, LogLevel } from '../../../platform/log/common/log.js';
 import { IMcpMessageTransport } from '../../contrib/mcp/common/mcpRegistryTypes.js';
 import { IMcpMessageEnvelope, IMcpRequestAbort, McpCollectionDefinition, McpConnectionState, McpServerDefinition } from '../../contrib/mcp/common/mcpTypes.js';
-import { IAuthMetadataSource, IMcpAuthenticationDetails, IMcpAuthenticationOptions, MainThreadMcpShape } from '../common/extHost.protocol.js';
+import { IAuthMetadataSource, IMcpAccessTokenBinding, IMcpAuthenticationDetails, IMcpAuthenticationOptions, MainThreadMcpShape } from '../common/extHost.protocol.js';
 import { McpHTTPHandle } from '../common/extHostMcp.js';
 
 /**
@@ -24,12 +24,14 @@ import { McpHTTPHandle } from '../common/extHostMcp.js';
  */
 
 /**
- * Supplies bearer tokens to the transport. The conformance client installs
+ * Supplies access tokens to the transport. The conformance client installs
  * one backed by the product's OAuth rule set (`createConformanceTokenSource`
  * in mcpConformanceOAuth.ts); tests may pass their own.
  */
 export interface IConformanceTokenSource {
 	getToken(details: IMcpAuthenticationDetails, options: IMcpAuthenticationOptions | undefined): Promise<string | undefined>;
+	/** The DPoP key a token of {@link getToken} is bound to; a source of bearer tokens leaves it out. */
+	getBinding?(accessToken: string): Promise<IMcpAccessTokenBinding | undefined>;
 }
 
 export interface IConformanceStateEvent {
@@ -111,6 +113,10 @@ export class ConformanceMainThreadMcp extends Disposable implements MainThreadMc
 
 	async $getTokenForProviderId(_id: number, _providerId: string, _scopes: string[], _options?: IMcpAuthenticationOptions): Promise<string | undefined> {
 		return undefined; // no authentication providers outside the workbench
+	}
+
+	async $getAccessTokenBinding(_id: number, accessToken: string): Promise<IMcpAccessTokenBinding | undefined> {
+		return this.tokenSource?.getBinding?.(accessToken);
 	}
 
 	$logMcpAuthSetup(data: IAuthMetadataSource): void {

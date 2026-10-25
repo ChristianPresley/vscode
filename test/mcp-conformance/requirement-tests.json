@@ -115,7 +115,7 @@
 				},
 				{
 					"file": "src/vs/base/test/common/oauthClient.test.ts",
-					"test": "parseBearerChallenge reads the Bearer challenge only"
+					"test": "parseOAuthChallenge reads the Bearer or DPoP challenge only"
 				},
 				{
 					"file": "src/vs/workbench/api/test/common/extHostMcpAuth.test.ts",

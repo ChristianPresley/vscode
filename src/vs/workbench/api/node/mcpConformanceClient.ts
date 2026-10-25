@@ -23,7 +23,8 @@ import { McpSkills } from '../../../platform/mcp/common/modelContextProtocolSkil
 import { McpTaskManager } from '../../contrib/mcp/common/mcpTaskManager.js';
 import { IMcpClientMethods, McpServerTransportHTTP, McpServerTransportType } from '../../contrib/mcp/common/mcpTypes.js';
 import { McpHTTPHandle } from '../common/extHostMcp.js';
-import { CONFORMANCE_LAUNCH_OAUTH, createConformanceOAuthClient, createConformanceTokenSource } from './mcpConformanceOAuth.js';
+import { OAuthDpopProver } from '../../../base/common/oauthDpop.js';
+import { CONFORMANCE_LAUNCH_OAUTH, conformanceGrantFor, createConformanceOAuthClient, createConformanceTokenSource } from './mcpConformanceOAuth.js';
 import { ConformanceMainThreadMcp, IConformanceContext, IConformanceTokenSource, InProcessMcpTransport, parseConformanceContext, StderrLogger } from './mcpConformanceProxy.js';
 import { IScenarioClient, resolveScenario, schemaDefaults } from './mcpConformanceScenarios.js';
 
@@ -276,9 +277,14 @@ export async function main(argv: readonly string[], env: ConformanceEnv, options
 		if (options.tokenSource) {
 			proxy.tokenSource = options.tokenSource;
 		} else {
-			// Every authorization scenario runs through the product's OAuth rule set.
+			// Every authorization scenario runs through the product's OAuth rule set: the user's grant, or a
+			// machine client's when the scenario's context carries its credentials, DPoP-bound when the
+			// server accepts such tokens.
+			const dpop = await OAuthDpopProver.generate();
 			const oauthClient = disposables.add(createConformanceOAuthClient({
 				context: args.context,
+				grant: await conformanceGrantFor(args.scenario, args.context),
+				dpop,
 				protocolVersion: args.protocolVersion,
 				log: (level, message) => {
 					switch (level) {
@@ -288,7 +294,7 @@ export async function main(argv: readonly string[], env: ConformanceEnv, options
 					}
 				},
 			}));
-			proxy.tokenSource = createConformanceTokenSource(oauthClient);
+			proxy.tokenSource = createConformanceTokenSource(oauthClient, dpop);
 		}
 		const launch: McpServerTransportHTTP = { type: McpServerTransportType.HTTP, uri: URI.parse(args.serverUrl), headers: [], oauth: CONFORMANCE_LAUNCH_OAUTH };
 		const createHandle = options.createHandle ?? ((id, l, p, log) => new McpHTTPHandle(id, l, p, log, true));

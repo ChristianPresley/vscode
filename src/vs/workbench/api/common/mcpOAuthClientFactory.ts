@@ -4,7 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata } from '../../../base/common/oauth.js';
-import { IOAuthClientOptions, IOAuthClientStorage, IOAuthFetch, IOAuthRegistrationOptions, OAuthAuthorizeStrategy, OAuthClient, OAuthLogLevel, selectScopes } from '../../../base/common/oauthClient.js';
+import { IOAuthClientOptions, IOAuthClientStorage, IOAuthFetch, IOAuthRegistrationOptions, OAuthAuthorizeStrategy, OAuthClient, OAuthGrant, OAuthLogLevel, selectScopes } from '../../../base/common/oauthClient.js';
+import { IOAuthDpopProver } from '../../../base/common/oauthDpop.js';
 import { IMcpRemoteServerOAuthConfiguration } from '../../../platform/mcp/common/mcpPlatformTypes.js';
 import { WORKBENCH_ONLY_SESSION_OPTION_PREFIX } from '../../services/authentication/common/authentication.js';
 
@@ -32,7 +33,26 @@ export interface IMcpOAuthServerPolicy {
 	readonly allowInsecureHttp: boolean;
 	/** The issuer pre-registered credentials are bound to, when configured. */
 	readonly authorizationServer?: string;
+	/** How tokens are obtained: a user's sign-in, or a machine client's grant. */
+	readonly grant: McpOAuthGrantKind;
+	/** `oauth.dpop`: request DPoP-bound tokens always (`true`) or never (`false`); `undefined` follows the server ({@link mcpWantsDpop}). */
+	readonly dpop: boolean | undefined;
 }
+
+export type McpOAuthGrantKind = 'authorization_code' | 'client_credentials' | 'workload_identity';
+
+/** Whether a token for a server is requested DPoP-bound: as `oauth.dpop` says, else when the server requires DPoP-bound tokens. */
+export function mcpWantsDpop(policy: Pick<IMcpOAuthServerPolicy, 'dpop'>, resourceRequiresDpop: boolean): boolean {
+	return policy.dpop ?? resourceRequiresDpop;
+}
+
+/**
+ * The session option with which the workbench asks a dynamic provider to request a DPoP-bound
+ * token (RFC 9449) for that request, from an authorization server that supports DPoP: the
+ * MCP server requires such tokens, or its `oauth.dpop` asks for them. Workbench-only, like
+ * {@link MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION}.
+ */
+export const MCP_OAUTH_DPOP_SESSION_OPTION = `${WORKBENCH_ONLY_SESSION_OPTION_PREFIX}McpOAuthDpop`;
 
 /**
  * The session option with which the workbench hands a server's `oauth.allowInsecureHttp` to the
@@ -57,6 +77,8 @@ export function resolveMcpOAuthPolicy(config: IMcpRemoteServerOAuthConfiguration
 		pkce: config?.pkce === 'assume-supported' || config?.pkce === 'require-advertised' ? config.pkce : (defaults.pkce ?? 'require-advertised'),
 		allowInsecureHttp: typeof config?.allowInsecureHttp === 'boolean' ? config.allowInsecureHttp : (defaults.allowInsecureHttp ?? false),
 		authorizationServer: typeof config?.authorizationServer === 'string' && config.authorizationServer.length > 0 ? config.authorizationServer : defaults.authorizationServer,
+		grant: config?.grant === 'client_credentials' || config?.grant === 'workload_identity' || config?.grant === 'authorization_code' ? config.grant : (defaults.grant ?? 'authorization_code'),
+		dpop: typeof config?.dpop === 'boolean' ? config.dpop : defaults.dpop,
 	};
 }
 
@@ -73,6 +95,10 @@ export interface IMcpOAuthClientFactoryOptions {
 	readonly sameOriginHeaders?: Record<string, string>;
 	/** Synthesize the 2025-03-26 default endpoints for servers that serve no protected resource metadata. */
 	readonly legacyDefaultEndpoints?: boolean;
+	/** A machine client's grant; a user's authorization code grant by default. */
+	readonly grant?: OAuthGrant;
+	/** The key DPoP-bound tokens are requested with. */
+	readonly dpop?: IOAuthDpopProver;
 	readonly log?: (level: OAuthLogLevel, message: string) => void;
 }
 
@@ -99,6 +125,8 @@ export function mcpOAuthClientOptions(options: IMcpOAuthClientFactoryOptions): I
 		maxAuthorizationRequests: MCP_OAUTH_MAX_AUTHORIZATION_REQUESTS,
 		requestOfflineAccess: true,
 		legacyDefaultEndpoints: options.legacyDefaultEndpoints ?? false,
+		grant: options.grant,
+		dpop: options.dpop,
 	};
 }
 

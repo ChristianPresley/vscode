@@ -169,6 +169,10 @@ export class NodeExtHostMpcService extends ExtHostMcpService {
 class McpHTTPHandleNode extends McpHTTPHandle {
 	private readonly _undici = new Lazy(() => import('undici'));
 
+	protected override _readCredentialFile(path: string): Promise<string> {
+		return readFile(untildify(path, homedir()), 'utf8');
+	}
+
 	protected override async _fetchInternal(url: string, init?: CommonRequestInit): Promise<CommonResponse> {
 		// Note: imported async so that we can ensure we load undici after proxy patches have been applied
 		const { fetch, Agent } = await this._undici.value;

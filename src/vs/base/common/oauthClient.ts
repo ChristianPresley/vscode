@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { raceCancellationError } from './async.js';
+import { decodeBase64 } from './buffer.js';
 import { CancellationToken } from './cancellation.js';
 import { CancellationError, isCancellationError } from './errors.js';
 import { Emitter, Event } from './event.js';
@@ -17,6 +18,8 @@ import {
 	fetchAuthorizationServerMetadata,
 	fetchDynamicRegistration,
 	getDefaultMetadataForUrl,
+	GRANT_TYPE_JWT_BEARER,
+	GRANT_TYPE_TOKEN_EXCHANGE,
 	IAuthorizationProtectedResourceMetadata,
 	IAuthorizationRedirectParams,
 	IAuthorizationServerMetadata,
@@ -34,8 +37,12 @@ import {
 	pkceSupported,
 	selectRegistrationAuthMethod,
 	selectTokenEndpointAuthMethod,
+	TOKEN_TYPE_ID_JAG,
+	TOKEN_TYPE_ID_TOKEN,
 	validateIssuerParameter,
 } from './oauth.js';
+import { authorizationServerSupportsDpop, DPOP_HEADER, DPOP_NONCE_HEADER, DPOP_SCHEME, IOAuthDpopProver, isDpopTokenType, USE_DPOP_NONCE_ERROR } from './oauthDpop.js';
+import { base64UrlEncode, IJwsSigningKey, signJwt } from './oauthJose.js';
 
 /**
  * A UI-free OAuth 2.1 client implementing the MCP 2026-07-28 authorization
@@ -46,6 +53,15 @@ import {
  * grant with PKCE `S256`, RFC 8707 resource indicators, RFC 9207 `iss`
  * validation, token refresh and scope step-up. The browser interaction is
  * injected as an {@link OAuthAuthorizeStrategy} so the core can run headless.
+ *
+ * It also implements the authorization extensions of MCP for machine clients
+ * ({@link OAuthGrant}): the client credentials grant
+ * (`io.modelcontextprotocol/oauth-client-credentials`, with a client secret
+ * or `private_key_jwt`) and the JWT authorization grant of RFC 7523 section
+ * 2.1, whose assertion is a workload identity JWT
+ * (`io.modelcontextprotocol/auth/wif`) or an ID-JAG of enterprise-managed
+ * authorization ({@link requestIdJag}); and DPoP-bound tokens
+ * (`io.modelcontextprotocol/auth/dpop`, RFC 9449) for every grant.
  */
 
 //#region fetch
@@ -75,6 +91,9 @@ export type IOAuthFetch = (url: string, init: IOAuthFetchInit) => Promise<IOAuth
 
 export type OAuthRegistrationKind = 'pre-registered' | 'cimd' | 'dcr' | 'prompt';
 
+/** How an access token is presented: as a bearer token (RFC 6750), or bound to a DPoP key (RFC 9449). */
+export type OAuthTokenType = 'Bearer' | 'DPoP';
+
 /** What the client remembers about a resource, keyed by its canonical URI. */
 export interface IOAuthClientRecord {
 	/** The issuer of the authorization server the registration and tokens belong to. */
@@ -91,6 +110,14 @@ export interface IOAuthClientRecord {
 	readonly scopes?: readonly string[];
 	/** Authorization requests made for the resource by this client instance. */
 	readonly authorizationRequests: number;
+	/** `DPoP` when the access token is bound to the key of {@link dpopThumbprint}; a bearer token otherwise. */
+	readonly tokenType?: OAuthTokenType;
+	/**
+	 * The thumbprint of the DPoP key the token requests were made with. The
+	 * tokens (a public client's refresh token too, RFC 9449 section 5) only work
+	 * with that key, so a client with another key does not use them.
+	 */
+	readonly dpopThumbprint?: string;
 }
 
 export interface IOAuthClientStorage {
@@ -158,6 +185,53 @@ export type OAuthAuthorizeResult =
 /** Opens the authorization URL for the user and resolves with the redirect; headless tests resolve immediately. */
 export type OAuthAuthorizeStrategy = (request: IOAuthAuthorizeRequest, token: CancellationToken) => Promise<OAuthAuthorizeResult>;
 
+/**
+ * The credentials of a pre-registered client: a secret, sent as the server
+ * supports it (`client_secret_basic`, else `client_secret_post`), or a private
+ * key for `private_key_jwt` (RFC 7523 section 2.2), which the client
+ * credentials extension recommends.
+ */
+export type OAuthClientCredentials =
+	| { readonly clientId: string; readonly clientSecret: string; readonly privateKey?: undefined }
+	| { readonly clientId: string; readonly privateKey: IJwsSigningKey; readonly keyId?: string; readonly audience?: OAuthClientAssertionAudience; readonly clientSecret?: undefined };
+
+/**
+ * The `aud` of a `private_key_jwt` client assertion: the issuer identifier
+ * (the default, which draft-ietf-oauth-rfc7523bis makes the only value), or
+ * the token endpoint URL, which RFC 7523 section 3 also allows and some
+ * authorization servers (Microsoft Entra ID) require.
+ */
+export type OAuthClientAssertionAudience = 'issuer' | 'token_endpoint';
+
+/** What a JWT authorization grant's assertion is requested for. */
+export interface IOAuthAssertionRequest {
+	readonly serverMetadata: IAuthorizationServerMetadata;
+	/** The RFC 8707 `resource` of the token request. */
+	readonly resource: string;
+	readonly scopes?: readonly string[];
+}
+
+/** Supplies the assertion of a JWT authorization grant, for each token request. */
+export type OAuthAssertionSource = (request: IOAuthAssertionRequest, token: CancellationToken) => Promise<string>;
+
+/** How an {@link OAuthClient} obtains tokens. */
+export type OAuthGrant =
+	/** The authorization code grant with PKCE: a user signs in (the default). */
+	| { readonly kind: 'authorization_code' }
+	/** The client credentials grant of a pre-registered machine client (`io.modelcontextprotocol/oauth-client-credentials`). */
+	| { readonly kind: 'client_credentials'; readonly credentials: OAuthClientCredentials }
+	/**
+	 * The JWT authorization grant (RFC 7523 section 2.1): a workload identity
+	 * JWT (`io.modelcontextprotocol/auth/wif`), or the ID-JAG of
+	 * enterprise-managed authorization. `client` authenticates the request
+	 * (the client of the resource authorization server, for an ID-JAG), or
+	 * only names a public client; without it the request names no client, as
+	 * workload identity federation needs none.
+	 */
+	| { readonly kind: 'jwt_bearer'; readonly assertion: OAuthAssertionSource; readonly client?: OAuthClientCredentials | { readonly clientId: string; readonly clientSecret?: undefined; readonly privateKey?: undefined } };
+
+export type OAuthGrantKind = OAuthGrant['kind'];
+
 export type OAuthLogLevel = 'info' | 'warn' | 'error';
 
 export interface IOAuthClientOptions {
@@ -188,6 +262,16 @@ export interface IOAuthClientOptions {
 	readonly legacyDefaultEndpoints?: boolean;
 	/** Headers sent with protected resource metadata requests to the resource's own origin. */
 	readonly sameOriginHeaders?: Record<string, string>;
+	/** How the client obtains tokens; the authorization code grant by default. */
+	readonly grant?: OAuthGrant;
+	/**
+	 * Ask for DPoP-bound tokens (RFC 9449) with this key from an authorization
+	 * server that lists its algorithm in `dpop_signing_alg_values_supported`:
+	 * every token request carries a proof, and {@link OAuthClient.fetchWithAuth}
+	 * presents a DPoP-bound token with the `DPoP` scheme and a fresh proof. A
+	 * server that issues a bearer token anyway gets that token back as one.
+	 */
+	readonly dpop?: IOAuthDpopProver;
 	/** Receives redacted diagnostics; secrets never reach it. */
 	readonly log?: (level: OAuthLogLevel, message: string) => void;
 }
@@ -222,6 +306,8 @@ export interface IOAuthRegistration {
 	readonly clientId: string;
 	readonly clientSecret?: string;
 	readonly tokenEndpointAuthMethod: OAuthTokenEndpointAuthMethod;
+	/** A key for `private_key_jwt` (RFC 7523 section 2.2), which then authenticates the client instead of {@link tokenEndpointAuthMethod}. */
+	readonly assertionKey?: { readonly key: IJwsSigningKey; readonly keyId?: string; readonly audience?: OAuthClientAssertionAudience };
 }
 
 export interface IOAuthTokenResult {
@@ -229,6 +315,10 @@ export interface IOAuthTokenResult {
 	readonly refreshToken?: string;
 	readonly expiresAt?: number;
 	readonly scopes?: readonly string[];
+	/** `DPoP` for a token bound to the client's DPoP key; a bearer token when absent. */
+	readonly tokenType?: OAuthTokenType;
+	/** The thumbprint of the DPoP key the token request proved possession of, if it carried a proof. */
+	readonly dpopThumbprint?: string;
 }
 
 export interface IOAuthAuthorization extends IOAuthTokenResult {
@@ -245,6 +335,12 @@ export interface IOAuthAcquireTokenRequest {
 	readonly rejectedToken?: string;
 	/** Discard the stored registration and register anew. */
 	readonly forceNewRegistration?: boolean;
+	/**
+	 * Ask for a DPoP-bound token, because the resource requires them ({@link resourceRequiresDpop}). It takes
+	 * effect with a configured {@link IOAuthClientOptions.dpop} prover and an authorization server that
+	 * supports its algorithm.
+	 */
+	readonly dpop?: boolean;
 }
 
 export interface IOAuthAuthorizationCodeGrantRequest {
@@ -254,6 +350,12 @@ export interface IOAuthAuthorizationCodeGrantRequest {
 	readonly resourceIndicator?: string;
 	readonly registration: IOAuthRegistration;
 	readonly scopes?: readonly string[];
+	/**
+	 * Ask for a DPoP-bound token, because the resource requires them ({@link resourceRequiresDpop}). It takes
+	 * effect with a configured {@link IOAuthClientOptions.dpop} prover and an authorization server that
+	 * supports its algorithm.
+	 */
+	readonly dpop?: boolean;
 }
 
 export interface IOAuthRefreshRequest {
@@ -261,10 +363,50 @@ export interface IOAuthRefreshRequest {
 	readonly resource: string;
 	/** The `resource` value to send; {@link resourceIndicatorFor} of `resource` by default. */
 	readonly resourceIndicator?: string;
-	readonly registration: IOAuthRegistration;
+	/** The client the refresh token was issued to; `undefined` for one issued without client identification (a workload identity grant). */
+	readonly registration: IOAuthRegistration | undefined;
 	readonly refreshToken: string;
 	/** The scopes of the token being refreshed, recorded when the server does not echo them. */
 	readonly scopes?: readonly string[];
+	/**
+	 * Ask for a DPoP-bound token, because the resource requires them ({@link resourceRequiresDpop}). It takes
+	 * effect with a configured {@link IOAuthClientOptions.dpop} prover and an authorization server that
+	 * supports its algorithm.
+	 */
+	readonly dpop?: boolean;
+}
+
+export interface IOAuthClientCredentialsGrantRequest {
+	readonly serverMetadata: IAuthorizationServerMetadata;
+	readonly resource: string;
+	/** The `resource` value to send; {@link resourceIndicatorFor} of `resource` by default. */
+	readonly resourceIndicator?: string;
+	readonly credentials: OAuthClientCredentials;
+	readonly scopes?: readonly string[];
+	/**
+	 * Ask for a DPoP-bound token, because the resource requires them ({@link resourceRequiresDpop}). It takes
+	 * effect with a configured {@link IOAuthClientOptions.dpop} prover and an authorization server that
+	 * supports its algorithm.
+	 */
+	readonly dpop?: boolean;
+}
+
+export interface IOAuthJwtBearerGrantRequest {
+	readonly serverMetadata: IAuthorizationServerMetadata;
+	readonly resource: string;
+	/** The `resource` value to send; {@link resourceIndicatorFor} of `resource` by default. */
+	readonly resourceIndicator?: string;
+	/** The JWT presented as the grant (`assertion`). */
+	readonly assertion: string;
+	/** The client that authenticates the request; `undefined` names none. */
+	readonly registration?: IOAuthRegistration;
+	readonly scopes?: readonly string[];
+	/**
+	 * Ask for a DPoP-bound token, because the resource requires them ({@link resourceRequiresDpop}). It takes
+	 * effect with a configured {@link IOAuthClientOptions.dpop} prover and an authorization server that
+	 * supports its algorithm.
+	 */
+	readonly dpop?: boolean;
 }
 
 export interface IOAuthHandleChallengeOptions {
@@ -360,12 +502,21 @@ export function assertSecureOAuthEndpoint(url: string, what: string, allowInsecu
 	}
 }
 
-/** Extracts the first `Bearer` challenge of a `WWW-Authenticate` header. */
-export function parseBearerChallenge(wwwAuthenticate: string | undefined): IOAuthChallenge | undefined {
+/**
+ * Extracts the OAuth challenge of a `WWW-Authenticate` header: its first
+ * challenge of the `preferred` scheme, else its first one of the other. A
+ * resource server that accepts DPoP-bound tokens challenges with the `DPoP`
+ * scheme (RFC 9449 section 7.1), with the same parameters (`resource_metadata`,
+ * `scope`, `error`) as a `Bearer` challenge (RFC 6750, RFC 9728); a client
+ * that presented a DPoP-bound token prefers that one.
+ */
+export function parseOAuthChallenge(wwwAuthenticate: string | undefined, preferred: OAuthTokenType = 'Bearer'): IOAuthChallenge | undefined {
 	if (!wwwAuthenticate) {
 		return undefined;
 	}
-	const challenge = parseWWWAuthenticateHeader(wwwAuthenticate).find(c => c.scheme.toLowerCase() === 'bearer');
+	const challenges = parseWWWAuthenticateHeader(wwwAuthenticate);
+	const ofScheme = (scheme: string) => challenges.find(c => c.scheme.toLowerCase() === scheme.toLowerCase());
+	const challenge = ofScheme(preferred) ?? ofScheme(preferred === 'Bearer' ? DPOP_SCHEME : 'Bearer');
 	if (!challenge) {
 		return undefined;
 	}
@@ -380,6 +531,23 @@ export function parseBearerChallenge(wwwAuthenticate: string | undefined): IOAut
 		error: param('error'),
 		errorDescription: param('error_description'),
 	};
+}
+
+/**
+ * Whether a resource requires DPoP-bound tokens (RFC 9449): its protected
+ * resource metadata sets `dpop_bound_access_tokens_required` (RFC 9728
+ * section 2), or it challenges with the `DPoP` scheme and not with `Bearer`
+ * (section 7.1). VS Code asks for a DPoP-bound token by default only then: an
+ * authorization server may support DPoP for resources that take bearer
+ * tokens, and a resource that takes both is served best by a token every
+ * client of the session can present (a bearer token).
+ */
+export function resourceRequiresDpop(wwwAuthenticate: string | undefined, resourceMetadata: IAuthorizationProtectedResourceMetadata | undefined): boolean {
+	if (resourceMetadata?.dpop_bound_access_tokens_required === true) {
+		return true;
+	}
+	const schemes = wwwAuthenticate ? parseWWWAuthenticateHeader(wwwAuthenticate).map(c => c.scheme.toLowerCase()) : [];
+	return schemes.includes(DPOP_SCHEME.toLowerCase()) && !schemes.includes('bearer');
 }
 
 const REDACTED = '[redacted]';
@@ -423,6 +591,116 @@ export function createHeadlessRedirectAuthorize(fetchImpl: IOAuthFetch): OAuthAu
 	};
 }
 
+export interface IOAuthIdJagRequest {
+	/** The token endpoint of the enterprise identity provider. */
+	readonly tokenEndpoint: string;
+	/** The client the user signed in to the identity provider with; it authenticates the exchange by `tokenEndpointAuthMethod` (`none` by default). */
+	readonly client: { readonly clientId: string; readonly clientSecret?: string; readonly tokenEndpointAuthMethod?: OAuthTokenEndpointAuthMethod };
+	/** The ID token of the user's single sign-on, the `subject_token`. */
+	readonly idToken: string;
+	/** The issuer identifier of the resource authorization server, which redeems the ID-JAG. */
+	readonly audience: string;
+	/** The resource identifier of the MCP server (RFC 9728). */
+	readonly resource?: string;
+	readonly scopes?: readonly string[];
+	readonly fetch: IOAuthFetch;
+	readonly signal?: AbortSignal;
+}
+
+/**
+ * Exchanges the ID token of a single sign-on for an Identity Assertion JWT
+ * Authorization Grant (ID-JAG) at the enterprise identity provider: the token
+ * exchange (RFC 8693) of enterprise-managed authorization, section 4 (the
+ * `audience` is the resource authorization server, the `resource` the MCP
+ * server). The ID-JAG is then the assertion of a JWT authorization grant at
+ * the resource authorization server ({@link OAuthClient.jwtBearerGrant}).
+ */
+export async function requestIdJag(request: IOAuthIdJagRequest): Promise<string> {
+	const auth = buildClientAuthentication(request.client.tokenEndpointAuthMethod ?? 'none', request.client.clientId, request.client.clientSecret);
+	const params: Record<string, string> = {
+		...auth.body,
+		grant_type: GRANT_TYPE_TOKEN_EXCHANGE,
+		requested_token_type: TOKEN_TYPE_ID_JAG,
+		subject_token: request.idToken,
+		subject_token_type: TOKEN_TYPE_ID_TOKEN,
+		audience: request.audience,
+	};
+	if (request.resource) {
+		params.resource = request.resource;
+	}
+	if (request.scopes && request.scopes.length > 0) {
+		params.scope = request.scopes.join(' ');
+	}
+	const response = await request.fetch(request.tokenEndpoint, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json', ...auth.headers },
+		body: new URLSearchParams(params).toString(),
+		signal: request.signal,
+		// The body carries the user's ID token: a redirect would send it elsewhere.
+		redirect: 'manual',
+	});
+	let payload: unknown;
+	try {
+		payload = await response.json();
+	} catch {
+		payload = undefined;
+	}
+	const issued = typeof payload === 'object' && payload !== null ? payload as { readonly access_token?: unknown; readonly issued_token_type?: unknown } : undefined;
+	if (response.status === 200 && typeof issued?.access_token === 'string' && issued.access_token.length > 0) {
+		if (issued.issued_token_type !== undefined && issued.issued_token_type !== TOKEN_TYPE_ID_JAG) {
+			throw new OAuthClientError('token_request_failed', `The identity provider issued a '${String(issued.issued_token_type)}' instead of an ID-JAG`);
+		}
+		return issued.access_token;
+	}
+	const failure = isAuthorizationErrorResponse(payload) ? payload : undefined;
+	const description = failure ? `${failure.error}${failure.error_description ? ` (${failure.error_description})` : ''}` : 'no error details';
+	throw new OAuthClientError('token_request_failed', `The ID-JAG token exchange at ${request.tokenEndpoint} failed with HTTP ${response.status}: ${redact(description)}`, { status: response.status, error: failure?.error, errorDescription: failure?.error_description });
+}
+
+/** Slack for the clock of the issuer of a workload identity JWT. */
+const WORKLOAD_JWT_CLOCK_SKEW_SECONDS = 60;
+
+function withoutTrailingSlash(url: string): string {
+	return url.endsWith('/') ? url.slice(0, -1) : url;
+}
+
+/**
+ * Why a workload identity JWT must not be presented to an authorization
+ * server, or `undefined` when it may be: it must be a signed JWT in the
+ * compact serialization (not `alg: none`), not expired, and issued for this
+ * authorization server (`aud` names its token endpoint, as workload identity
+ * federation requires, or its issuer identifier). A file that holds anything
+ * else, or a JWT for another audience, thus stays on the machine.
+ */
+export function workloadIdentityJwtProblem(jwt: string, serverMetadata: Pick<IAuthorizationServerMetadata, 'issuer' | 'token_endpoint'>, nowMs: number): string | undefined {
+	const parts = jwt.split('.');
+	if (parts.length !== 3 || parts.some(part => !/^[A-Za-z0-9_-]+$/.test(part))) {
+		return 'it is not a JWT in the compact serialization';
+	}
+	let header: unknown;
+	let claims: unknown;
+	try {
+		header = JSON.parse(new TextDecoder().decode(decodeBase64(parts[0]).buffer));
+		claims = JSON.parse(new TextDecoder().decode(decodeBase64(parts[1]).buffer));
+	} catch {
+		return 'its header or claims are not JSON';
+	}
+	const alg = typeof header === 'object' && header !== null ? (header as { readonly alg?: unknown }).alg : undefined;
+	if (typeof alg !== 'string' || alg.toLowerCase() === 'none') {
+		return 'it is not signed';
+	}
+	const { aud, exp } = (typeof claims === 'object' && claims !== null ? claims : {}) as { readonly aud?: unknown; readonly exp?: unknown };
+	if (typeof exp !== 'number' || exp + WORKLOAD_JWT_CLOCK_SKEW_SECONDS <= nowMs / 1000) {
+		return typeof exp === 'number' ? 'it has expired' : 'it has no expiration time';
+	}
+	const audiences = (Array.isArray(aud) ? aud : [aud]).filter((a): a is string => typeof a === 'string').map(withoutTrailingSlash);
+	const accepted = [serverMetadata.issuer, serverMetadata.token_endpoint].filter((a): a is string => typeof a === 'string').map(withoutTrailingSlash);
+	if (!audiences.some(a => accepted.includes(a))) {
+		return `its audience is not the authorization server ${serverMetadata.issuer}`;
+	}
+	return undefined;
+}
+
 function splitScopes(scope: string | undefined): string[] {
 	return scope ? scope.split(/\s+/).filter(s => s.length > 0) : [];
 }
@@ -445,6 +723,37 @@ function isInvalidClientError(error: unknown): boolean {
 	}
 	const detail = error.detail as { readonly error?: unknown } | undefined;
 	return (error.code === 'token_request_failed' || error.code === 'authorization_denied') && detail?.error === 'invalid_client';
+}
+
+const AUTHORIZATION_CODE_GRANT: OAuthGrant = { kind: 'authorization_code' };
+
+/** The `client_assertion_type` of a JWT client assertion (RFC 7523 section 2.2). */
+export const CLIENT_ASSERTION_TYPE_JWT_BEARER = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
+
+/** How long a `private_key_jwt` client assertion is valid; it is signed for each token request. */
+const CLIENT_ASSERTION_LIFETIME_SECONDS = 300;
+
+/**
+ * The registration a machine client's token requests use: none without a
+ * client, a key for `private_key_jwt`, a secret by the server's methods
+ * (`client_secret_basic` unless it only supports `client_secret_post`), or
+ * the id of a public client.
+ */
+function machineRegistration(client: OAuthClientCredentials | { readonly clientId: string; readonly clientSecret?: undefined; readonly privateKey?: undefined } | undefined, serverMetadata: IAuthorizationServerMetadata): IOAuthRegistration | undefined {
+	if (!client) {
+		return undefined;
+	}
+	if (client.privateKey) {
+		return { kind: 'pre-registered', clientId: client.clientId, tokenEndpointAuthMethod: 'none', assertionKey: { key: client.privateKey, keyId: client.keyId, audience: client.audience } };
+	}
+	if (client.clientSecret !== undefined) {
+		const supported = serverMetadata.token_endpoint_auth_methods_supported;
+		if (supported && supported.length > 0 && !supported.includes('client_secret_basic') && !supported.includes('client_secret_post')) {
+			throw new OAuthClientError('grant_unsupported', `The authorization server ${serverMetadata.issuer} accepts no client secret (token_endpoint_auth_methods_supported: ${supported.join(' ')})`);
+		}
+		return { kind: 'pre-registered', clientId: client.clientId, clientSecret: client.clientSecret, tokenEndpointAuthMethod: selectTokenEndpointAuthMethod(undefined, supported, true) };
+	}
+	return { kind: 'pre-registered', clientId: client.clientId, tokenEndpointAuthMethod: 'none' };
 }
 
 //#endregion
@@ -481,6 +790,8 @@ export class OAuthClient extends Disposable {
 	/** The scopes most recently requested at the authorization endpoint per resource. */
 	private readonly lastRequestedScopes = new Map<string, readonly string[]>();
 	private readonly rejections = new Map<string, IRejectionStreak>();
+	/** The last assertion per resource that the authorization server refused; it is not presented again. */
+	private readonly refusedAssertions = new Map<string, string>();
 
 	constructor(private readonly options: IOAuthClientOptions) {
 		super();
@@ -511,7 +822,7 @@ export class OAuthClient extends Disposable {
 	 */
 	async discover(resource: string, wwwAuthenticate?: string, token: CancellationToken = CancellationToken.None): Promise<IOAuthDiscovery> {
 		const key = canonicalResourceUri(resource);
-		const challenge = parseBearerChallenge(wwwAuthenticate);
+		const challenge = parseOAuthChallenge(wwwAuthenticate);
 		const store = new DisposableStore();
 		try {
 			const signal = CancellationToken.toAbortSignal(token, store);
@@ -645,17 +956,26 @@ export class OAuthClient extends Disposable {
 	}
 
 	/**
-	 * The authorization and token endpoints are used by every flow, so they are
-	 * checked here. The registration endpoint is not: it is used only when a
-	 * client registers dynamically, and a client that is pre-registered or uses
-	 * a Client ID Metadata Document never contacts it, so it is checked where
-	 * it is used (here {@link selectRegistration}; the extension host's dynamic
+	 * The token endpoint is used by every grant and the authorization endpoint
+	 * by the authorization code grant, so they are checked here (a machine
+	 * client's grant needs no authorization endpoint and no PKCE). The
+	 * registration endpoint is not: it is used only when a client registers
+	 * dynamically, and a client that is pre-registered or uses a Client ID
+	 * Metadata Document never contacts it, so it is checked where it is used
+	 * (here {@link selectRegistration}; the extension host's dynamic
 	 * authentication providers check it before they register). The same holds
 	 * for the device authorization endpoint, which only the extension host's
 	 * device code flow uses: it checks it, by the same rule, before its first
 	 * request.
 	 */
 	private validateServerMetadata(metadata: IAuthorizationServerMetadata): void {
+		if (this.grant.kind !== 'authorization_code') {
+			if (!metadata.token_endpoint) {
+				throw new OAuthClientError('discovery_failed', `The authorization server ${metadata.issuer} does not publish a token endpoint`);
+			}
+			this.assertSecureEndpoint(metadata.token_endpoint, 'token endpoint');
+			return;
+		}
 		if (!metadata.authorization_endpoint || !metadata.token_endpoint) {
 			throw new OAuthClientError('discovery_failed', `The authorization server ${metadata.issuer} does not publish an authorization and a token endpoint`);
 		}
@@ -664,6 +984,19 @@ export class OAuthClient extends Disposable {
 		if (this.options.pkce !== 'assume-supported' && !pkceSupported(metadata)) {
 			throw new OAuthClientError('pkce_unsupported', `The authorization server ${metadata.issuer} does not advertise the S256 PKCE method in code_challenge_methods_supported`);
 		}
+	}
+
+	private get grant(): OAuthGrant {
+		return this.options.grant ?? AUTHORIZATION_CODE_GRANT;
+	}
+
+	/**
+	 * The prover of a token request that asks for a DPoP-bound token: the
+	 * configured one, when the authorization server advertises its algorithm.
+	 */
+	private dpopFor(serverMetadata: IAuthorizationServerMetadata, wanted: boolean | undefined): IOAuthDpopProver | undefined {
+		const prover = this.options.dpop;
+		return wanted && prover && authorizationServerSupportsDpop(serverMetadata, prover.algorithm) ? prover : undefined;
 	}
 
 	private assertSecureEndpoint(url: string, what: string): void {
@@ -700,13 +1033,19 @@ export class OAuthClient extends Disposable {
 		const key = canonicalResourceUri(request.resource);
 		const resourceIndicator = resourceIndicatorFor(key, request.resourceMetadata?.resource);
 		const { serverMetadata } = request;
-		let record = await this.reconcileIssuer(key, await this.storage.get(key), serverMetadata.issuer);
+		let record = await this.reconcileDpopKey(key, await this.reconcileIssuer(key, await this.storage.get(key), serverMetadata.issuer));
+		const grant = this.grant;
 		const scopes = selectScopes({
 			challengeScope: request.scopes?.join(' '),
 			prmScopes: request.resourceMetadata?.scopes_supported,
-			requestOfflineAccess: this.options.requestOfflineAccess,
+			// A machine client's grant has no user to keep signed in.
+			requestOfflineAccess: grant.kind === 'authorization_code' && this.options.requestOfflineAccess,
 			scopesSupported: serverMetadata.scopes_supported,
 		});
+
+		if (grant.kind !== 'authorization_code') {
+			return this.acquireMachineToken(grant, key, resourceIndicator, request, record, scopes, token);
+		}
 
 		if (record && !request.forceNewRegistration) {
 			if (record.accessToken && record.accessToken !== request.rejectedToken && !this.isExpired(record) && this.scopesCovered(scopes, record.scopes, true)) {
@@ -715,7 +1054,7 @@ export class OAuthClient extends Disposable {
 			// A refresh never widens the grant, so it only helps when the scopes are known to be held.
 			if (record.refreshToken && this.scopesCovered(scopes, record.scopes, false)) {
 				try {
-					const refreshed = await this.refresh({ serverMetadata, resource: key, resourceIndicator, registration: this.registrationOf(record), refreshToken: record.refreshToken, scopes: record.scopes }, token);
+					const refreshed = await this.refresh({ serverMetadata, resource: key, resourceIndicator, registration: this.registrationOf(record), refreshToken: record.refreshToken, scopes: record.scopes, dpop: request.dpop || record.dpopThumbprint !== undefined }, token);
 					record = await this.persist(key, { ...record, ...refreshed });
 					return this.toAuthorization(record);
 				} catch (error) {
@@ -736,7 +1075,7 @@ export class OAuthClient extends Disposable {
 				fromRecord = false;
 			}
 			try {
-				const result = await this.authorizationCodeGrant({ serverMetadata, resource: key, resourceIndicator, registration, scopes }, token);
+				const result = await this.authorizationCodeGrant({ serverMetadata, resource: key, resourceIndicator, registration, scopes, dpop: request.dpop }, token);
 				record = await this.persist(key, {
 					issuer: serverMetadata.issuer,
 					registrationKind: registration.kind,
@@ -769,6 +1108,120 @@ export class OAuthClient extends Disposable {
 	}
 
 	/**
+	 * The token of a machine client's grant: the stored one when it is valid,
+	 * covers the scopes and was not rejected; otherwise a refreshed one (a
+	 * server rarely issues a refresh token for these grants); otherwise a new
+	 * grant. A refused grant is terminal: the client neither retries it nor
+	 * falls back to another grant (workload identity federation), and a refused
+	 * assertion is not sent again.
+	 */
+	private async acquireMachineToken(grant: Exclude<OAuthGrant, { readonly kind: 'authorization_code' }>, key: string, resourceIndicator: string, request: IOAuthAcquireTokenRequest, record: IOAuthClientRecord | undefined, scopes: string[] | undefined, token: CancellationToken): Promise<IOAuthAuthorization> {
+		const { serverMetadata } = request;
+		if (record?.accessToken && record.accessToken !== request.rejectedToken && !this.isExpired(record) && this.scopesCovered(scopes, record.scopes, true)) {
+			return this.toAuthorization(record);
+		}
+		const registration = machineRegistration(grant.kind === 'client_credentials' ? grant.credentials : grant.client, serverMetadata);
+		if (record?.refreshToken && this.scopesCovered(scopes, record.scopes, false)) {
+			try {
+				const refreshed = await this.refresh({ serverMetadata, resource: key, resourceIndicator, registration, refreshToken: record.refreshToken, scopes: record.scopes, dpop: request.dpop || record.dpopThumbprint !== undefined }, token);
+				return this.toAuthorization(await this.persist(key, { ...record, ...refreshed }));
+			} catch (error) {
+				if (isCancellationError(error)) {
+					throw error;
+				}
+				this.log('warn', `refreshing the token for ${key} failed, requesting a new one: ${errorMessage(error)}`);
+			}
+		}
+		let result: IOAuthTokenResult;
+		if (grant.kind === 'client_credentials') {
+			result = await this.clientCredentialsGrant({ serverMetadata, resource: key, resourceIndicator, credentials: grant.credentials, scopes, dpop: request.dpop }, token);
+		} else {
+			const assertion = await raceCancellationError(grant.assertion({ serverMetadata, resource: resourceIndicator, scopes }, token), token);
+			if (this.refusedAssertions.get(key) === assertion) {
+				throw new OAuthClientError('token_request_failed', `Not presenting the assertion the authorization server ${serverMetadata.issuer} refused for ${key} again`);
+			}
+			try {
+				result = await this.jwtBearerGrant({ serverMetadata, resource: key, resourceIndicator, assertion, registration, scopes, dpop: request.dpop }, token);
+			} catch (error) {
+				if (error instanceof OAuthClientError && error.code === 'token_request_failed') {
+					this.refusedAssertions.set(key, assertion);
+				}
+				throw error;
+			}
+		}
+		const stored = await this.persist(key, {
+			issuer: serverMetadata.issuer,
+			registrationKind: 'pre-registered',
+			clientId: registration?.clientId ?? '',
+			tokenEndpointAuthMethod: registration?.tokenEndpointAuthMethod ?? 'none',
+			...result,
+			authorizationRequests: this.authorizationRequests.get(key) ?? 0,
+		});
+		return this.toAuthorization(stored);
+	}
+
+	/**
+	 * The client credentials grant (OAuth 2.1 section 4.2) of the
+	 * `io.modelcontextprotocol/oauth-client-credentials` extension: a
+	 * pre-registered client authenticates with `private_key_jwt` or its secret
+	 * and asks for a token for the resource (RFC 8707). The server must list
+	 * `client_credentials` in `grant_types_supported` when it lists grants.
+	 */
+	async clientCredentialsGrant(request: IOAuthClientCredentialsGrantRequest, token: CancellationToken = CancellationToken.None): Promise<IOAuthTokenResult> {
+		const key = canonicalResourceUri(request.resource);
+		const { serverMetadata } = request;
+		this.validateMachineGrant(serverMetadata, 'client_credentials');
+		const registration = machineRegistration(request.credentials, serverMetadata)!;
+		const store = new DisposableStore();
+		try {
+			const signal = CancellationToken.toAbortSignal(token, store);
+			this.log('info', `client credentials grant for ${key} at ${serverMetadata.issuer} (${registration.assertionKey ? 'private_key_jwt' : registration.tokenEndpointAuthMethod}, scope: ${request.scopes?.join(' ') ?? 'omitted'})`);
+			const params: Record<string, string> = { grant_type: 'client_credentials', resource: request.resourceIndicator ?? resourceIndicatorFor(key) };
+			if (request.scopes && request.scopes.length > 0) {
+				params.scope = request.scopes.join(' ');
+			}
+			return await this.tokenRequest(serverMetadata, registration, params, request.scopes, this.dpopFor(serverMetadata, request.dpop), signal);
+		} finally {
+			store.dispose();
+		}
+	}
+
+	/**
+	 * The JWT authorization grant (RFC 7523 section 2.1): the assertion (a
+	 * workload identity JWT, or an ID-JAG) is the grant, and the client
+	 * authenticates only when `registration` is given. The server must list
+	 * the grant type in `grant_types_supported` when it lists grants.
+	 */
+	async jwtBearerGrant(request: IOAuthJwtBearerGrantRequest, token: CancellationToken = CancellationToken.None): Promise<IOAuthTokenResult> {
+		const key = canonicalResourceUri(request.resource);
+		const { serverMetadata } = request;
+		this.validateMachineGrant(serverMetadata, GRANT_TYPE_JWT_BEARER);
+		const store = new DisposableStore();
+		try {
+			const signal = CancellationToken.toAbortSignal(token, store);
+			this.log('info', `JWT authorization grant for ${key} at ${serverMetadata.issuer} (${request.registration ? `client ${request.registration.clientId}` : 'no client'}, scope: ${request.scopes?.join(' ') ?? 'omitted'})`);
+			const params: Record<string, string> = { grant_type: GRANT_TYPE_JWT_BEARER, assertion: request.assertion, resource: request.resourceIndicator ?? resourceIndicatorFor(key) };
+			if (request.scopes && request.scopes.length > 0) {
+				params.scope = request.scopes.join(' ');
+			}
+			return await this.tokenRequest(serverMetadata, request.registration, params, request.scopes, this.dpopFor(serverMetadata, request.dpop), signal);
+		} finally {
+			store.dispose();
+		}
+	}
+
+	private validateMachineGrant(serverMetadata: IAuthorizationServerMetadata, grantType: string): void {
+		if (!serverMetadata.token_endpoint) {
+			throw new OAuthClientError('discovery_failed', `The authorization server ${serverMetadata.issuer} does not publish a token endpoint`);
+		}
+		this.assertSecureEndpoint(serverMetadata.token_endpoint, 'token endpoint');
+		const supported = serverMetadata.grant_types_supported;
+		if (supported && supported.length > 0 && !supported.includes(grantType)) {
+			throw new OAuthClientError('grant_unsupported', `The authorization server ${serverMetadata.issuer} does not support the ${grantType} grant (grant_types_supported: ${supported.join(' ')})`);
+		}
+	}
+
+	/**
 	 * Runs the authorization code grant with PKCE `S256`, the RFC 8707
 	 * `resource` indicator and `state`, validates the redirect (RFC 9207 `iss`
 	 * first, then `state`, then `error`) and redeems the code. Counts towards
@@ -780,7 +1233,6 @@ export class OAuthClient extends Disposable {
 		const { serverMetadata, registration } = request;
 		this.validateServerMetadata(serverMetadata);
 		const authorizationEndpoint = serverMetadata.authorization_endpoint!;
-		const tokenEndpoint = serverMetadata.token_endpoint!;
 
 		const made = this.authorizationRequests.get(key) ?? 0;
 		if (made >= this.maxAuthorizationRequests) {
@@ -804,6 +1256,11 @@ export class OAuthClient extends Disposable {
 			url.searchParams.set('resource', resourceIndicator);
 			if (request.scopes && request.scopes.length > 0) {
 				url.searchParams.set('scope', request.scopes.join(' '));
+			}
+			const prover = this.dpopFor(serverMetadata, request.dpop);
+			if (prover) {
+				// Binds the code to the key the token request proves possession of (RFC 9449 section 10).
+				url.searchParams.set('dpop_jkt', prover.thumbprint);
 			}
 			this.lastRequestedScopes.set(key, request.scopes ?? []);
 			this.log('info', `authorization request ${made + 1} for ${key} at ${serverMetadata.issuer} (${registration.kind} client, scope: ${request.scopes?.join(' ') ?? 'omitted'})`);
@@ -836,13 +1293,13 @@ export class OAuthClient extends Disposable {
 				throw new OAuthClientError('authorization_denied', 'The authorization response carries no code');
 			}
 
-			return this.tokenRequest(tokenEndpoint, registration, {
+			return this.tokenRequest(serverMetadata, registration, {
 				grant_type: 'authorization_code',
 				code: params.code,
 				redirect_uri: redirectUri,
 				code_verifier: pkce.verifier,
 				resource: resourceIndicator,
-			}, request.scopes, signal);
+			}, request.scopes, prover, signal);
 		} finally {
 			store.dispose();
 		}
@@ -860,45 +1317,112 @@ export class OAuthClient extends Disposable {
 		try {
 			const signal = CancellationToken.toAbortSignal(token, store);
 			this.log('info', `refreshing the token for ${key} at ${request.serverMetadata.issuer}`);
-			const result = await this.tokenRequest(tokenEndpoint, request.registration, { grant_type: 'refresh_token', refresh_token: request.refreshToken, resource: request.resourceIndicator ?? resourceIndicatorFor(key) }, request.scopes, signal);
+			const result = await this.tokenRequest(request.serverMetadata, request.registration, { grant_type: 'refresh_token', refresh_token: request.refreshToken, resource: request.resourceIndicator ?? resourceIndicatorFor(key) }, request.scopes, this.dpopFor(request.serverMetadata, request.dpop), signal);
 			return { ...result, refreshToken: result.refreshToken ?? request.refreshToken };
 		} finally {
 			store.dispose();
 		}
 	}
 
-	private async tokenRequest(tokenEndpoint: string, registration: IOAuthRegistration, params: Record<string, string>, requestedScopes: readonly string[] | undefined, signal: AbortSignal): Promise<IOAuthTokenResult> {
-		const auth = buildClientAuthentication(registration.tokenEndpointAuthMethod, registration.clientId, registration.clientSecret);
-		const response = await this.fetch(tokenEndpoint, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json', ...auth.headers },
-			body: new URLSearchParams({ ...params, ...auth.body }).toString(),
-			signal,
+	/**
+	 * Sends a token request with the client's authentication (none without a
+	 * registration) and, to an authorization server that supports DPoP, a
+	 * proof. A `use_dpop_nonce` error is answered once with a proof that
+	 * carries the server's nonce (RFC 9449 section 8). A `DPoP` token is
+	 * accepted only when the request carried a proof.
+	 */
+	private async tokenRequest(serverMetadata: IAuthorizationServerMetadata, registration: IOAuthRegistration | undefined, params: Record<string, string>, requestedScopes: readonly string[] | undefined, prover: IOAuthDpopProver | undefined, signal: AbortSignal): Promise<IOAuthTokenResult> {
+		const tokenEndpoint = serverMetadata.token_endpoint!;
+		for (let attempt = 0; ; attempt++) {
+			// A fresh client assertion and proof for each attempt: servers may refuse a `jti` they saw.
+			const auth = await this.clientAuthentication(serverMetadata, registration);
+			const headers: Record<string, string> = { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json', ...auth.headers };
+			if (prover) {
+				headers[DPOP_HEADER] = await prover.createProof('POST', tokenEndpoint);
+			}
+			const response = await this.fetch(tokenEndpoint, {
+				method: 'POST',
+				headers,
+				body: new URLSearchParams({ ...params, ...auth.body }).toString(),
+				signal,
+				// The body carries the client's credentials or assertion: a redirect would send them elsewhere.
+				redirect: 'manual',
+			});
+			const nonce = response.headers.get(DPOP_NONCE_HEADER) ?? undefined;
+			if (prover && nonce !== undefined) {
+				prover.rememberNonce(tokenEndpoint, nonce);
+			}
+			let payload: unknown;
+			try {
+				payload = await response.json();
+			} catch {
+				payload = undefined;
+			}
+			if (response.status === 200 && isAuthorizationTokenResponse(payload)) {
+				if (typeof payload.access_token !== 'string' || payload.access_token.length === 0) {
+					throw new OAuthClientError('token_request_failed', `The token endpoint ${tokenEndpoint} issued no usable access token`);
+				}
+				const dpopBound = prover !== undefined && isDpopTokenType(payload.token_type);
+				if (!dpopBound && (typeof payload.token_type !== 'string' || payload.token_type.toLowerCase() !== 'bearer')) {
+					throw new OAuthClientError('token_request_failed', `The token endpoint ${tokenEndpoint} issued an unsupported token type '${String(payload.token_type)}'`);
+				}
+				if (prover && !dpopBound) {
+					this.log('info', `the token endpoint ${tokenEndpoint} issued a bearer token for a request with a DPoP proof`);
+				}
+				return {
+					accessToken: payload.access_token,
+					refreshToken: payload.refresh_token,
+					expiresAt: typeof payload.expires_in === 'number' ? this.now() + payload.expires_in * 1000 : undefined,
+					scopes: payload.scope ? splitScopes(payload.scope) : requestedScopes,
+					tokenType: dpopBound ? 'DPoP' : 'Bearer',
+					dpopThumbprint: prover?.thumbprint,
+				};
+			}
+			const failure = isAuthorizationErrorResponse(payload) ? payload : undefined;
+			if (prover && attempt === 0 && failure?.error === USE_DPOP_NONCE_ERROR && nonce !== undefined) {
+				this.log('info', `the token endpoint ${tokenEndpoint} asked for a DPoP nonce; sending the request again`);
+				continue;
+			}
+			const description = failure ? `${failure.error}${failure.error_description ? ` (${failure.error_description})` : ''}` : 'no error details';
+			this.log('warn', `token request to ${tokenEndpoint} failed with HTTP ${response.status}: ${description}`);
+			throw new OAuthClientError('token_request_failed', `The token request to ${tokenEndpoint} failed with HTTP ${response.status}: ${description}`, { status: response.status, error: failure?.error, errorDescription: failure?.error_description });
+		}
+	}
+
+	/**
+	 * The client authentication of a token request (RFC 6749 section 2.3): the
+	 * registration's method, or a client assertion for `private_key_jwt`
+	 * (RFC 7523 section 2.2) whose `iss` and `sub` are the client id and whose
+	 * `aud` is the issuer identifier (or the token endpoint, as configured); it then names the client by the assertion
+	 * alone (the client credentials extension omits `client_id`). Nothing
+	 * without a registration.
+	 */
+	private async clientAuthentication(serverMetadata: IAuthorizationServerMetadata, registration: IOAuthRegistration | undefined): Promise<{ headers: Record<string, string>; body: Record<string, string> }> {
+		if (!registration) {
+			return { headers: {}, body: {} };
+		}
+		if (!registration.assertionKey) {
+			return buildClientAuthentication(registration.tokenEndpointAuthMethod, registration.clientId, registration.clientSecret);
+		}
+		const { key, keyId, audience } = registration.assertionKey;
+		const methods = serverMetadata.token_endpoint_auth_methods_supported;
+		if (methods && methods.length > 0 && !methods.includes('private_key_jwt')) {
+			throw new OAuthClientError('grant_unsupported', `The authorization server ${serverMetadata.issuer} does not support private_key_jwt client authentication (token_endpoint_auth_methods_supported: ${methods.join(' ')})`);
+		}
+		const algorithms = serverMetadata.token_endpoint_auth_signing_alg_values_supported;
+		if (algorithms && algorithms.length > 0 && !algorithms.includes(key.algorithm)) {
+			throw new OAuthClientError('grant_unsupported', `The authorization server ${serverMetadata.issuer} does not accept ${key.algorithm} client assertions (token_endpoint_auth_signing_alg_values_supported: ${algorithms.join(' ')})`);
+		}
+		const issuedAt = Math.floor(this.now() / 1000);
+		const assertion = await signJwt(key, keyId !== undefined ? { typ: 'JWT', kid: keyId } : { typ: 'JWT' }, {
+			iss: registration.clientId,
+			sub: registration.clientId,
+			aud: audience === 'token_endpoint' ? serverMetadata.token_endpoint! : serverMetadata.issuer,
+			iat: issuedAt,
+			exp: issuedAt + CLIENT_ASSERTION_LIFETIME_SECONDS,
+			jti: base64UrlEncode(this.random(16)),
 		});
-		let payload: unknown;
-		try {
-			payload = await response.json();
-		} catch {
-			payload = undefined;
-		}
-		if (response.status === 200 && isAuthorizationTokenResponse(payload)) {
-			if (typeof payload.access_token !== 'string' || payload.access_token.length === 0) {
-				throw new OAuthClientError('token_request_failed', `The token endpoint ${tokenEndpoint} issued no usable access token`);
-			}
-			if (typeof payload.token_type !== 'string' || payload.token_type.toLowerCase() !== 'bearer') {
-				throw new OAuthClientError('token_request_failed', `The token endpoint ${tokenEndpoint} issued an unsupported token type '${String(payload.token_type)}'`);
-			}
-			return {
-				accessToken: payload.access_token,
-				refreshToken: payload.refresh_token,
-				expiresAt: typeof payload.expires_in === 'number' ? this.now() + payload.expires_in * 1000 : undefined,
-				scopes: payload.scope ? splitScopes(payload.scope) : requestedScopes,
-			};
-		}
-		const failure = isAuthorizationErrorResponse(payload) ? payload : undefined;
-		const description = failure ? `${failure.error}${failure.error_description ? ` (${failure.error_description})` : ''}` : 'no error details';
-		this.log('warn', `token request to ${tokenEndpoint} failed with HTTP ${response.status}: ${description}`);
-		throw new OAuthClientError('token_request_failed', `The token request to ${tokenEndpoint} failed with HTTP ${response.status}: ${description}`, { status: response.status, error: failure?.error, errorDescription: failure?.error_description });
+		return { headers: {}, body: { client_assertion_type: CLIENT_ASSERTION_TYPE_JWT_BEARER, client_assertion: assertion } };
 	}
 
 	//#endregion
@@ -992,6 +1516,7 @@ export class OAuthClient extends Disposable {
 		const { serverMetadata, resourceMetadata, challenge } = discovery;
 		let record = await this.reconcileIssuer(key, await this.storage.get(key), serverMetadata.issuer);
 		const held = unique([...(record?.scopes ?? []), ...(options.scopes ?? [])]);
+		const dpop = resourceRequiresDpop(wwwAuthenticate, resourceMetadata);
 
 		if (challenge?.error === 'insufficient_scope') {
 			// The union of the previously granted and requested scopes with the challenged ones (SEP-2350).
@@ -1002,7 +1527,7 @@ export class OAuthClient extends Disposable {
 				throw new OAuthClientError('step_up_limit', `The resource ${key} still reports insufficient scope after a token was issued for every scope it demands (${union.join(' ')})`);
 			}
 			this.log('info', `stepping up ${key} to scope '${union.join(' ')}'`);
-			const authorization = await this.acquireToken({ serverMetadata, resourceMetadata, resource: key, scopes: union, rejectedToken: rejected }, token);
+			const authorization = await this.acquireToken({ serverMetadata, resourceMetadata, resource: key, scopes: union, rejectedToken: rejected, dpop }, token);
 			this.rejections.set(key, { issued: authorization.accessToken, count: 0 });
 			return authorization;
 		}
@@ -1018,30 +1543,39 @@ export class OAuthClient extends Disposable {
 			record = await this.persist(key, { ...record, accessToken: undefined, expiresAt: undefined, refreshToken: forceNewRegistration ? undefined : record.refreshToken });
 		}
 		const scopes = unique([...held, ...splitScopes(challenge?.scope)]);
-		const authorization = await this.acquireToken({ serverMetadata, resourceMetadata, resource: key, scopes: scopes.length > 0 ? scopes : undefined, rejectedToken: rejected, forceNewRegistration }, token);
+		const authorization = await this.acquireToken({ serverMetadata, resourceMetadata, resource: key, scopes: scopes.length > 0 ? scopes : undefined, rejectedToken: rejected, forceNewRegistration, dpop }, token);
 		this.rejections.set(key, { issued: authorization.accessToken, count });
 		return authorization;
 	}
 
 	/**
-	 * Sends a request with the resource's bearer token, handling up to
+	 * Sends a request with the resource's access token, handling up to
 	 * {@link IOAuthClientOptions.maxChallengesPerRequest} challenges by
-	 * (re-)authorizing, and returns the final response.
+	 * (re-)authorizing, and returns the final response. A DPoP-bound token
+	 * goes with the `DPoP` scheme and a fresh proof for each attempt (RFC 9449
+	 * section 7.1); a `use_dpop_nonce` challenge is answered with a proof that
+	 * carries the resource server's nonce (section 9), within the same limit.
 	 */
 	async fetchWithAuth(resource: string, url: string, init: IOAuthFetchInit = {}, token: CancellationToken = CancellationToken.None): Promise<IOAuthFetchResponse> {
 		const key = canonicalResourceUri(resource);
 		const store = new DisposableStore();
 		try {
 			const signal = init.signal ?? CancellationToken.toAbortSignal(token, store);
-			let accessToken = (await this.getAuthorization(key))?.accessToken;
+			let authorization: IOAuthTokenResult | undefined = await this.getAuthorization(key);
 			for (let challenges = 0; ; challenges++) {
 				const headers: Record<string, string> = {};
 				for (const [name, value] of Object.entries(init.headers ?? {})) {
-					if (name.toLowerCase() !== 'authorization') {
+					const lower = name.toLowerCase();
+					if (lower !== 'authorization' && lower !== DPOP_HEADER.toLowerCase()) {
 						headers[name] = value;
 					}
 				}
-				if (accessToken) {
+				const accessToken = authorization?.accessToken;
+				const prover = authorization?.tokenType === 'DPoP' ? this.options.dpop : undefined;
+				if (accessToken && prover) {
+					headers.Authorization = `${DPOP_SCHEME} ${accessToken}`;
+					headers[DPOP_HEADER] = await prover.createProof(init.method ?? 'GET', url, accessToken);
+				} else if (accessToken) {
 					headers.Authorization = `Bearer ${accessToken}`;
 				}
 				if (token.isCancellationRequested) {
@@ -1053,8 +1587,12 @@ export class OAuthClient extends Disposable {
 				} catch (error) {
 					throw token.isCancellationRequested ? new CancellationError() : error;
 				}
+				const nonce = response.headers.get(DPOP_NONCE_HEADER) ?? undefined;
+				if (prover && nonce !== undefined) {
+					prover.rememberNonce(url, nonce);
+				}
 				const header = response.headers.get('WWW-Authenticate') ?? undefined;
-				const challenge = parseBearerChallenge(header);
+				const challenge = parseOAuthChallenge(header, prover ? 'DPoP' : 'Bearer');
 				const challenged = response.status === 401
 					? (challenge !== undefined || header === undefined)
 					: response.status === 403 && challenge?.error === 'insufficient_scope';
@@ -1067,8 +1605,12 @@ export class OAuthClient extends Disposable {
 				if (challenges >= this.maxChallengesPerRequest) {
 					throw new OAuthClientError('challenge_limit', `The resource ${key} kept challenging after ${challenges} authorization attempts`);
 				}
-				const authorization = await this.handleChallenge(key, header, { previousToken: accessToken }, token);
-				accessToken = authorization.accessToken;
+				if (prover && response.status === 401 && challenge?.error === USE_DPOP_NONCE_ERROR && nonce !== undefined) {
+					// The token stands: only the proof lacked the nonce.
+					this.log('info', `the resource ${key} asked for a DPoP nonce; sending the request again`);
+					continue;
+				}
+				authorization = await this.handleChallenge(key, header, { previousToken: accessToken }, token);
 			}
 		} finally {
 			store.dispose();
@@ -1079,10 +1621,24 @@ export class OAuthClient extends Disposable {
 
 	//#region records
 
-	/** The stored, unexpired access token for a resource, without any network activity. */
+	/** The stored, unexpired access token for a resource that this client can present, without any network activity. */
 	async getAuthorization(resource: string): Promise<IOAuthAuthorization | undefined> {
 		const record = await this.storage.get(canonicalResourceUri(resource));
-		return record?.accessToken && !this.isExpired(record) ? this.toAuthorization(record) : undefined;
+		return record?.accessToken && !this.isExpired(record) && this.holdsDpopKeyOf(record) ? this.toAuthorization(record) : undefined;
+	}
+
+	/** Whether the tokens of a record were requested with this client's DPoP key, or without any. */
+	private holdsDpopKeyOf(record: IOAuthClientRecord): boolean {
+		return record.dpopThumbprint === undefined || record.dpopThumbprint === this.options.dpop?.thumbprint;
+	}
+
+	/** Drops the tokens of a record that were requested with another DPoP key: only that key can use them. */
+	private async reconcileDpopKey(key: string, record: IOAuthClientRecord | undefined): Promise<IOAuthClientRecord | undefined> {
+		if (!record || this.holdsDpopKeyOf(record)) {
+			return record;
+		}
+		this.log('info', `the stored tokens for ${key} are bound to another DPoP key; forgetting them`);
+		return this.persist(key, { ...record, accessToken: undefined, refreshToken: undefined, expiresAt: undefined, tokenType: undefined, dpopThumbprint: undefined });
 	}
 
 	/** Drops the registration and tokens stored for a resource. */
@@ -1114,7 +1670,7 @@ export class OAuthClient extends Disposable {
 	}
 
 	private toAuthorization(record: IOAuthClientRecord): IOAuthAuthorization {
-		return { accessToken: record.accessToken!, refreshToken: record.refreshToken, expiresAt: record.expiresAt, scopes: record.scopes, record };
+		return { accessToken: record.accessToken!, refreshToken: record.refreshToken, expiresAt: record.expiresAt, scopes: record.scopes, tokenType: record.tokenType, dpopThumbprint: record.dpopThumbprint, record };
 	}
 
 	private registrationOf(record: IOAuthClientRecord): IOAuthRegistration {

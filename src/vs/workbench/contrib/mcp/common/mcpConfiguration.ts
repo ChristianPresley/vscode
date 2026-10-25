@@ -189,6 +189,52 @@ const mcpOAuthSchema: IJSONSchema = {
 			type: 'boolean',
 			default: false,
 			markdownDescription: localize('app.mcp.json.oauth.allowInsecureHttp', "Allow `http://` authorization server endpoints on hosts other than loopback. Only use this for local development; tokens and credentials are sent unencrypted.")
+		},
+		grant: {
+			type: 'string',
+			enum: ['authorization_code', 'client_credentials', 'workload_identity'],
+			default: 'authorization_code',
+			enumDescriptions: [
+				localize('app.mcp.json.oauth.grant.authorizationCode', "A user signs in in the browser (OAuth authorization code grant with PKCE)."),
+				localize('app.mcp.json.oauth.grant.clientCredentials', "VS Code authenticates as the pre-registered machine client `clientId`, with its client secret (set with the *Set Client Secret* code lens) or with `privateKeyFile` (OAuth client credentials grant)."),
+				localize('app.mcp.json.oauth.grant.workloadIdentity', "VS Code presents the workload identity JWT in `workloadIdentityTokenFile`, which its platform issued (workload identity federation, a JWT authorization grant)."),
+			],
+			markdownDescription: localize('app.mcp.json.oauth.grant', "How VS Code obtains access tokens for the server. `client_credentials` and `workload_identity` need no user: they are for machine clients (the authorization extensions `io.modelcontextprotocol/oauth-client-credentials` and `io.modelcontextprotocol/auth/wif`), and need an extension host with a file system for their files.")
+		},
+		privateKeyFile: {
+			type: 'string',
+			minLength: 1,
+			markdownDescription: localize('app.mcp.json.oauth.privateKeyFile', "With `grant` `client_credentials`: a PKCS #8 PEM private key file (`-----BEGIN PRIVATE KEY-----`) that signs the client assertion of `private_key_jwt` client authentication, the method the extension recommends. Without it, the client secret of `clientId` is used.")
+		},
+		signingAlgorithm: {
+			type: 'string',
+			enum: ['ES256', 'ES384', 'RS256', 'PS256'],
+			default: 'ES256',
+			markdownDescription: localize('app.mcp.json.oauth.signingAlgorithm', "The JWS algorithm of the key in `privateKeyFile`.")
+		},
+		keyId: {
+			type: 'string',
+			minLength: 1,
+			markdownDescription: localize('app.mcp.json.oauth.keyId', "The key ID (`kid`) under which the authorization server knows the key in `privateKeyFile`.")
+		},
+		clientAssertionAudience: {
+			type: 'string',
+			enum: ['issuer', 'token_endpoint'],
+			default: 'issuer',
+			enumDescriptions: [
+				localize('app.mcp.json.oauth.clientAssertionAudience.issuer', "The issuer identifier of the authorization server, the audience current OAuth guidance requires."),
+				localize('app.mcp.json.oauth.clientAssertionAudience.tokenEndpoint', "The token endpoint URL, which some authorization servers (for example Microsoft Entra ID) require."),
+			],
+			markdownDescription: localize('app.mcp.json.oauth.clientAssertionAudience', "The audience (`aud`) of the client assertion that the key in `privateKeyFile` signs.")
+		},
+		workloadIdentityTokenFile: {
+			type: 'string',
+			minLength: 1,
+			markdownDescription: localize('app.mcp.json.oauth.workloadIdentityTokenFile', "With `grant` `workload_identity`: the file the workload platform writes the workload identity JWT to (for example a projected service account token). It is read for each token request, so a rotated token is used. VS Code sends it only when it is an unexpired, signed JWT whose `aud` is the authorization server's token endpoint or issuer.")
+		},
+		dpop: {
+			type: 'boolean',
+			markdownDescription: localize('app.mcp.json.oauth.dpop', "Whether to request DPoP-bound access tokens (RFC 9449), which only VS Code can use, from an authorization server that supports DPoP. By default VS Code requests them when the server requires them (its metadata says so, or it accepts no bearer token). `true` requests them always, `false` never.")
 		}
 	}
 };

@@ -113,6 +113,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 			// If a resource is specified, include it in the request
 			authorizationUrl.searchParams.append('resource', resource);
 		}
+		this._bindAuthorizationToDpopKey(authorizationUrl);
 
 		// Create and start the loopback server
 		const server = this._createLoopbackServer(appUri);
@@ -272,18 +273,14 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 			if (resource) {
 				tokenParams.resource = resource;
 			}
-			const tokenRequest = this._buildTokenRequest(tokenParams);
 
 			try {
-				const tokenResponse = await fetch(this._serverMetadata.token_endpoint, {
-					method: 'POST',
-					headers: tokenRequest.headers,
-					body: tokenRequest.body
-				});
+				// With a DPoP key, each poll proves possession of it (RFC 9449 section 5).
+				const { response: tokenResponse, result } = await this._postTokenRequest(tokenParams, this._signInDpopProver);
 
 				if (tokenResponse.ok) {
-					// The rules of the code grant and of a refresh: HTTP 200 with a usable bearer token.
-					const tokenData = this._acceptTokenResponse(tokenResponse, await tokenResponse.json());
+					// The rules of the code grant and of a refresh: HTTP 200 with a usable token.
+					const tokenData = this._acceptTokenResponse(tokenResponse, result, this._signInDpopProver);
 					if (!tokenData) {
 						this._logger.error('Invalid token response received from server');
 						throw new Error('Invalid token response received from server');
@@ -291,13 +288,11 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 					this._logger.info(`Device code flow completed successfully for scopes: ${scopeString}`);
 					return tokenData;
 				} else {
-					let errorData: IAuthorizationDeviceTokenErrorResponse;
-					try {
-						errorData = await tokenResponse.json();
-					} catch (e) {
-						this._logger.error(`Failed to parse error response: ${e}`);
+					if (result === undefined) {
+						this._logger.error('Failed to parse error response');
 						throw new Error(`Token request failed with status ${tokenResponse.status}: ${tokenResponse.statusText}`);
 					}
+					const errorData = result as IAuthorizationDeviceTokenErrorResponse;
 
 					// Handle known error cases
 					if (errorData.error === AuthorizationDeviceCodeErrorType.AuthorizationPending) {

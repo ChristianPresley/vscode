@@ -11,7 +11,7 @@
  *
  * - @grpc/grpc-js calls all eight typed RPCs (with routing metadata) and the
  *   tunnel (discover, list, call, listen) with the vendored proto files,
- * - the zig-sdk example client (`grpc_client` of zig-sdk 0.6.0, tunnel only,
+ * - the zig-sdk example client (`grpc_client` of zig-sdk 0.6.0 or later, tunnel only,
  *   called with `--tool add`) runs against the default route when
  *   `MCP_ZIG_GRPC_CLIENT` names its binary,
  * - curl makes a raw HTTP/2 prior-knowledge tunnel call, as in the zig-sdk
@@ -258,7 +258,7 @@ test('grpc-js calls the tunnel: discover, list, call with progress, listen', { s
 });
 
 test('the zig-sdk example client calls add on the default route', { skip: (!ENABLED || !ZIG_CLIENT) && 'set MCP_GATEWAY_GRPC_INTEROP=1 and MCP_ZIG_GRPC_CLIENT to the grpc_client binary' }, () => {
-	// zig-sdk 0.6.0: the tool and its arguments are options (the default tool is test_simple_text).
+	// Since zig-sdk 0.6.0 the tool and its arguments are options (the default tool is test_simple_text).
 	const result = spawnSync(ZIG_CLIENT!, ['127.0.0.1', String(gateway!.port), '--tool', 'add', '--args', '{"a":40,"b":2}'], { encoding: 'utf8', timeout: 60_000 });
 	const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
 	assert.strictEqual(result.status, 0, output);

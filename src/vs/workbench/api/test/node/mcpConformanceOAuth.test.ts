@@ -5,19 +5,21 @@
 
 import assert from 'assert';
 import { promises as fs } from 'fs';
+import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { FileAccess } from '../../../../base/common/network.js';
 import { OAuthClientError } from '../../../../base/common/oauth.js';
 import { IOAuthFetchResponse, OAuthClient } from '../../../../base/common/oauthClient.js';
 import { join } from '../../../../base/common/path.js';
 import { URI } from '../../../../base/common/uri.js';
-import { bearerChallenge, createAuthorizationServerFixture, createOAuthFixture, createResourceServerFixture, IOAuthFixture } from '../../../../base/test/common/oauthClientFixture.js';
+import { bearerChallenge, createAuthorizationServerFixture, createFixtureRouter, createOAuthFixture, createResourceServerFixture, IFixtureRequest, IOAuthFixture } from '../../../../base/test/common/oauthClientFixture.js';
+import { encodeBase64, VSBuffer } from '../../../../base/common/buffer.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../platform/log/common/log.js';
 import { McpServerTransportType } from '../../../contrib/mcp/common/mcpTypes.js';
 import { IMcpAuthenticationDetails } from '../../common/extHost.protocol.js';
 import { CommonRequestInit, CommonResponse, McpHTTPHandle } from '../../common/extHostMcp.js';
 import { MCP_OAUTH_MAX_AUTHORIZATION_REQUESTS, MCP_OAUTH_MAX_CHALLENGE_CYCLES, mcpOAuthClientOptions, resolveMcpOAuthPolicy } from '../../common/mcpOAuthClientFactory.js';
-import { CONFORMANCE_CLIENT_METADATA_URL, CONFORMANCE_LAUNCH_OAUTH, createConformanceOAuthClient, createConformanceTokenSource } from '../../node/mcpConformanceOAuth.js';
+import { CONFORMANCE_CLIENT_METADATA_URL, CONFORMANCE_LAUNCH_OAUTH, conformanceGrantFor, createConformanceOAuthClient, createConformanceTokenSource } from '../../node/mcpConformanceOAuth.js';
 import { ConformanceMainThreadMcp, parseConformanceContext } from '../../node/mcpConformanceProxy.js';
 
 /** The transport's private request path, which these tests drive directly. */
@@ -204,7 +206,37 @@ suite('MCP OAuth rule set', () => {
 			legacyDefaultEndpoints: options.legacyDefaultEndpoints,
 		}, { maxChallengesPerRequest: MCP_OAUTH_MAX_CHALLENGE_CYCLES, maxAuthorizationRequests: MCP_OAUTH_MAX_AUTHORIZATION_REQUESTS, requestOfflineAccess: true, pkce: 'assume-supported', allowInsecureHttp: true, legacyDefaultEndpoints: false });
 		assert.deepStrictEqual([MCP_OAUTH_MAX_CHALLENGE_CYCLES, MCP_OAUTH_MAX_AUTHORIZATION_REQUESTS], [3, 3]);
-		assert.deepStrictEqual(resolveMcpOAuthPolicy(undefined), { pkce: 'require-advertised', allowInsecureHttp: false, authorizationServer: undefined });
+		assert.deepStrictEqual(resolveMcpOAuthPolicy(undefined), { pkce: 'require-advertised', allowInsecureHttp: false, authorizationServer: undefined, grant: 'authorization_code', dpop: undefined });
+		assert.deepStrictEqual(resolveMcpOAuthPolicy({ grant: 'workload_identity', dpop: false }), { pkce: 'require-advertised', allowInsecureHttp: false, authorizationServer: undefined, grant: 'workload_identity', dpop: false });
+	});
+
+	test('the scenarios of the authorization extensions run the grant of a machine client from their context; every other scenario the user\'s', async () => {
+		const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']) as CryptoKeyPair;
+		const pem = `-----BEGIN PRIVATE KEY-----\n${encodeBase64(VSBuffer.wrap(new Uint8Array(await crypto.subtle.exportKey('pkcs8', pair.privateKey))))}\n-----END PRIVATE KEY-----`;
+		const idp: IFixtureRequest[] = [];
+		const router = createFixtureRouter();
+		router.handle('http://localhost:9001', request => {
+			idp.push(request);
+			return { status: 200, body: { access_token: 'the.id.jag', issued_token_type: 'urn:ietf:params:oauth:token-type:id-jag', token_type: 'N_A' } };
+		});
+		const grant = (scenario: string, context: object) => conformanceGrantFor(scenario, parseConformanceContext(JSON.stringify({ name: scenario, ...context })), router.fetch);
+		const serverMetadata = { issuer: 'http://localhost:9002', response_types_supported: ['code'] };
+
+		const jwt = await grant('auth/client-credentials-jwt', { client_id: 'c', private_key_pem: pem, signing_algorithm: 'ES256' });
+		const basic = await grant('auth/client-credentials-basic', { client_id: 'c', client_secret: 's' });
+		const preRegistration = await grant('auth/pre-registration', { client_id: 'c', client_secret: 's' });
+		const wif = await grant('auth/wif-jwt-bearer', { client_id: 'w', valid_jwt: 'workload.jwt', expired_jwt: 'old.jwt' });
+		const ema = await grant('auth/enterprise-managed-authorization', { client_id: 'rc', client_secret: 'rs', idp_client_id: 'ic', idp_id_token: 'id.token', idp_issuer: 'http://localhost:9001', idp_token_endpoint: 'http://localhost:9001/token' });
+		assert.ok(jwt?.kind === 'client_credentials' && jwt.credentials.privateKey !== undefined && jwt.credentials.clientId === 'c');
+		assert.deepStrictEqual([basic, preRegistration, await grant('tools_call', {})], [{ kind: 'client_credentials', credentials: { clientId: 'c', clientSecret: 's' } }, undefined, undefined]);
+		assert.ok(wif?.kind === 'jwt_bearer' && wif.client === undefined);
+		assert.strictEqual(await wif.assertion({ serverMetadata, resource: 'http://localhost:9003/mcp' }, CancellationToken.None), 'workload.jwt');
+		assert.ok(ema?.kind === 'jwt_bearer');
+		assert.deepStrictEqual(ema.client, { clientId: 'rc', clientSecret: 'rs' });
+		assert.strictEqual(await ema.assertion({ serverMetadata, resource: 'http://localhost:9003/mcp', scopes: ['a'] }, CancellationToken.None), 'the.id.jag');
+		const form = idp[0].form();
+		assert.deepStrictEqual([form.get('subject_token'), form.get('audience'), form.get('resource'), form.get('client_id'), form.get('scope')], ['id.token', 'http://localhost:9002', 'http://localhost:9003/mcp', 'ic', 'a']);
+		await assert.rejects(grant('auth/client-credentials-jwt', { client_id: 'c', private_key_pem: pem, signing_algorithm: 'HS256' }), /HS256 of the scenario is not supported/);
 	});
 
 	test('the conformance client, the transport and the main thread share one factory and rule set', async () => {

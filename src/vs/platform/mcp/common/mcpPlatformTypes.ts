@@ -89,6 +89,24 @@ export interface IMcpRemoteServerOAuthConfiguration {
 	 * Defaults to false; loopback hosts are always allowed.
 	 */
 	readonly allowInsecureHttp?: boolean;
+	/**
+	 * `authorization_code` (the default: a user signs in), `client_credentials` (a pre-registered
+	 * machine client, `io.modelcontextprotocol/oauth-client-credentials`) or `workload_identity`
+	 * (a workload identity JWT, `io.modelcontextprotocol/auth/wif`).
+	 */
+	readonly grant?: 'authorization_code' | 'client_credentials' | 'workload_identity';
+	/** For `client_credentials`: a PKCS #8 PEM private key file for `private_key_jwt`. */
+	readonly privateKeyFile?: string;
+	/** The JWS algorithm of the private key (`ES256`, `ES384`, `RS256` or `PS256`; `ES256` by default). */
+	readonly signingAlgorithm?: string;
+	/** The `kid` of the private key. */
+	readonly keyId?: string;
+	/** The `aud` of the client assertion: `issuer` (the default) or `token_endpoint`. */
+	readonly clientAssertionAudience?: 'issuer' | 'token_endpoint';
+	/** For `workload_identity`: the file that holds the workload JWT; it is read for each token request. */
+	readonly workloadIdentityTokenFile?: string;
+	/** Request DPoP-bound tokens (RFC 9449): `true` always, `false` never; by default when the server requires them. */
+	readonly dpop?: boolean;
 }
 
 export interface IMcpRemoteServerConfiguration extends ICommonMcpServerConfiguration {

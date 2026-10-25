@@ -30,7 +30,7 @@ import { ITelemetryService } from '../../../../platform/telemetry/common/telemet
 import { IMcpGatewayResult, IMcpGatewayResultServer, IWorkbenchMcpGatewayService } from '../../../contrib/mcp/common/mcpGatewayService.js';
 import { IMcpHostDelegate, IMcpRegistry } from '../../../contrib/mcp/common/mcpRegistryTypes.js';
 import { IMcpMessageEnvelope, IMcpRequestAbort, McpCollectionDefinition, McpCollectionSortOrder, McpConnectionState, McpServerDefinition, McpServerLaunch, McpServerTransportHTTP, McpServerTransportType, McpServerTrust, mcpOAuthClientSecretStorageKey, UserInteractionRequiredError } from '../../../contrib/mcp/common/mcpTypes.js';
-import { IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, OAuthClientError } from '../../../../base/common/oauth.js';
+import { IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, IAuthorizationTokenResponse, OAuthClientError } from '../../../../base/common/oauth.js';
 import { IMcpRemoteServerOAuthConfiguration } from '../../../../platform/mcp/common/mcpPlatformTypes.js';
 import { mcpEnterpriseManagedAuthIdpSection } from '../../../contrib/mcp/common/mcpConfiguration.js';
 import { IAuthenticationMcpAccessService } from '../../../services/authentication/browser/authenticationMcpAccessService.js';
@@ -45,7 +45,8 @@ import { IMcpServerAuthContext, MainThreadMcp, McpServerAuthTracker } from '../.
 import { ExtHostContext, ExtHostMcpShape, IMcpAuthenticationDetails, IMcpGatewayServerDto, IMcpGatewayStartOptionsDto, MainContext } from '../../common/extHost.protocol.js';
 import { IExtHostInitDataService } from '../../common/extHostInitDataService.js';
 import { CommonRequestInit, CommonResponse, createAuthMetadata, ExtHostMcpService, McpHTTPHandle } from '../../common/extHostMcp.js';
-import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION, MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION } from '../../common/mcpOAuthClientFactory.js';
+import { parseStoredClientSecret, serializeStoredClientSecret } from '../../../contrib/mcp/common/mcpOAuthClientSecret.js';
+import { MCP_OAUTH_ALLOW_INSECURE_HTTP_SESSION_OPTION, MCP_OAUTH_DPOP_SESSION_OPTION, MCP_OAUTH_REQUIRE_ADVERTISED_PKCE_SESSION_OPTION } from '../../common/mcpOAuthClientFactory.js';
 import { IExtHostVariableResolverProvider } from '../../common/extHostVariableResolverService.js';
 import { IExtHostWorkspace } from '../../common/extHostWorkspace.js';
 import { SingleProxyRPCProtocol, TestRPCProtocol } from '../common/testRPCProtocol.js';
@@ -491,6 +492,8 @@ suite('MainThreadMcp - authorization rules', () => {
 		readonly launch?: McpServerLaunch;
 		/** Further servers, started after it with the ids 2, 3, ... */
 		readonly moreLaunches?: readonly McpServerLaunch[];
+		/** The tokens the dynamic provider stored (with the client `c`); none by default. */
+		readonly storedTokens?: (IAuthorizationTokenResponse & { created_at: number; dpop_jwk?: JsonWebKey })[];
 	} = {}): IAuthHarness {
 		const secrets = new Map<string, string>();
 		const getSessionsCalls: IAuthHarness['getSessionsCalls'] = [];
@@ -551,7 +554,8 @@ suite('MainThreadMcp - authorization rules', () => {
 			services.stub(IDynamicAuthenticationProviderStorageService, {
 				getInteractedProviders: () => (options.interactedProviders ?? []).map(providerId => ({ providerId, label: providerId, authorizationServer: providerId.split(' ')[0], clientId: 'c' })),
 				async removeDynamicProvider(providerId: string) { removedProviders.push(providerId); },
-				async getClientRegistration() { return undefined; },
+				async getClientRegistration() { return options.storedTokens ? { clientId: 'c' } : undefined; },
+				async getSessionsForDynamicAuthProvider(providerId: string, clientId: string) { return providerId === options.providerId && clientId === 'c' ? options.storedTokens : undefined; },
 			});
 		});
 		const launch: McpServerLaunch = options.launch ?? { type: McpServerTransportType.HTTP, uri: URI.parse(serverUrl), headers: [], oauth: options.oauth };
@@ -586,6 +590,64 @@ suite('MainThreadMcp - authorization rules', () => {
 			...overrides,
 		};
 	}
+
+	test('a server asks for a DPoP-bound token with its request, and learns the key of a DPoP token its own provider issued', async () => {
+		const dpopKey: JsonWebKey = { kty: 'EC', crv: 'P-256', x: 'x', y: 'y', d: 'd' };
+		const harness = createHarness({
+			providerId: 'dynamic-provider',
+			sessions: [{ id: 'session-1', accessToken: 'dpop-token', account: { id: 'a', label: 'user' }, scopes: [] }],
+			storedTokens: [
+				{ access_token: 'dpop-token', token_type: 'DPoP', created_at: 0, dpop_jwk: dpopKey },
+				{ access_token: 'bearer-token', token_type: 'Bearer', created_at: 0, dpop_jwk: dpopKey },
+			],
+			moreLaunches: [{ type: McpServerTransportType.HTTP, uri: URI.parse('https://other.example/mcp'), headers: [] }],
+		});
+		// No token was handed out yet: nothing to answer.
+		const beforeAnyToken = await harness.mainThreadMcp.$getAccessTokenBinding(1, 'dpop-token');
+		assert.strictEqual(await harness.mainThreadMcp.$getTokenFromServerMetadata(1, details(asA, { dpop: true }), {}), 'dpop-token');
+		assert.deepStrictEqual({
+			beforeAnyToken,
+			dpopOption: (harness.getSessionsOptions[0] as Record<string, unknown> | undefined)?.[MCP_OAUTH_DPOP_SESSION_OPTION],
+			bound: await harness.mainThreadMcp.$getAccessTokenBinding(1, 'dpop-token'),
+			bearer: await harness.mainThreadMcp.$getAccessTokenBinding(1, 'bearer-token'),
+			unknown: await harness.mainThreadMcp.$getAccessTokenBinding(1, 'other-token'),
+			// Another server, which got no token from that provider, learns nothing.
+			otherServer: await harness.mainThreadMcp.$getAccessTokenBinding(2, 'dpop-token'),
+		}, { beforeAnyToken: undefined, dpopOption: true, bound: { dpopKey }, bearer: undefined, unknown: undefined, otherServer: undefined });
+
+		const plain = createHarness({ providerId: 'p' });
+		await plain.mainThreadMcp.$getTokenFromServerMetadata(1, details(asA), {});
+		assert.strictEqual((plain.getSessionsOptions[0] as Record<string, unknown> | undefined)?.[MCP_OAUTH_DPOP_SESSION_OPTION], undefined);
+	});
+
+	test('the client secret of a machine client goes to its transport for its own oauth.clientId only', async () => {
+		const machine = createHarness({ oauth: { grant: 'client_credentials', clientId: 'machine' } });
+		machine.secrets.set(mcpOAuthClientSecretStorageKey(serverUrl, 'machine'), serializeStoredClientSecret({ clientSecret: 'machine-secret' }));
+		machine.secrets.set(mcpOAuthClientSecretStorageKey(serverUrl, 'other'), serializeStoredClientSecret({ clientSecret: 'other-secret' }));
+		const user = createHarness({ oauth: { clientId: 'machine' } });
+		user.secrets.set(mcpOAuthClientSecretStorageKey(serverUrl, 'machine'), serializeStoredClientSecret({ clientSecret: 'machine-secret' }));
+		assert.deepStrictEqual([
+			await machine.mainThreadMcp.$getMcpOAuthClientSecret(1, 'machine', asA),
+			await machine.mainThreadMcp.$getMcpOAuthClientSecret(1, 'other', asA),
+			await machine.mainThreadMcp.$getMcpOAuthClientSecret(2, 'machine', asA),
+			// A user's sign-in passes its secret to the provider in the main thread, not to the transport.
+			await user.mainThreadMcp.$getMcpOAuthClientSecret(1, 'machine', asA),
+		], ['machine-secret', undefined, undefined, undefined]);
+	});
+
+	test('the client secret of a machine client is bound to the authorization server it is first used with, or the configured one, and never sent to another', async () => {
+		const key = mcpOAuthClientSecretStorageKey(serverUrl, 'machine');
+		const firstUse = createHarness({ oauth: { grant: 'client_credentials', clientId: 'machine' } });
+		firstUse.secrets.set(key, serializeStoredClientSecret({ clientSecret: 'machine-secret' }));
+		assert.strictEqual(await firstUse.mainThreadMcp.$getMcpOAuthClientSecret(1, 'machine', asA), 'machine-secret');
+		await assert.rejects(firstUse.mainThreadMcp.$getMcpOAuthClientSecret(1, 'machine', asB), (error: unknown) => error instanceof OAuthClientError && error.code === 'issuer_not_registered');
+		assert.strictEqual(parseStoredClientSecret(firstUse.secrets.get(key))?.issuer, asA);
+
+		const configured = createHarness({ oauth: { grant: 'client_credentials', clientId: 'machine', authorizationServer: asB } as McpServerTransportHTTP['oauth'] });
+		configured.secrets.set(key, serializeStoredClientSecret({ clientSecret: 'machine-secret' }));
+		await assert.rejects(configured.mainThreadMcp.$getMcpOAuthClientSecret(1, 'machine', asA), (error: unknown) => error instanceof OAuthClientError && error.code === 'issuer_not_registered');
+		assert.strictEqual(await configured.mainThreadMcp.$getMcpOAuthClientSecret(1, 'machine', asB), 'machine-secret');
+	});
 
 	test('a rejected token removes its session, looked up without a scope filter', async () => {
 		const sessions: AuthenticationSession[] = [

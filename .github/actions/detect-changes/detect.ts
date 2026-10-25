@@ -109,6 +109,9 @@ const rules: readonly IChangeRule[] = [
 			'src/vs/workbench/api/browser/mainThreadMcp.ts',
 			'src/vs/base/common/oauth.ts',
 			'src/vs/base/common/oauthClient.ts',
+			// The JOSE and DPoP pieces of the OAuth client (the authorization extensions).
+			'src/vs/base/common/oauthJose.ts',
+			'src/vs/base/common/oauthDpop.ts',
 			'src/vs/base/common/jsonRpcProtocol.ts',
 			'src/vs/base/common/jsonSchemaValidator/',
 			'src/vs/base/common/protobuf/',

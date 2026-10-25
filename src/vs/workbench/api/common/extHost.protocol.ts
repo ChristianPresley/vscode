@@ -3777,6 +3777,20 @@ export interface IMcpAuthenticationDetails {
 	 * configured issuer rather than the per-resource dynamic auth provider.
 	 */
 	enterpriseManaged?: boolean;
+	/**
+	 * Request a DPoP-bound token (RFC 9449) from an authorization server that supports DPoP: the
+	 * MCP server requires such tokens, or its `oauth.dpop` asks for them ({@link MainThreadMcpShape.$getAccessTokenBinding}).
+	 */
+	dpop?: boolean;
+}
+
+/** How a token from {@link MainThreadMcpShape.$getTokenFromServerMetadata} is bound. */
+export interface IMcpAccessTokenBinding {
+	/**
+	 * The private JWK of the ES256 key the token is DPoP-bound to (RFC 9449): the transport presents
+	 * the token with the `DPoP` scheme and signs a proof with it for each request.
+	 */
+	readonly dpopKey: JsonWebKey;
 }
 
 export interface IMcpAuthenticationOptions {
@@ -3831,6 +3845,19 @@ export interface MainThreadMcpShape {
 	 * registrations (the conformance client) leave it out.
 	 */
 	$getRegisteredAuthorizationServers?(id: number, resource: string): Promise<IMcpRegisteredAuthorizationServer[]>;
+	/**
+	 * How a token that {@link $getTokenFromServerMetadata} returned for the server is bound;
+	 * `undefined` for a bearer token. Hosts whose tokens are all bearer tokens leave it out.
+	 */
+	$getAccessTokenBinding?(id: number, accessToken: string): Promise<IMcpAccessTokenBinding | undefined>;
+	/**
+	 * The client secret stored for the server's own `oauth.clientId` (the *Set Client Secret* code
+	 * lens), for the grant of a machine client (`oauth.grant`), which the transport runs itself with
+	 * the authorization server `issuer`; `undefined` for any other client id. A secret configured
+	 * for (`oauth.authorizationServer`) or first used with another authorization server is refused
+	 * (an `issuer_not_registered` error); an unbound one is bound to `issuer`.
+	 */
+	$getMcpOAuthClientSecret?(id: number, clientId: string, issuer: string): Promise<string | undefined>;
 	$logMcpAuthSetup(data: IAuthMetadataSource): void;
 	$startMcpGateway(chatSessionResource?: UriComponents, options?: IMcpGatewayStartOptionsDto): Promise<{ servers: IMcpGatewayServerDto[]; gatewayId: string } | undefined>;
 	$disposeMcpGateway(gatewayId: string): void;

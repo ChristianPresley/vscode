@@ -191,6 +191,11 @@ export interface IAuthorizationProtectedResourceMetadata {
 	bearer_methods_supported?: string[];
 
 	/**
+	 * OPTIONAL. Whether the protected resource always requires DPoP-bound access tokens (RFC 9728 section 2, RFC 9449).
+	 */
+	dpop_bound_access_tokens_required?: boolean;
+
+	/**
 	 * OPTIONAL. JSON array containing a list of the JWS signing algorithms supported.
 	 */
 	resource_signing_alg_values_supported?: string[];
@@ -1515,7 +1520,11 @@ export type OAuthClientErrorCode =
 	| 'authorization_denied'
 	| 'discovery_failed'
 	| 'step_up_limit'
-	| 'challenge_limit';
+	| 'challenge_limit'
+	/** The authorization server does not offer the grant or the client authentication a machine client needs. */
+	| 'grant_unsupported'
+	/** A machine client's configured credentials (client secret, private key, workload identity JWT) are missing or unusable. */
+	| 'credentials_unavailable';
 
 /** A terminal, classified failure of the OAuth client flow. */
 export class OAuthClientError extends Error {

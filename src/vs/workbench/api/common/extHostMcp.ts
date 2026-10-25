@@ -11,7 +11,9 @@ import { Emitter, Event } from '../../../base/common/event.js';
 import { JsonRpcId } from '../../../base/common/jsonRpcProtocol.js';
 import { Disposable, DisposableMap, DisposableStore, IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
 import { AUTH_SCOPE_SEPARATOR, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, isAuthorizationProtectedResourceMetadata, OAuthClientError, parseWWWAuthenticateHeader, scopesMatch } from '../../../base/common/oauth.js';
-import { IOAuthClientRecord, IOAuthClientStorage, OAuthLogLevel, parseBearerChallenge, redact } from '../../../base/common/oauthClient.js';
+import { InMemoryOAuthClientStorage, IOAuthClientRecord, IOAuthClientStorage, OAuthClient, OAuthClientCredentials, OAuthGrant, OAuthGrantKind, OAuthLogLevel, parseOAuthChallenge, redact, resourceRequiresDpop, workloadIdentityJwtProblem } from '../../../base/common/oauthClient.js';
+import { DPOP_HEADER, DPOP_NONCE_HEADER, DPOP_SCHEME, IOAuthDpopProver, OAuthDpopProver, USE_DPOP_NONCE_ERROR } from '../../../base/common/oauthDpop.js';
+import { importPkcs8PrivateKey, isJwsAlgorithm } from '../../../base/common/oauthJose.js';
 import { SSEParser } from '../../../base/common/sseParser.js';
 import { URI, UriComponents } from '../../../base/common/uri.js';
 import { IValidator, vArray, vBoolean, vNumber, vObj, vObjAny, vOptionalProp, vString } from '../../../base/common/validation.js';
@@ -34,7 +36,7 @@ import * as Convert from './extHostTypeConverters.js';
 import { McpGrpcServerDefinition, McpHttpServerDefinition, McpStdioServerDefinition, McpToolAvailability } from './extHostTypes.js';
 import { IExtHostVariableResolverProvider } from './extHostVariableResolverService.js';
 import { IExtHostWorkspace } from './extHostWorkspace.js';
-import { createMcpOAuthClient, IMcpOAuthServerPolicy, MCP_OAUTH_MAX_AUTHORIZATION_REQUESTS, MCP_OAUTH_MAX_CHALLENGE_CYCLES, MCP_OAUTH_METADATA_TIMEOUT_MS, MCP_OAUTH_REJECTIONS_BEFORE_REREGISTRATION, resolveMcpOAuthPolicy } from './mcpOAuthClientFactory.js';
+import { createMcpOAuthClient, IMcpOAuthServerPolicy, MCP_OAUTH_MAX_AUTHORIZATION_REQUESTS, MCP_OAUTH_MAX_CHALLENGE_CYCLES, MCP_OAUTH_METADATA_TIMEOUT_MS, MCP_OAUTH_REJECTIONS_BEFORE_REREGISTRATION, mcpWantsDpop, resolveMcpOAuthPolicy } from './mcpOAuthClientFactory.js';
 import { IMcpRemoteServerOAuthConfiguration } from '../../../platform/mcp/common/mcpPlatformTypes.js';
 
 export const IExtHostMpcService = createDecorator<IExtHostMpcService>('IExtHostMpcService');
@@ -527,7 +529,7 @@ const REDIRECT_STATUS_CODES = [301, 302, 303, 307, 308];
 const HTTP_PROTOCOLS = new Set(['http:', 'https:']);
 // Credential-bearing headers that must not be replayed to a different origin
 // after a redirect (matches browser fetch / curl behavior). Compared case-insensitively.
-const CROSS_ORIGIN_STRIPPED_HEADERS = new Set(['authorization', 'cookie', 'proxy-authorization', 'mcp-session-id']);
+const CROSS_ORIGIN_STRIPPED_HEADERS = new Set(['authorization', 'dpop', 'cookie', 'proxy-authorization', 'mcp-session-id']);
 
 function setHostHeader(headers: Record<string, string>, name: string, value: string): void {
 	for (const configuredName of Object.keys(headers)) {
@@ -617,7 +619,9 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 			errorOnUserInteraction: this._errorOnUserInteraction,
 			protocolVersion: () => this._protocolVersion,
 			fetchMetadata: (url, init, transportHeaders, signal) => this._fetch(url, init, { isAuthMetadata: true, transportHeaders, signal }),
+			fetchToken: (url, init, signal) => this._fetchToken(url, init, signal),
 			log: (level, message) => this._log(level, message),
+			readFile: path => this._readCredentialFile(path),
 		}));
 
 		this._register(toDisposable(() => {
@@ -1377,7 +1381,7 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 						this._log(LogLevel.Warning, `${res.status} status from ${mcpUrl} after ${cycle} authorization attempts; giving up on this request`);
 						break;
 					}
-					const retry = await this._auth.handleChallenge(res.status, res.headers.get('WWW-Authenticate') ?? undefined, headers, cts.token);
+					const retry = await this._auth.handleChallenge(res.status, res.headers.get('WWW-Authenticate') ?? undefined, headers, cts.token, res.headers.get(DPOP_NONCE_HEADER) ?? undefined);
 					if (!retry) {
 						break;
 					}
@@ -1446,11 +1450,19 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 			if (this._cts.token.isCancellationRequested) {
 				throw new CancellationError();
 			}
+			// A DPoP-bound token needs a fresh proof for each request, for this hop's method and URL.
+			const signing = options.isAuthMetadata ? undefined : this._auth.addDpopProof(init.headers, init.method, currentUrl);
+			if (signing) {
+				await signing;
+			}
 			response = await this._fetchInternal(currentUrl, {
 				...init,
 				signal,
 				redirect: 'manual'
 			});
+			if (!options.isAuthMetadata) {
+				this._auth.observeResponse(currentUrl, init.headers, response.headers);
+			}
 
 			// Check for redirect status codes (301, 302, 303, 307, 308)
 			if (!REDIRECT_STATUS_CODES.includes(response.status)) {
@@ -1505,6 +1517,31 @@ export class McpHTTPHandle extends Disposable implements IMcpExtHostHandle {
 
 	protected _fetchInternal(url: string, init?: CommonRequestInit): Promise<CommonResponse> {
 		return fetch(url, init);
+	}
+
+	/**
+	 * A token request of a machine client's grant ({@link IMcpAuthHeaderProviderHost.fetchToken}): to
+	 * the authorization server's token endpoint only, with its own headers (the client authentication,
+	 * the DPoP proof; the MCP server's configured headers are not its to receive), following no
+	 * redirect, within {@link MCP_OAUTH_METADATA_TIMEOUT_MS}.
+	 */
+	private async _fetchToken(url: string, init: MinimalRequestInit, signal: AbortSignal | undefined): Promise<CommonResponse> {
+		if (!HTTP_PROTOCOLS.has(new URL(url).protocol)) {
+			throw new Error(`The token endpoint ${url} is not an http(s) URL`);
+		}
+		const headers = { ...init.headers };
+		setHostHeader(headers, 'user-agent', `${product.nameLong}/${product.version}`);
+		const signals = [this._abortCtrl.signal, AbortSignal.timeout(MCP_OAUTH_METADATA_TIMEOUT_MS)];
+		if (signal) {
+			signals.push(signal);
+		}
+		this._log(LogLevel.Trace, `Token request to ${url}`);
+		return this._fetchInternal(url, { ...init, headers, signal: AbortSignal.any(signals), redirect: 'manual' });
+	}
+
+	/** Reads a credential file of the server's `oauth` configuration; only an extension host with a file system can. */
+	protected _readCredentialFile(_path: string): Promise<string> {
+		return Promise.reject(new Error(localize('mcp.oauth.noFiles', "This extension host has no file system")));
 	}
 }
 
@@ -1562,6 +1599,8 @@ export interface IAuthMetadata {
 	readonly scopes: string[] | undefined;
 	/** Telemetry data about how auth metadata was discovered */
 	readonly telemetry: IAuthMetadataSource;
+	/** Whether the server requires DPoP-bound tokens: its metadata says so, or it challenged with the `DPoP` scheme only ({@link resourceRequiresDpop}). */
+	readonly resourceRequiresDpop: boolean;
 
 	/**
 	 * Updates the scopes based on the WWW-Authenticate header in the response.
@@ -1586,6 +1625,7 @@ class AuthMetadata implements IAuthMetadata {
 		scopes: string[] | undefined,
 		public readonly telemetry: IAuthMetadataSource,
 		private readonly _log: AuthMetadataLogger,
+		public readonly resourceRequiresDpop: boolean = false,
 	) {
 		this._scopes = scopes;
 	}
@@ -1619,7 +1659,8 @@ class AuthMetadata implements IAuthMetadata {
 		}
 		const challenges = parseWWWAuthenticateHeader(authHeader);
 		for (const challenge of challenges) {
-			if (challenge.scheme === 'Bearer' && challenge.params['scope']) {
+			const scheme = challenge.scheme.toLowerCase();
+			if ((scheme === 'bearer' || scheme === DPOP_SCHEME.toLowerCase()) && challenge.params['scope']) {
 				const scopes = challenge.params['scope'].split(AUTH_SCOPE_SEPARATOR).filter(s => s.trim().length);
 				if (scopes.length) {
 					this._log(LogLevel.Info, `Found scope challenge in WWW-Authenticate header: ${challenge.params['scope']}`);
@@ -1661,8 +1702,13 @@ export interface ICreateAuthMetadataOptions {
 	registeredAuthorizationServers?: readonly IMcpRegisteredAuthorizationServer[];
 	/** How long one metadata request may take; defaults to {@link MCP_OAUTH_METADATA_TIMEOUT_MS}. */
 	metadataTimeoutMs?: number;
+	/** The grant tokens are requested with; a machine client's needs no authorization endpoint. Defaults to `authorization_code`. */
+	grant?: OAuthGrantKind;
 	token?: CancellationToken;
 }
+
+/** The grant a discovery-only client is configured with for a machine client: it requests no tokens. */
+const MACHINE_DISCOVERY_GRANT: OAuthGrant = { kind: 'jwt_bearer', assertion: () => Promise.reject(new Error('Authorization metadata discovery does not request tokens')) };
 
 /**
  * A storage that only answers which authorization server already has a
@@ -1798,7 +1844,7 @@ export async function createAuthMetadata(
 ): Promise<AuthMetadata> {
 	const { fetch, log } = options;
 	const wwwAuthenticate = initialResponseHeaders.get('WWW-Authenticate') ?? undefined;
-	const challenge = parseBearerChallenge(wwwAuthenticate);
+	const challenge = parseOAuthChallenge(wwwAuthenticate);
 	if (challenge?.resourceMetadataUrl) {
 		log(LogLevel.Debug, `Found resource_metadata challenge in WWW-Authenticate header: ${challenge.resourceMetadataUrl}`);
 	}
@@ -1818,6 +1864,7 @@ export async function createAuthMetadata(
 		registration: { dynamic: false },
 		authorize: () => Promise.reject(new Error('Authorization metadata discovery does not authorize')),
 		policy: { ...policy, pkce: 'assume-supported' },
+		grant: options.grant !== undefined && options.grant !== 'authorization_code' ? MACHINE_DISCOVERY_GRANT : undefined,
 		storage: selection,
 		fetch: async (url, init) => {
 			const response = await fetchMetadataWithin(fetch, url, { method: init.method ?? 'GET', headers: { ...init.headers } }, init.signal, timeoutMs);
@@ -1856,7 +1903,8 @@ export async function createAuthMetadata(
 			discovery.resource,
 			scopes ? [...scopes] : undefined,
 			{ resourceMetadataSource, serverMetadataSource },
-			log
+			log,
+			resourceRequiresDpop(wwwAuthenticate, discovery.resourceMetadata),
 		);
 		metadata.authorizationServerIdentifier = discovery.authorizationServer;
 		return metadata;
@@ -1870,7 +1918,7 @@ export async function createAuthMetadata(
 //#region McpAuthHeaderProvider
 
 /** The headers that carry credentials; trace logs show them blanked. */
-const CREDENTIAL_HEADERS = new Set(['authorization', 'proxy-authorization', 'cookie', 'set-cookie']);
+const CREDENTIAL_HEADERS = new Set(['authorization', 'dpop', 'proxy-authorization', 'cookie', 'set-cookie']);
 
 /** A copy of `headers` with the credential-bearing ones and those named in `alsoRedact` (in any letter case) blanked, for trace logs. */
 function redactCredentialHeaders(headers: Record<string, string> | undefined, alsoRedact: readonly string[] = []): Record<string, string> | undefined {
@@ -1886,10 +1934,12 @@ function redactCredentialHeaders(headers: Record<string, string> | undefined, al
 	return copy;
 }
 
-function bearerTokenOf(headers: Readonly<Record<string, string>>): string | undefined {
+/** The access token a request carries in its `Authorization` header (`Bearer` or `DPoP` scheme), and whether it is DPoP-bound. */
+function accessTokenOf(headers: Readonly<Record<string, string>>): { readonly token: string; readonly dpop: boolean } | undefined {
 	for (const [name, value] of Object.entries(headers)) {
-		if (name.toLowerCase() === 'authorization' && /^bearer\s+/i.test(value)) {
-			return value.replace(/^bearer\s+/i, '');
+		const match = name.toLowerCase() === 'authorization' ? /^(bearer|dpop)\s+(.*)$/i.exec(value) : null;
+		if (match) {
+			return { token: match[2], dpop: match[1].toLowerCase() === 'dpop' };
 		}
 	}
 	return undefined;
@@ -1929,23 +1979,48 @@ export interface IMcpAuthHeaderProviderHost {
 		readonly oauth?: McpServerTransportHTTP['oauth'];
 		readonly authentication?: McpServerTransportHTTP['authentication'];
 	};
-	readonly proxy: Pick<MainThreadMcpShape, '$getTokenFromServerMetadata' | '$getTokenForProviderId' | '$onDidChangeState' | '$logMcpAuthSetup' | '$getRegisteredAuthorizationServers'>;
+	readonly proxy: Pick<MainThreadMcpShape, '$getTokenFromServerMetadata' | '$getTokenForProviderId' | '$onDidChangeState' | '$logMcpAuthSetup' | '$getRegisteredAuthorizationServers' | '$getAccessTokenBinding' | '$getMcpOAuthClientSecret'>;
 	readonly errorOnUserInteraction?: boolean;
 	/** The protocol revision of the traffic; metadata requests to the resource origin carry it. */
 	protocolVersion(): string | undefined;
 	/**
-	 * Fetches authorization metadata. It is not subject to the server allow
-	 * list; `transportHeaders` are generated headers that survive cross-origin
+	 * Fetches authorization metadata, and sends the token requests of a
+	 * machine client's grant. It is not subject to the server allow list;
+	 * `transportHeaders` are generated headers that survive cross-origin
 	 * redirects; `signal` aborts the request (discovery was cancelled or the
 	 * request timed out).
 	 */
 	fetchMetadata(url: string, init: MinimalRequestInit, transportHeaders: Readonly<Record<string, string>> | undefined, signal?: AbortSignal): Promise<CommonResponse>;
+	/**
+	 * Sends a token request of a machine client's grant: to the token endpoint
+	 * only (no redirect is followed: the body carries the credentials), with
+	 * its own headers (the client authentication and the DPoP proof survive,
+	 * whatever the origin), within a timeout. A host without it runs no
+	 * machine client.
+	 */
+	fetchToken?(url: string, init: MinimalRequestInit, signal?: AbortSignal): Promise<CommonResponse>;
 	log(level: LogLevel, message: string): void;
 	/** The URL protected resource metadata is discovered for, when it is not the launch URI (a `grpc(s)://` server's HTTPS identity). */
 	resourceUrl?(): string;
 	/** Step-ups per resource; defaults to the process-wide counter. */
 	readonly stepUps?: Map<string, number>;
+	/**
+	 * Reads a credential file of the server's `oauth` configuration (a private
+	 * key, a workload identity JWT) where the transport runs; a host without a
+	 * file system leaves it out.
+	 */
+	readFile?(path: string): Promise<string>;
 }
+
+/** The client of a machine client's grant, its DPoP key, and the authorization server its credentials were first used with. */
+interface IMachineClient {
+	readonly client: OAuthClient;
+	readonly prover: OAuthDpopProver;
+	readonly issuer: string;
+}
+
+/** How many of the last tokens a provider keeps the binding of: a request in flight may still carry an older one. */
+const MAX_TOKEN_BINDINGS = 4;
 
 /**
  * Supplies the `Authorization` header of an MCP transport and answers its
@@ -1964,6 +2039,15 @@ export interface IMcpAuthHeaderProviderHost {
  *   issued for is terminal (`step_up_limit`).
  * - Challenges are handled one at a time; a request whose token was already
  *   replaced is retried with the new one.
+ * - A DPoP-bound token (RFC 9449) goes with the `DPoP` scheme, and the
+ *   transport asks {@link addDpopProof} for a fresh proof for each request it
+ *   sends; a `use_dpop_nonce` challenge is answered with the server's nonce.
+ *   VS Code asks for one when the server signals that it accepts them, or
+ *   when `oauth.dpop` says so ({@link mcpWantsDpop}).
+ * - A machine client (`oauth.grant`: `client_credentials` or
+ *   `workload_identity`) gets its tokens here, from an {@link OAuthClient}
+ *   in the extension host, without a user and without the main thread's
+ *   authentication providers.
  */
 export class McpAuthHeaderProvider extends Disposable {
 	private _metadata: AuthMetadata | undefined;
@@ -1977,6 +2061,13 @@ export class McpAuthHeaderProvider extends Disposable {
 	/** The authorization server tokens were obtained from, preferred on re-discovery. */
 	private _registeredAuthorizationServer: string | undefined;
 	private readonly _stepUps: Map<string, number>;
+	/**
+	 * How the last tokens put on requests are bound, by token: the DPoP key of a DPoP-bound one,
+	 * `null` for a bearer token. A token's binding is looked up once.
+	 */
+	private readonly _tokenBindings = new Map<string, IOAuthDpopProver | null>();
+	/** The client of a machine client's grant, created on its first token request. */
+	private _machine: Promise<IMachineClient> | undefined;
 
 	constructor(private readonly _host: IMcpAuthHeaderProviderHost) {
 		super();
@@ -1990,6 +2081,10 @@ export class McpAuthHeaderProvider extends Disposable {
 
 	private get _resourceUrl(): string {
 		return this._host.resourceUrl?.() ?? this._host.launch.uri.toString(true);
+	}
+
+	private get _policy(): IMcpOAuthServerPolicy {
+		return resolveMcpOAuthPolicy(this._host.launch.oauth as IMcpRemoteServerOAuthConfiguration | undefined);
 	}
 
 	/** Adds the `Authorization` header for a request, when a token is (or can silently be) available. */
@@ -2010,18 +2105,52 @@ export class McpAuthHeaderProvider extends Disposable {
 	}
 
 	/**
+	 * Signs the DPoP proof (RFC 9449 section 7.1) of a request whose
+	 * `Authorization` carries a DPoP-bound token: a fresh one for each request
+	 * the transport sends (each redirect too), for its method and URL. Any
+	 * other request gets none, and a proof left from an earlier attempt is
+	 * removed. Returns the signing to wait for, or `undefined` when there is
+	 * nothing to sign, so that other requests go out without delay.
+	 */
+	addDpopProof(headers: Record<string, string>, method: string, url: string): Promise<void> | undefined {
+		deleteHeader(headers, DPOP_HEADER);
+		const sent = accessTokenOf(headers);
+		const prover = sent?.dpop ? this._tokenBindings.get(sent.token) : undefined;
+		if (!sent || !prover) {
+			return undefined;
+		}
+		return prover.createProof(method, url, sent.token).then(proof => setHostHeader(headers, DPOP_HEADER, proof));
+	}
+
+	/** Keeps the DPoP nonce (RFC 9449 section 9) a response to a request from {@link addDpopProof} supplied, for the next proofs to its origin. */
+	observeResponse(url: string, requestHeaders: Readonly<Record<string, string>>, responseHeaders: { get(name: string): string | null }): void {
+		const nonce = responseHeaders.get(DPOP_NONCE_HEADER);
+		const sent = nonce !== null ? accessTokenOf(requestHeaders) : undefined;
+		if (nonce !== null && sent?.dpop) {
+			this._tokenBindings.get(sent.token)?.rememberNonce(url, nonce);
+		}
+	}
+
+	/**
 	 * Handles a challenge to a request that carried `headers`. Returns true
 	 * when `headers` now carry a (new) token and the request should be sent
 	 * again; false when the response stands. Throws a terminal
-	 * {@link OAuthClientError}.
+	 * {@link OAuthClientError}. `dpopNonce` is the response's `DPoP-Nonce`: a
+	 * `use_dpop_nonce` challenge to a DPoP-bound token sends the request again
+	 * with the same token, its next proof carrying the nonce.
 	 */
-	async handleChallenge(status: number, wwwAuthenticate: string | undefined, headers: Record<string, string>, token: CancellationToken = CancellationToken.None): Promise<boolean> {
-		const challenge = parseBearerChallenge(wwwAuthenticate);
+	async handleChallenge(status: number, wwwAuthenticate: string | undefined, headers: Record<string, string>, token: CancellationToken = CancellationToken.None, dpopNonce?: string): Promise<boolean> {
+		const sent = accessTokenOf(headers);
+		const challenge = parseOAuthChallenge(wwwAuthenticate, sent?.dpop ? 'DPoP' : 'Bearer');
 		const insufficientScope = status === 403 && challenge?.error === 'insufficient_scope';
 		if (status !== 401 && !insufficientScope) {
 			return false;
 		}
-		const sentToken = bearerTokenOf(headers);
+		if (status === 401 && sent?.dpop && challenge?.error === USE_DPOP_NONCE_ERROR && dpopNonce !== undefined && this._tokenBindings.get(sent.token)) {
+			this._host.log(LogLevel.Debug, 'The MCP server asked for a DPoP nonce; sending the request again with it');
+			return true;
+		}
+		const sentToken = sent?.token;
 		// A cancelled request stops waiting for the challenges ahead of it, and its own discovery ends.
 		return raceCancellationError(this._challenges.queue(async () => {
 			if (this._store.isDisposed || token.isCancellationRequested) {
@@ -2077,7 +2206,10 @@ export class McpAuthHeaderProvider extends Disposable {
 			this._metadata = metadata;
 
 			deleteHeader(headers, 'Authorization');
-			const newToken = await this._requestToken({ errorOnUserInteraction: this._host.errorOnUserInteraction, forceNewRegistration, rejectedToken });
+			deleteHeader(headers, DPOP_HEADER);
+			// The token stands for its own scopes; a machine client's grant still must not hand it out again for the wider ones.
+			const machineStepUp = insufficientScope && this._policy.grant !== 'authorization_code';
+			const newToken = await this._requestToken({ errorOnUserInteraction: this._host.errorOnUserInteraction, forceNewRegistration, rejectedToken: machineStepUp ? sentToken : rejectedToken, token });
 			if (!newToken || newToken === sentToken) {
 				return false;
 			}
@@ -2089,20 +2221,21 @@ export class McpAuthHeaderProvider extends Disposable {
 
 	/** Records that a request carrying `headers` was answered without a challenge: the rejection streak ends. */
 	onDidAccept(headers: Readonly<Record<string, string>>): void {
-		if (bearerTokenOf(headers) !== undefined) {
+		if (accessTokenOf(headers) !== undefined) {
 			this._rejections = 0;
 		}
 	}
 
 	protected async _discover(wwwAuthenticate: string | undefined, token: CancellationToken): Promise<AuthMetadata> {
 		const protocolVersion = this._host.protocolVersion() ?? MCPLegacy.LATEST_PROTOCOL_VERSION;
-		const policy = resolveMcpOAuthPolicy(this._host.launch.oauth as IMcpRemoteServerOAuthConfiguration | undefined);
+		const policy = this._policy;
 		const registeredAuthorizationServers = await this._registeredAuthorizationServers(token);
 		return createAuthMetadata(this._resourceUrl, new Headers(wwwAuthenticate !== undefined ? { 'WWW-Authenticate': wwwAuthenticate } : {}), {
 			sameOriginHeaders: Object.fromEntries(this._host.launch.headers),
 			protocolVersion,
 			policy,
 			registeredAuthorizationServers,
+			grant: policy.grant === 'authorization_code' ? 'authorization_code' : policy.grant === 'client_credentials' ? 'client_credentials' : 'jwt_bearer',
 			fetch: (url, init) => this._host.fetchMetadata(url, { method: init.method, headers: init.headers, body: init.body }, init.headers[MCP_PROTOCOL_VERSION_HEADER] === protocolVersion ? { [MCP_PROTOCOL_VERSION_HEADER]: protocolVersion } : undefined, init.signal),
 			log: (level, message) => this._host.log(level, message),
 			token,
@@ -2130,15 +2263,34 @@ export class McpAuthHeaderProvider extends Disposable {
 		return registered;
 	}
 
+	/** Puts a token on a request: with the `DPoP` scheme when it is DPoP-bound, else as a bearer token. The proof is the transport's ({@link addDpopProof}). */
 	private _setToken(headers: Record<string, string>, token: string): void {
-		setHostHeader(headers, 'Authorization', `Bearer ${token}`);
+		setHostHeader(headers, 'Authorization', `${this._tokenBindings.get(token) ? DPOP_SCHEME : 'Bearer'} ${token}`);
+		deleteHeader(headers, DPOP_HEADER);
 		this._currentToken = token;
 	}
 
-	private async _requestToken(options: { errorOnUserInteraction?: boolean; forceNewRegistration?: boolean; rejectedToken?: string }): Promise<string | undefined> {
+	/** Records how a token is bound: its DPoP key, or `null` for a bearer token. */
+	private _bindToken(token: string, prover: IOAuthDpopProver | null): void {
+		this._tokenBindings.delete(token);
+		this._tokenBindings.set(token, prover);
+		for (const oldest of this._tokenBindings.keys()) {
+			if (this._tokenBindings.size <= MAX_TOKEN_BINDINGS) {
+				break;
+			}
+			this._tokenBindings.delete(oldest);
+		}
+	}
+
+	private async _requestToken(options: { errorOnUserInteraction?: boolean; forceNewRegistration?: boolean; rejectedToken?: string; token?: CancellationToken }): Promise<string | undefined> {
 		const metadata = this._metadata;
 		if (!metadata) {
 			return undefined;
+		}
+		const policy = this._policy;
+		const dpop = mcpWantsDpop(policy, metadata.resourceRequiresDpop);
+		if (policy.grant !== 'authorization_code') {
+			return this._requestMachineToken(metadata, policy.grant, dpop, options.rejectedToken, options.token ?? CancellationToken.None);
 		}
 		const details: IMcpAuthenticationDetails = {
 			authorizationServer: metadata.authorizationServer.toJSON(),
@@ -2148,6 +2300,7 @@ export class McpAuthHeaderProvider extends Disposable {
 			resource: metadata.resource,
 			clientId: this._host.launch.oauth?.clientId,
 			enterpriseManaged: this._host.launch.oauth?.enterpriseManaged,
+			dpop: dpop || undefined,
 		};
 		try {
 			const token = await this._host.proxy.$getTokenFromServerMetadata(this._host.id, details, {
@@ -2157,6 +2310,7 @@ export class McpAuthHeaderProvider extends Disposable {
 			});
 			if (token) {
 				this._registeredAuthorizationServer = metadata.authorizationServerIdentifier;
+				await this._lookUpDpopBinding(token);
 			}
 			return token;
 		} catch (e) {
@@ -2169,6 +2323,166 @@ export class McpAuthHeaderProvider extends Disposable {
 			}
 			this._host.log(LogLevel.Warning, `Error getting token from server metadata: ${redact(String(e))}`);
 			return undefined;
+		}
+	}
+
+	/** Learns whether a token of the main thread is DPoP-bound, and to which key. */
+	private async _lookUpDpopBinding(token: string): Promise<void> {
+		if (this._tokenBindings.has(token)) {
+			return;
+		}
+		if (!this._host.proxy.$getAccessTokenBinding) {
+			this._bindToken(token, null);
+			return;
+		}
+		try {
+			const binding = await this._host.proxy.$getAccessTokenBinding(this._host.id, token);
+			this._bindToken(token, binding?.dpopKey ? await OAuthDpopProver.fromPrivateJwk(binding.dpopKey) : null);
+		} catch (e) {
+			// Sent as a bearer token, the server rejects a bound token, and the challenge gets another one.
+			this._host.log(LogLevel.Warning, `Could not look up the DPoP key of the access token: ${redact(String(e))}`);
+		}
+	}
+
+	/**
+	 * The token of a machine client's grant (`oauth.grant`): the extension-host
+	 * {@link OAuthClient} keeps it and requests a new one when it expires or is
+	 * rejected. A refused grant, and credentials that are missing or belong to
+	 * another authorization server, are terminal: the connection fails with the
+	 * reason and the grant is not retried. A token endpoint that cannot be
+	 * reached leaves the request unauthenticated, as for a user's sign-in.
+	 */
+	private async _requestMachineToken(metadata: AuthMetadata, grant: 'client_credentials' | 'workload_identity', dpop: boolean, rejectedToken: string | undefined, token: CancellationToken): Promise<string | undefined> {
+		const issuer = metadata.serverMetadata.issuer;
+		// Pre-registered credentials belong to one authorization server (`oauth.authorizationServer`): nothing is sent to another.
+		const configuredIssuer = this._policy.authorizationServer;
+		if (configuredIssuer !== undefined && configuredIssuer !== issuer) {
+			throw new OAuthClientError('issuer_not_registered', localize('mcp.oauth.machineIssuerMismatch', "The MCP server names the authorization server {0}, but its `oauth.authorizationServer` is {1}; its credentials are not sent there.", issuer, configuredIssuer));
+		}
+		const pending = this._machine ??= this._createMachineClient(grant, issuer);
+		let machine: IMachineClient;
+		try {
+			machine = await pending;
+		} catch (e) {
+			// The next challenge reads the configuration again (a secret set meanwhile, a fixed key file).
+			if (this._machine === pending) {
+				this._machine = undefined;
+			}
+			throw e;
+		}
+		// The credentials were first used with one authorization server: a resource that names another later does not get them.
+		// (A workload identity JWT names its authorization server itself; it is checked before each request.)
+		if (grant === 'client_credentials' && machine.issuer !== issuer) {
+			throw new OAuthClientError('issuer_not_registered', localize('mcp.oauth.machineIssuerMoved', "The MCP server now names the authorization server {0}, but its client credentials were used with {1}; they are not sent to another.", issuer, machine.issuer));
+		}
+		let authorization;
+		try {
+			authorization = await machine.client.acquireToken({
+				serverMetadata: metadata.serverMetadata,
+				resourceMetadata: metadata.resourceMetadata,
+				resource: metadata.resource,
+				scopes: metadata.scopes,
+				rejectedToken,
+				dpop,
+			}, token);
+		} catch (e) {
+			if (isCancellationError(e) || isTerminalAuthorizationError(e)) {
+				throw e;
+			}
+			this._host.log(LogLevel.Warning, `The token request of the machine client failed: ${redact(String(e))}`);
+			return undefined;
+		}
+		this._registeredAuthorizationServer = metadata.authorizationServerIdentifier;
+		this._bindToken(authorization.accessToken, authorization.tokenType === 'DPoP' ? machine.prover : null);
+		return authorization.accessToken;
+	}
+
+	private async _createMachineClient(grant: 'client_credentials' | 'workload_identity', issuer: string): Promise<IMachineClient> {
+		const fetchToken = this._host.fetchToken;
+		if (!fetchToken) {
+			throw new OAuthClientError('grant_unsupported', localize('mcp.oauth.noMachineClient', "This transport cannot run the grant of `oauth.grant` `{0}`.", grant));
+		}
+		const oauthGrant = await this._machineGrant(grant, issuer);
+		const prover = await OAuthDpopProver.generate();
+		if (this._store.isDisposed) {
+			throw new CancellationError();
+		}
+		const client = this._register(createMcpOAuthClient({
+			clientName: product.nameLong,
+			redirectUris: ['http://127.0.0.1/'],
+			// Pre-registered credentials or a workload identity: no registration and no browser.
+			registration: { dynamic: false },
+			authorize: () => Promise.reject(new Error('A machine client does not authorize')),
+			policy: this._policy,
+			storage: new InMemoryOAuthClientStorage(),
+			grant: oauthGrant,
+			dpop: prover,
+			fetch: (url, init) => fetchToken(url, { method: init.method ?? 'GET', headers: { ...init.headers }, body: init.body !== undefined ? new TextEncoder().encode(init.body) as Uint8Array<ArrayBuffer> : undefined }, init.signal),
+			log: (level, message) => this._host.log(toLogLevel(level), message),
+		}));
+		return { client, prover, issuer };
+	}
+
+	/**
+	 * The grant of `oauth.grant`, with the credentials of the server's `oauth`
+	 * configuration, for their first use with the authorization server `issuer`.
+	 */
+	private async _machineGrant(grant: 'client_credentials' | 'workload_identity', issuer: string): Promise<OAuthGrant> {
+		const oauth = this._host.launch.oauth;
+		const clientId = oauth?.clientId;
+		if (grant === 'workload_identity') {
+			const tokenFile = oauth?.workloadIdentityTokenFile;
+			if (!tokenFile) {
+				throw new OAuthClientError('credentials_unavailable', localize('mcp.oauth.noWorkloadToken', "The MCP server's `oauth.grant` is `workload_identity`, which needs `oauth.workloadIdentityTokenFile`."));
+			}
+			return {
+				kind: 'jwt_bearer',
+				// The workload platform rotates the JWT, so the file is read for each token request.
+				assertion: async request => {
+					const jwt = (await this._readCredentialFile(tokenFile, 'workloadIdentityTokenFile')).trim();
+					const problem = workloadIdentityJwtProblem(jwt, request.serverMetadata, Date.now());
+					if (problem) {
+						throw new OAuthClientError('credentials_unavailable', localize('mcp.oauth.badWorkloadToken', "The workload identity JWT in `oauth.workloadIdentityTokenFile` is not sent to {0}: {1}.", request.serverMetadata.issuer, problem));
+					}
+					return jwt;
+				},
+				client: clientId ? { clientId } : undefined,
+			};
+		}
+		if (!clientId) {
+			throw new OAuthClientError('credentials_unavailable', localize('mcp.oauth.noClientId', "The MCP server's `oauth.grant` is `client_credentials`, which needs the pre-registered `oauth.clientId`."));
+		}
+		let credentials: OAuthClientCredentials;
+		if (oauth.privateKeyFile) {
+			const algorithm = oauth.signingAlgorithm ?? 'ES256';
+			if (!isJwsAlgorithm(algorithm)) {
+				throw new OAuthClientError('credentials_unavailable', localize('mcp.oauth.badAlgorithm', "`oauth.signingAlgorithm` must be ES256, ES384, RS256 or PS256, not '{0}'.", algorithm));
+			}
+			const pem = await this._readCredentialFile(oauth.privateKeyFile, 'privateKeyFile');
+			try {
+				credentials = { clientId, privateKey: await importPkcs8PrivateKey(pem, algorithm), keyId: oauth.keyId, audience: oauth.clientAssertionAudience === 'token_endpoint' ? 'token_endpoint' : 'issuer' };
+			} catch (e) {
+				throw new OAuthClientError('credentials_unavailable', localize('mcp.oauth.badKey', "The private key in `oauth.privateKeyFile` cannot be used: {0}", e instanceof Error ? e.message : String(e)));
+			}
+		} else {
+			// The main thread refuses a secret bound to another authorization server, and binds an unbound one to this one.
+			const clientSecret = await this._host.proxy.$getMcpOAuthClientSecret?.(this._host.id, clientId, issuer);
+			if (!clientSecret) {
+				throw new OAuthClientError('credentials_unavailable', localize('mcp.oauth.noClientSecret', "No client secret is set for the MCP server's `oauth.clientId` '{0}'. Set one with the Set Client Secret code lens in mcp.json, or configure `oauth.privateKeyFile`.", clientId));
+			}
+			credentials = { clientId, clientSecret };
+		}
+		return { kind: 'client_credentials', credentials };
+	}
+
+	private async _readCredentialFile(path: string, setting: string): Promise<string> {
+		if (!this._host.readFile) {
+			throw new OAuthClientError('credentials_unavailable', localize('mcp.oauth.noFileSystem', "`oauth.{0}` cannot be read in this extension host.", setting));
+		}
+		try {
+			return await this._host.readFile(path);
+		} catch (e) {
+			throw new OAuthClientError('credentials_unavailable', localize('mcp.oauth.unreadableFile', "Could not read `oauth.{0}` ({1}): {2}", setting, path, e instanceof Error ? e.message : String(e)));
 		}
 	}
 
