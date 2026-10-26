@@ -13,6 +13,7 @@ import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as path from 'node:path';
+import { ensureOAuthCredentials, oauthCredentialsDir } from './oauth-credentials.ts';
 import { activeMutations, readServers, resolvePlaceholders } from './servers.ts';
 
 /** The mutations of runner/mutations.ts that runner/http-fault-proxy.ts applies (--mutate). */
@@ -102,12 +103,13 @@ function zigArgs(binary: string, args: readonly string[]): readonly string[] {
 }
 
 async function start(logDir: string, args: readonly string[]): Promise<number> {
+	const tlsDir = path.resolve(argValue(args, '--tls-dir', '/tmp/e2e/tls'));
 	const placeholders = {
 		zig: argValue(args, '--zig', '/work/zig-sdk/zig-out/bin/mcp-conformance-server'),
 		everything: argValue(args, '--everything', '/work/e2e-tools/node_modules/@modelcontextprotocol/server-everything/dist/index.js'),
+		oauthCredentials: oauthCredentialsDir(tlsDir),
 	};
 	const servers = readServers(argValue(args, '--servers', path.join(import.meta.dirname, '..', 'config', 'servers.json')));
-	const tlsDir = path.resolve(argValue(args, '--tls-dir', '/tmp/e2e/tls'));
 	const mutations = activeMutations();
 	fs.mkdirSync(logDir, { recursive: true });
 	const pids: Record<string, number> = {};
@@ -184,6 +186,21 @@ async function start(logDir: string, args: readonly string[]): Promise<number> {
 				fixtureArgs.push('--prm-path', f.prmPath);
 			}
 			fixtureArgs.push('--iss-mode', mutations.has('oauth-iss-ok') ? 'ok' : f.issMode ?? 'ok');
+			if (f.machineClient) {
+				// The public key of the client key pair that prepare-profile.ts created (mcp.json's oauth.privateKeyFile);
+				// mutation oauth-wrong-client-key: the fixture trusts another key.
+				const credentials = ensureOAuthCredentials(mutations.has('oauth-wrong-client-key') ? path.join(placeholders.oauthCredentials, 'other') : placeholders.oauthCredentials);
+				fixtureArgs.push('--machine-client', f.machineClient, '--client-jwk', credentials.clientJwk);
+			}
+			if (f.workloadToken) {
+				fs.mkdirSync(path.dirname(f.workloadToken.file), { recursive: true });
+				// Mutation oauth-wif-aud-ok: the workload JWT names this authorization server.
+				fixtureArgs.push('--workload-token-out', f.workloadToken.file, '--workload-token-aud', mutations.has('oauth-wif-aud-ok') ? 'issuer' : f.workloadToken.aud ?? 'issuer');
+			}
+			if (f.dpop && f.dpop !== 'off') {
+				// Mutation oauth-dpop-optional: the resource no longer requires DPoP-bound tokens.
+				fixtureArgs.push('--dpop', mutations.has('oauth-dpop-optional') && f.dpop === 'required' ? 'optional' : f.dpop);
+			}
 			if (!await startProcess(logDir, `${server.label}-oauth`, process.execPath, fixtureArgs, f.grpcPort ?? f.port, undefined, pids)) {
 				failures++;
 			}

@@ -37,7 +37,10 @@ export interface IE2eServer {
 		readonly upstreamPort?: number;
 		readonly grpcLogProxy?: { readonly port: number; readonly refuseTunnel?: boolean; readonly tls?: boolean; readonly resetLimit?: { readonly burst: number; readonly rate: number }; readonly mangle?: readonly string[]; readonly hold?: readonly string[] };
 		readonly httpProxy?: { readonly port: number; readonly faults?: readonly string[] };
-		readonly oauthFixture?: { readonly port: number; readonly asPort?: number; readonly asPath?: string; readonly prmPath?: string; readonly issMode?: string; readonly grpcPort?: number };
+		readonly oauthFixture?: {
+			readonly port: number; readonly asPort?: number; readonly asPath?: string; readonly prmPath?: string; readonly issMode?: string; readonly grpcPort?: number;
+			readonly machineClient?: string; readonly workloadToken?: { readonly file: string; readonly aud?: string }; readonly dpop?: string;
+		};
 	};
 	/** Started only by its own test (not with the others, no negotiation row). */
 	readonly ownTest?: boolean;
